@@ -25,17 +25,32 @@ def main() -> None:
     args = parser.parse_args()
 
     log = TradingLogger(config_45dte.LOG_DIR)
+    print(f"[ALPACA 45DTE] Starting bot (log: {config_45dte.LOG_DIR})")
+    if args.dry_run:
+        print("[ALPACA 45DTE] DRY-RUN mode: orders logged but not sent")
+    if args.once:
+        print("[ALPACA 45DTE] ONCE mode: will exit after end-of-day")
+    
     broker = Broker(config_45dte, dry_run=True if args.dry_run else None,
                     log=lambda message: log.log_event("BROKER", message))
+    print(f"[ALPACA 45DTE] Broker initialized")
+    
     orders = OrderManager(broker, log, config_45dte)
+    print(f"[ALPACA 45DTE] OrderManager initialized")
+    
     if args.reset_breaker:
         orders.risk.reset_breaker()
+        print(f"[ALPACA 45DTE] Circuit breaker reset")
+    
     scheduler = Scheduler(broker, orders, log, config_45dte, once=args.once)
+    print(f"[ALPACA 45DTE] Scheduler started\n")
+    
     try:
         scheduler.run()
     except KeyboardInterrupt:
         log.log_event("SHUTDOWN", "stopped by user; state saved")
         orders.save()
+        print("[ALPACA 45DTE] Stopped by user")
 
 
 if __name__ == "__main__":

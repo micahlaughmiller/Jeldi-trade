@@ -1,165 +1,114 @@
-"""Signal generator for 45-60 DTE credit spreads."""
+"""Turn an RSI signal into a fully specified $5-wide credit spread."""
 
-from datetime import datetime, timedelta
-from config_45dte import (
-    TARGET_DELTA,
-    SPREAD_WIDTH,
-    MIN_CREDIT_TARGET,
-    EXPIRATION_DTE_MIN,
-    EXPIRATION_DTE_MAX,
-)
+from __future__ import annotations
+
+import math
+from datetime import date, datetime
+from types import ModuleType
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import config_45dte
+
+ET = ZoneInfo("US/Eastern")
 
 
-class SignalGenerator:
-    """Generates credit spread entry signals based on RSI confluence."""
+def round_down_to_nickel(value: float) -> float:
+    return round(math.floor(value / 0.05 + 1e-9) * 0.05, 2)
 
-    def __init__(self):
-        """Initialize signal generator."""
-        self.target_delta = TARGET_DELTA
-        self.spread_width = SPREAD_WIDTH
-        self.min_credit = MIN_CREDIT_TARGET
 
-    def get_next_expiration_dte(self):
-        """
-        Find next expiration within 45-60 DTE range.
+def round_to_nickel(value: float) -> float:
+    return round(round(value / 0.05) * 0.05, 2)
 
-        Returns:
-            datetime object for expiration Friday, dte
-        """
-        today = datetime.now()
 
-        # Find next Friday
-        days_until_friday = (4 - today.weekday()) % 7
-        if days_until_friday == 0:
-            days_until_friday = 7
+def choose_expiration(expirations: list[date], today: date,
+                      config: ModuleType = config_45dte) -> tuple[date | None, int, bool, str]:
+    """(expiration, dte, out_of_range, reason). Inside [DTE_MIN, DTE_MAX] closest to DTE_TARGET wins;
+    otherwise the nearest within DTE_TOLERANCE_DAYS of the window, flagged out_of_range."""
+    dated = [(exp, (exp - today).days) for exp in expirations]
+    inside = [(exp, dte) for exp, dte in dated if config.DTE_MIN <= dte <= config.DTE_MAX]
+    if inside:
+        exp, dte = min(inside, key=lambda p: (abs(p[1] - config.DTE_TARGET), p[1]))
+        return exp, dte, False, "inside window"
+    lo = config.DTE_MIN - config.DTE_TOLERANCE_DAYS
+    hi = config.DTE_MAX + config.DTE_TOLERANCE_DAYS
 
-        next_friday = today + timedelta(days=days_until_friday)
+    def distance(dte: int) -> int:
+        return config.DTE_MIN - dte if dte < config.DTE_MIN else dte - config.DTE_MAX
 
-        # Find Friday in 45-60 DTE range
-        current_friday = next_friday
-        for _ in range(12):  # Check up to 12 weeks
-            dte = (current_friday - today).days
-            if EXPIRATION_DTE_MIN <= dte <= EXPIRATION_DTE_MAX:
-                return current_friday, dte
-            current_friday += timedelta(days=7)
+    near = [(exp, dte) for exp, dte in dated if lo <= dte <= hi]
+    if near:
+        exp, dte = min(near, key=lambda p: (distance(p[1]), p[1]))
+        return exp, dte, True, f"nearest outside window ({dte} DTE)"
+    return None, 0, False, f"no expiration within {lo}-{hi} DTE (have {[d for _, d in dated]})"
 
-        # Fallback to closest DTE in range
-        dte = (next_friday - today).days
-        if dte < EXPIRATION_DTE_MIN:
-            later_friday = next_friday + timedelta(days=7)
-            return later_friday, (later_friday - today).days
-        else:
-            return next_friday, dte
 
-    def estimate_options_credit(self, stock_price, signal_type, iv_percentile=50):
-        """
-        Estimate credit for options spread (simplified model).
+def _find_strike(chain: list[dict[str, Any]], strike: float) -> dict[str, Any] | None:
+    for quote in chain:
+        if abs(quote["strike"] - strike) < 1e-6:
+            return quote
+    return None
 
-        In production, fetch real Greeks from options chain API.
-        This uses Black-Scholes approximation for paper trading.
 
-        Args:
-            stock_price: Current stock price
-            signal_type: "oversold" (put spread) or "overbought" (call spread)
-            iv_percentile: IV percentile (0-100)
+def select_strikes(chain: list[dict[str, Any]], right: str,
+                   config: ModuleType = config_45dte) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    """Short = |delta| closest to TARGET_DELTA within [DELTA_MIN, DELTA_MAX]; long = $SPREAD_WIDTH further OTM."""
+    candidates = [
+        q for q in chain
+        if q.get("delta") is not None and config.DELTA_MIN <= abs(q["delta"]) <= config.DELTA_MAX
+    ]
+    if not candidates:
+        return None, None, f"no strike with |delta| in [{config.DELTA_MIN}, {config.DELTA_MAX}]"
+    candidates.sort(key=lambda q: abs(abs(q["delta"]) - config.TARGET_DELTA))
+    offset = -config.SPREAD_WIDTH if right == "P" else config.SPREAD_WIDTH
+    for short in candidates:
+        long = _find_strike(chain, short["strike"] + offset)
+        if long is not None:
+            return short, long, "ok"
+    return None, None, "no $5-wide pair"
 
-        Returns:
-            Estimated credit or None if below minimum
-        """
-        try:
-            if signal_type == "oversold":
-                base_credit = stock_price * 0.01 + (iv_percentile / 100) * 0.5
-            else:
-                base_credit = max(0.5, stock_price * 0.005 + (iv_percentile / 100) * 0.3)
 
-            credit = base_credit * (self.spread_width / 5.0) * (self.target_delta / 0.30)
+def build_trade(broker: Any, row: dict[str, Any], today: date | None = None,
+                config: ModuleType = config_45dte) -> dict[str, Any]:
+    """Return a trade spec; `accepted` False carries a `reason`."""
+    today = today or datetime.now(ET).date()
+    symbol = row["broker_symbol"]
+    right = "P" if row["signal"] == "oversold" else "C"
+    strong = bool(row.get("strong"))
+    spec: dict[str, Any] = {
+        "symbol": row["symbol"], "broker_symbol": symbol, "right": right, "signal": row["signal"], "strong": strong,
+        "rsi14": row.get("rsi14"), "rsi28": row.get("rsi28"), "accepted": False, "reason": "", "dte_out_of_range": False,
+    }
+    expirations = broker.get_expirations(symbol, config.DTE_SEARCH_MIN, config.DTE_SEARCH_MAX)
+    expiration, dte, out_of_range, why = choose_expiration(expirations, today, config)
+    if expiration is None:
+        spec["reason"] = why
+        return spec
+    spec.update({"expiration": expiration, "dte": dte, "dte_out_of_range": out_of_range})
 
-            return round(credit, 2)
+    spot = broker.get_spot(symbol)
+    chain = broker.get_option_chain(symbol, expiration, right, spot=spot)
+    spec["spot"] = spot
+    if not chain:
+        spec["reason"] = "empty option chain"
+        return spec
+    short, long, why = select_strikes(chain, right, config)
+    if short is None or long is None:
+        spec["reason"] = why
+        return spec
 
-        except Exception as e:
-            print(f"Error estimating credit: {e}")
-            return None
-
-    def generate_entry_signal(self, rsi_signal, current_price, iv_percentile=50):
-        """
-        Generate credit spread entry signal.
-
-        Args:
-            rsi_signal: Dict with signal_type, rsi_14, rsi_28, close
-            current_price: Current stock price
-            iv_percentile: IV percentile (placeholder)
-
-        Returns:
-            Signal dict or None
-        """
-        try:
-            signal_type = rsi_signal['signal_type']
-            symbol = rsi_signal['symbol']
-
-            # Determine spread direction
-            if signal_type == "oversold":
-                spread_direction = "put_spread"
-                spread_name = "Put Credit Spread (sell put)"
-            else:
-                spread_direction = "call_spread"
-                spread_name = "Call Credit Spread (sell call)"
-
-            # Get expiration
-            expiration_date, dte = self.get_next_expiration_dte()
-
-            # Estimate credit
-            estimated_credit = self.estimate_options_credit(
-                current_price,
-                signal_type,
-                iv_percentile,
-            )
-
-            if estimated_credit is None or estimated_credit < self.min_credit:
-                return None  # Credit too low, skip entry
-
-            # Calculate strike prices (simplified)
-            if signal_type == "oversold":
-                short_strike = round((current_price * 0.97) / 5) * 5
-                long_strike = short_strike - self.spread_width
-            else:
-                short_strike = round((current_price * 1.03) / 5) * 5
-                long_strike = short_strike + self.spread_width
-
-            return {
-                'symbol': symbol,
-                'signal_type': signal_type,
-                'spread_direction': spread_direction,
-                'spread_name': spread_name,
-                'rsi_14': rsi_signal['rsi_14'],
-                'rsi_28': rsi_signal['rsi_28'],
-                'current_price': current_price,
-                'short_strike': short_strike,
-                'long_strike': long_strike,
-                'spread_width': self.spread_width,
-                'short_delta': self.target_delta,
-                'estimated_credit': estimated_credit,
-                'max_loss': self.spread_width - estimated_credit,
-                'expiration_date': expiration_date,
-                'dte': dte,
-                'entry_timestamp': datetime.now(),
-            }
-
-        except Exception as e:
-            print(f"Error generating signal for {rsi_signal.get('symbol')}: {e}")
-            return None
-
-    def validate_signal(self, signal):
-        """Validate signal meets all entry criteria."""
-        if signal is None:
-            return False
-
-        if signal['estimated_credit'] < self.min_credit:
-            return False
-
-        if not (EXPIRATION_DTE_MIN <= signal['dte'] <= EXPIRATION_DTE_MAX):
-            return False
-
-        if signal['short_strike'] <= 0 or signal['long_strike'] <= 0:
-            return False
-
-        return True
+    credit = round_down_to_nickel(short["mid"] - long["mid"])
+    bid_side = round(short["bid"] - long["ask"], 2)
+    min_credit = config.MIN_CREDIT_STRONG if strong else config.MIN_CREDIT
+    spec.update({
+        "short_strike": short["strike"], "long_strike": long["strike"], "short_symbol": short["symbol"],
+        "long_symbol": long["symbol"], "short_delta": short["delta"], "long_delta": long.get("delta"),
+        "credit": credit, "bid_side": bid_side, "min_credit": min_credit,
+        "max_loss": round(config.SPREAD_WIDTH - credit, 2), "width": config.SPREAD_WIDTH,
+    })
+    if credit + 1e-9 < min_credit:
+        spec["reason"] = f"credit {credit:.2f} < min {min_credit:.2f}{' (strong)' if strong else ''}"
+        return spec
+    spec["accepted"] = True
+    spec["reason"] = "ok" if not out_of_range else f"ok ({why})"
+    return spec

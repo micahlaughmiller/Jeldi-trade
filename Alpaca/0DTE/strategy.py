@@ -1,213 +1,203 @@
-# ============================================
-# ASTRA ORB STRATEGY
-# 15-minute ORB + Overnight Breakout
-# ============================================
+"""Pure 0DTE strategy logic: phases, breakout detection, strikes, credit, momentum.
+
+No I/O here. Candles are pandas DataFrames indexed by tz-aware ET bar START
+time with columns open/high/low/close/volume, containing completed bars only.
+
+Breakout level source (config.BREAKOUT_LEVEL_SOURCE):
+  ES_TO_SPX (default): the overnight high/low come from ES futures (the only
+    instrument trading 18:00-09:30), are translated into SPX terms with the
+    09:30 basis (SPX - ES), and compared against live SPX candles. Yahoo's ES
+    quotes are ~10 minutes delayed while ^GSPC is real-time, so confirming on
+    SPX candles keeps the 2-candle confirmation on current prices.
+  ES: compare ES candles directly against the raw ES levels. Simpler, but the
+    signal arrives ~10 minutes late.
+"""
 
 from dataclasses import dataclass
-from typing import Optional
-from config import CONFIG
-from risk_manager import RiskManager
-import logging
+from datetime import date, datetime, time, timedelta
+from enum import StrEnum
+from math import ceil, floor
 
-logger = logging.getLogger(__name__)
+import pandas as pd
+
+import config
+
+BULLISH = "BULLISH"
+BEARISH = "BEARISH"
 
 
-@dataclass
-class PositionPlan:
-    """Trade candidate ready for execution"""
-    
+class Phase(StrEnum):
+    PRE_OPEN = "PRE_OPEN"
+    OVERNIGHT_ONLY = "OVERNIGHT_ONLY"
+    OVERNIGHT_OR_ORB = "OVERNIGHT_OR_ORB"
+    ORB_ONLY = "ORB_ONLY"
+    NO_NEW_ENTRIES = "NO_NEW_ENTRIES"
+    CLOSED = "CLOSED"
+
+
+ENTRY_PHASES = {Phase.OVERNIGHT_ONLY, Phase.OVERNIGHT_OR_ORB, Phase.ORB_ONLY}
+OVERNIGHT_PHASES = {Phase.OVERNIGHT_ONLY, Phase.OVERNIGHT_OR_ORB}
+ORB_PHASES = {Phase.OVERNIGHT_OR_ORB, Phase.ORB_ONLY}
+
+
+@dataclass(frozen=True)
+class Levels:
+    high: float
+    low: float
+    established_at: datetime
+
+    def shifted(self, basis: float) -> "Levels":
+        return Levels(self.high + basis, self.low + basis, self.established_at)
+
+
+@dataclass(frozen=True)
+class Breakout:
     direction: str
-    spread_type: str
-    short_strike: float
-    long_strike: float
-    width: int
-    credit: float
-    contracts: int
-    stop_price: float
-    profit_trigger: float
+    candle_times: tuple[datetime, datetime]
 
 
-class AstraStrategy:
-    """ORB strategy engine"""
-    
-    def __init__(self, risk: RiskManager):
-        self.risk = risk
-        
-        # Overnight levels (4 PM - 9:30 AM)
-        self.overnight_high = None
-        self.overnight_low = None
-        
-        # Opening range (9:30 - 9:45 AM)
-        self.or_high = None
-        self.or_low = None
-        
-        # Confirmation counters
-        self.above_count = 0
-        self.below_count = 0
-        
-        # Current setup
-        self.setup_type = None
-        self.direction = None
-    
-    def reset_day(self):
-        """Reset strategy at market open"""
-        self.overnight_high = None
-        self.overnight_low = None
-        self.or_high = None
-        self.or_low = None
-        self.above_count = 0
-        self.below_count = 0
-        self.setup_type = None
-        self.direction = None
-    
-    def set_overnight_levels(self, high: float, low: float):
-        """Set overnight high/low from previous session"""
-        self.overnight_high = high
-        self.overnight_low = low
-        logger.info(f"Overnight: High {high} / Low {low}")
-    
-    def confirm_overnight_breakout(self, es_close: float) -> Optional[str]:
-        """
-        Check for overnight breakout with 2-candle confirmation
-        Called every minute 9:30-9:45
-        """
-        if self.overnight_high is None or self.overnight_low is None:
-            return None
-        
-        # Track closes relative to overnight levels
-        if es_close > self.overnight_high:
-            self.above_count += 1
-            self.below_count = 0
-        elif es_close < self.overnight_low:
-            self.below_count += 1
-            self.above_count = 0
-        else:
-            self.above_count = 0
-            self.below_count = 0
-        
-        # Bullish confirmation: 2 closes above overnight high
-        if self.above_count >= CONFIG.confirmation_candles:
-            self.direction = "BULLISH"
-            self.setup_type = "OVERNIGHT_HIGH_BREAKOUT"
-            logger.info("✓ Bullish overnight breakout confirmed")
-            return self.direction
-        
-        # Bearish confirmation: 2 closes below overnight low
-        if self.below_count >= CONFIG.confirmation_candles:
-            self.direction = "BEARISH"
-            self.setup_type = "OVERNIGHT_LOW_BREAKDOWN"
-            logger.info("✓ Bearish overnight breakout confirmed")
-            return self.direction
-        
+@dataclass(frozen=True)
+class SpreadQuote:
+    mid: float
+    bid_side: float
+    ask_side: float
+
+
+def at_time(now: datetime, t: time) -> datetime:
+    return now.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=0)
+
+
+def minutes_since_open(now: datetime) -> float:
+    return (now - at_time(now, config.MARKET_OPEN)).total_seconds() / 60.0
+
+
+def phase(now: datetime) -> Phase:
+    if now >= at_time(now, config.FORCE_CLOSE_TIME):
+        return Phase.CLOSED
+    if now >= at_time(now, config.LAST_ENTRY_TIME):
+        return Phase.NO_NEW_ENTRIES
+    m = minutes_since_open(now)
+    if m < 0:
+        return Phase.PRE_OPEN
+    if m < config.OPENING_RANGE_MINUTES:
+        return Phase.OVERNIGHT_ONLY
+    if m < config.OVERNIGHT_ENTRY_END_MIN:
+        return Phase.OVERNIGHT_OR_ORB
+    return Phase.ORB_ONLY
+
+
+def detect_breakout(candles: pd.DataFrame, level_high: float, level_low: float,
+                    level_time: datetime) -> Breakout | None:
+    if candles is None or len(candles) < 2:
         return None
-    
-    def set_opening_range(self, high: float, low: float):
-        """Set 15-minute opening range"""
-        self.or_high = high
-        self.or_low = low
-        logger.info(f"Opening Range (9:30-9:45): High {high} / Low {low}")
-    
-    def evaluate_orb(self, spx_close: float, vwap: Optional[float] = None) -> Optional[str]:
-        """
-        Evaluate ORB breakout (called after 9:45 AM)
-        """
-        if self.or_high is None or self.or_low is None:
-            return None
-        
-        # Bullish ORB breakout
-        if spx_close > self.or_high:
-            if vwap is None or spx_close > vwap:
-                self.direction = "BULLISH"
-                self.setup_type = "15_MIN_ORB_HIGH"
-                logger.info("✓ Bullish ORB breakout")
-                return self.direction
-        
-        # Bearish ORB breakout
-        if spx_close < self.or_low:
-            if vwap is None or spx_close < vwap:
-                self.direction = "BEARISH"
-                self.setup_type = "15_MIN_ORB_LOW"
-                logger.info("✓ Bearish ORB breakout")
-                return self.direction
-        
+    prev, last = candles.iloc[-2], candles.iloc[-1]
+    t_prev, t_last = candles.index[-2].to_pydatetime(), candles.index[-1].to_pydatetime()
+    if t_prev < level_time:
         return None
-    
-    def calculate_strikes(self, spx_price: float, width: int):
-        """
-        Determine short and long strikes based on direction
-        
-        Returns:
-            (spread_type, short_strike, long_strike)
-        """
-        if self.direction == "BEARISH":
-            # Call credit spread (sell calls above price)
-            short = round(
-                (spx_price - CONFIG.short_strike_distance) / 5
-            ) * 5
-            long = short + width
-            
-            return ("CALL_CREDIT_SPREAD", short, long)
-        
-        if self.direction == "BULLISH":
-            # Put credit spread (sell puts below price)
-            short = round(
-                (spx_price + CONFIG.short_strike_distance) / 5
-            ) * 5
-            long = short - width
-            
-            return ("PUT_CREDIT_SPREAD", short, long)
-        
+    if prev.close > level_high and last.close > level_high and last.high > prev.high:
+        return Breakout(BULLISH, (t_prev, t_last))
+    if prev.close < level_low and last.close < level_low and last.low < prev.low:
+        return Breakout(BEARISH, (t_prev, t_last))
+    return None
+
+
+def direction_to_spread(direction: str) -> str:
+    if direction == BULLISH:
+        return "P"
+    if direction == BEARISH:
+        return "C"
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+def select_strikes(spot: float, right: str, width: int) -> tuple[float, float]:
+    """Return (short_strike, long_strike). ITM credit spreads by design."""
+    if right == "P":
+        long = float(floor(spot / 5) * 5 + 5)
+        return long + width, long
+    if right == "C":
+        long = float(ceil(spot / 5) * 5 - 5)
+        return long - width, long
+    raise ValueError(f"unknown right {right!r}")
+
+
+def width_for_tier(tier: int) -> int:
+    return config.WIDTH_BY_TIER[tier]
+
+
+def credit_range(width: int) -> tuple[float, float]:
+    return config.CREDIT_RANGE_BY_WIDTH[width]
+
+
+def spread_quote(chain_quotes: list[dict], short_strike: float, long_strike: float) -> SpreadQuote | None:
+    by_strike = {round(q["strike"], 2): q for q in chain_quotes}
+    short, long = by_strike.get(round(short_strike, 2)), by_strike.get(round(long_strike, 2))
+    if short is None or long is None:
         return None
-    
-    def build_trade_plan(self, spx_price: float, credit: float):
-        """
-        Build a PositionPlan ready for execution
-        
-        Returns:
-            (PositionPlan or None, reason)
-        """
-        
-        # Check if trading is allowed
-        allowed, reason = self.risk.trading_allowed()
-        if not allowed:
-            return None, reason
-        
-        # Check credit is in range
-        if not (CONFIG.min_credit <= credit <= CONFIG.max_credit):
-            return None, "CREDIT_OUTSIDE_RANGE"
-        
-        # Get tier and spread width
-        tier = self.risk.tier()
-        width = tier.spread_width
-        
-        if width > CONFIG.absolute_max_spread_width:
-            return None, "SPREAD_WIDTH_SAFETY_LIMIT"
-        
-        # Calculate strikes
-        strikes = self.calculate_strikes(spx_price, width)
-        if strikes is None:
-            return None, "NO_DIRECTION"
-        
-        spread_type, short_strike, long_strike = strikes
-        
-        # Calculate contracts
-        contracts = self.risk.calculate_contracts(
-            spread_width=width,
-            credit=credit,
-            planned_stop=CONFIG.stop_amount,
-        )
-        
-        if contracts < 1:
-            return None, "RISK_MANAGER_REJECTED"
-        
-        return PositionPlan(
-            direction=self.direction,
-            spread_type=spread_type,
-            short_strike=short_strike,
-            long_strike=long_strike,
-            width=width,
-            credit=credit,
-            contracts=contracts,
-            stop_price=credit + CONFIG.stop_amount,
-            profit_trigger=credit - CONFIG.profit_trigger,
-        ), "OK"
+    return SpreadQuote(
+        mid=round(short["mid"] - long["mid"], 2),
+        bid_side=round(short["bid"] - long["ask"], 2),
+        ask_side=round(short["ask"] - long["bid"], 2),
+    )
+
+
+def entry_credit(chain_quotes: list[dict], short_strike: float, long_strike: float,
+                 width: int) -> tuple[SpreadQuote | None, str | None]:
+    """(quote, None) when the mid is inside the credit range, else (quote, reason)."""
+    quote = spread_quote(chain_quotes, short_strike, long_strike)
+    if quote is None:
+        return None, f"STRIKES_NOT_IN_CHAIN short={short_strike} long={long_strike}"
+    lo, hi = credit_range(width)
+    if quote.mid < lo:
+        return quote, f"CREDIT_BELOW_MIN mid={quote.mid:.2f} < {lo:.2f}"
+    if quote.mid > hi:
+        return quote, f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f}"
+    return quote, None
+
+
+def _signed_bodies(candles: pd.DataFrame, direction: str) -> pd.Series:
+    sign = 1.0 if direction == BULLISH else -1.0
+    return (candles["close"] - candles["open"]) * sign
+
+
+def momentum(candles: pd.DataFrame, direction: str, n: int | None = None) -> float:
+    """Average body (close-open) of the last n completed candles, positive = with the trade."""
+    n = n or config.MOMENTUM_CANDLES
+    if candles is None or candles.empty:
+        return 0.0
+    return float(_signed_bodies(candles.tail(n), direction).mean())
+
+
+def momentum_continuing(candles: pd.DataFrame, direction: str, ratio: float | None = None) -> bool:
+    """Last candle body is in the trade direction and at least `ratio` of the previous body."""
+    ratio = ratio if ratio is not None else config.MOMENTUM_CONTINUE_RATIO
+    if candles is None or len(candles) < 2:
+        return False
+    bodies = _signed_bodies(candles.tail(2), direction)
+    prev, last = float(bodies.iloc[0]), float(bodies.iloc[1])
+    return last > 0 and last >= ratio * prev
+
+
+def momentum_slowed(current: float, reference: float, pct: float | None = None) -> bool:
+    pct = pct if pct is not None else config.MOMENTUM_SLOWDOWN_PCT
+    return current < reference * (1.0 - pct)
+
+
+def is_news_day(d: date) -> bool:
+    return d.isoformat() in config.NEWS_DAYS
+
+
+def news_mode(d: date) -> str | None:
+    return config.NEWS_DAY_MODE if is_news_day(d) else None
+
+
+def setup_allowed(setup: str, d: date) -> bool:
+    mode = news_mode(d)
+    if mode == "skip":
+        return False
+    if mode == "orb_only":
+        return setup == "ORB"
+    return True
+
+
+def candle_end(start: datetime, interval: str) -> datetime:
+    return start + timedelta(minutes=int(interval.rstrip("m")))

@@ -1,145 +1,152 @@
-"""Risk manager for Kelly sizing and portfolio constraints."""
+"""Position sizing, portfolio-risk caps, per-day limits and the max-loss circuit breaker."""
 
-from config_45dte import (
-    MAX_RISK_PER_TRADE_PCT,
-    MAX_PORTFOLIO_RISK_PCT,
-    MAX_CONTRACTS_PER_TRADE,
-    MAX_LOSS_HITS_CIRCUIT_BREAKER,
-    EFFECTIVE_MAX_EQUITY,
-    POSITION_SIZE_TIERS,
-)
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from types import ModuleType
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+import config_45dte
+
+ET = ZoneInfo("US/Eastern")
+
+
+@dataclass
+class RiskDecision:
+    allowed: bool
+    qty: int
+    reason: str
+    details: dict[str, Any]
+
+
+def spread_risk_dollars(qty: int, max_loss: float) -> float:
+    return qty * max_loss * 100.0
 
 
 class RiskManager:
-    """Manages position sizing, risk limits, and circuit breakers."""
+    def __init__(self, config: ModuleType = config_45dte, breaker_state: dict[str, Any] | None = None,
+                 on_change: Callable[[], None] | None = None, log: Any = None) -> None:
+        self.config = config
+        self.breaker = breaker_state if breaker_state is not None else {}
+        self.breaker.setdefault("tripped", False)
+        self.breaker.setdefault("hits", [])
+        self.breaker.setdefault("tripped_at", None)
+        self.on_change = on_change or (lambda: None)
+        self.log = log
 
-    def __init__(self, alpaca_connector):
-        """Initialize risk manager."""
-        self.alpaca = alpaca_connector
-        self.max_loss_hits = 0
-        self.circuit_breaker_active = False
+    @property
+    def breaker_tripped(self) -> bool:
+        return bool(self.breaker["tripped"])
 
-    def calculate_contract_size(self, signal, current_equity):
-        """Calculate contract size using tiered position sizing for account growth."""
-        try:
-            # Get tier-based max contracts
-            tier_max_contracts = MAX_CONTRACTS_PER_TRADE
-            for tier_limit in sorted(POSITION_SIZE_TIERS.keys()):
-                if current_equity <= tier_limit:
-                    tier_max_contracts = POSITION_SIZE_TIERS[tier_limit]
-                    break
+    @property
+    def max_loss_hits(self) -> int:
+        return len(self.breaker["hits"])
 
-            # Use effective equity for risk calculation
-            effective_equity = min(current_equity, EFFECTIVE_MAX_EQUITY)
-            risk_budget = effective_equity * MAX_RISK_PER_TRADE_PCT
-            max_loss_per_contract = signal['max_loss'] * 100
+    def tier_cap(self, equity: float) -> int:
+        for limit in sorted(self.config.POSITION_SIZE_TIERS):
+            if equity < limit:
+                return self.config.POSITION_SIZE_TIERS[limit]
+        return self.config.POSITION_SIZE_TIERS[max(self.config.POSITION_SIZE_TIERS)]
 
-            if max_loss_per_contract <= 0:
-                return 1
+    def get_current_portfolio_risk(self, open_spreads: list[dict[str, Any]],
+                                   pending_entries: list[dict[str, Any]] | None = None) -> float:
+        """Dollars at risk: qty x max_loss x 100 over open spreads plus working entries."""
+        if open_spreads is None:
+            raise ValueError("get_current_portfolio_risk requires a list of open spreads, not None")
+        total = sum(spread_risk_dollars(s["qty"], s["max_loss"]) for s in open_spreads)
+        for entry in pending_entries or []:
+            total += spread_risk_dollars(entry["qty"], entry["max_loss"])
+        return total
 
-            # Calculate by risk
-            contracts_by_risk = int(risk_budget / max_loss_per_contract)
+    def size_position(self, equity: float, max_loss: float, open_risk: float) -> tuple[int, str]:
+        cfg = self.config
+        if equity <= 0 or max_loss <= 0:
+            return 0, "invalid equity or max loss"
+        per_contract = max_loss * 100.0
+        budget = equity * cfg.MAX_RISK_PER_TRADE_PCT
+        cap = self.tier_cap(equity)
+        qty = min(math.floor(budget / per_contract), cap)
+        note = f"budget={budget:.0f} per_contract={per_contract:.0f} tier_cap={cap}"
+        if qty == 0 and cfg.ALLOW_MIN_CONTRACT_OVERRIDE:
+            if (open_risk + per_contract) / equity <= cfg.MAX_PORTFOLIO_RISK_PCT:
+                qty = 1
+                note += " min-contract override"
+        reduced = False
+        while qty > 0 and (open_risk + qty * per_contract) / equity > cfg.MAX_PORTFOLIO_RISK_PCT:
+            qty -= 1
+            reduced = True
+        if reduced:
+            note += " reduced for portfolio cap"
+        return qty, note
 
-            # Cap to tier maximum
-            contracts = min(contracts_by_risk, tier_max_contracts)
+    def check_new_entry(self, spec: dict[str, Any], equity: float, open_spreads: list[dict[str, Any]],
+                        pending_entries: list[dict[str, Any]], entries_today: int,
+                        blocked_symbols: set[str] | None = None) -> RiskDecision:
+        cfg = self.config
+        symbol = spec["broker_symbol"]
+        open_risk = self.get_current_portfolio_risk(open_spreads, pending_entries)
+        details = {"equity": equity, "open_risk": open_risk, "open_risk_pct": open_risk / equity if equity else None}
+        if self.breaker_tripped:
+            return RiskDecision(False, 0, "circuit breaker tripped (run with --reset-breaker to clear)", details)
+        if blocked_symbols and symbol in blocked_symbols:
+            return RiskDecision(False, 0, "symbol blocked (unpaired leg at broker)", details)
+        busy = {s["broker_symbol"] for s in open_spreads} | {e["broker_symbol"] for e in pending_entries}
+        if symbol in busy:
+            return RiskDecision(False, 0, "already has an open spread or working entry", details)
+        if entries_today >= cfg.MAX_NEW_POSITIONS_PER_DAY:
+            return RiskDecision(False, 0, f"daily entry limit {cfg.MAX_NEW_POSITIONS_PER_DAY} reached", details)
+        qty, note = self.size_position(equity, spec["max_loss"], open_risk)
+        details["sizing"] = note
+        if qty <= 0:
+            return RiskDecision(False, 0, f"size 0 ({note})", details)
+        new_pct = (open_risk + spread_risk_dollars(qty, spec["max_loss"])) / equity
+        details["portfolio_risk_pct_after"] = new_pct
+        return RiskDecision(True, qty, f"risk_after={new_pct:.1%} ({note})", details)
 
-            contracts = max(1, contracts)
-            return contracts
+    def is_max_loss_hit(self, entry_credit: float, current_price: float | None) -> bool:
+        if current_price is None:
+            return False
+        width = self.config.SPREAD_WIDTH
+        return current_price >= entry_credit + self.config.MAX_LOSS_HIT_PCT * (width - entry_credit) - 1e-9
 
-        except Exception as e:
-            print(f"Error calculating contract size: {e}")
-            return 1
+    def is_realized_max_loss(self, entry_credit: float, exit_debit: float | None) -> bool:
+        if exit_debit is None:
+            return False
+        max_loss = self.config.SPREAD_WIDTH - entry_credit
+        return (exit_debit - entry_credit) >= self.config.MAX_LOSS_HIT_PCT * max_loss - 1e-9
 
-    def get_current_portfolio_risk(self, order_manager):
-        """Calculate total portfolio risk across all open positions."""
-        open_orders = order_manager.get_open_orders()
+    def record_max_loss_hit(self, spread_id: str, now: datetime | None = None) -> bool:
+        """Count one hit per spread; returns True when this call trips the breaker."""
+        if spread_id in self.breaker["hits"]:
+            return False
+        self.breaker["hits"].append(spread_id)
+        hits = self.max_loss_hits
+        tripped_now = False
+        if hits >= self.config.MAX_LOSS_HITS_CIRCUIT_BREAKER and not self.breaker["tripped"]:
+            self.breaker["tripped"] = True
+            self.breaker["tripped_at"] = (now or datetime.now(ET)).isoformat()
+            tripped_now = True
+        if self.log:
+            msg = (f"CIRCUIT BREAKER TRIPPED after {hits} max-loss hits; no new entries until --reset-breaker"
+                   if tripped_now else
+                   f"max-loss hit recorded for {spread_id} ({hits}/{self.config.MAX_LOSS_HITS_CIRCUIT_BREAKER})")
+            self.log.breaker(self.breaker["tripped"], hits, msg)
+        self.on_change()
+        return tripped_now
 
-        total_risk_dollars = 0
-        position_count = 0
-        risk_by_symbol = {}
+    def reset_breaker(self) -> None:
+        self.breaker["tripped"] = False
+        self.breaker["hits"] = []
+        self.breaker["tripped_at"] = None
+        if self.log:
+            self.log.breaker(False, 0, "circuit breaker manually reset")
+        self.on_change()
 
-        for order_id, order in open_orders.items():
-            position_risk = order['quantity'] * order['max_loss'] * 100
-            total_risk_dollars += position_risk
-            position_count += 1
-            risk_by_symbol[order['symbol']] = position_risk
-
-        return {
-            'total_risk_dollars': total_risk_dollars,
-            'position_count': position_count,
-            'risk_by_symbol': risk_by_symbol,
-            'open_orders': open_orders,
-        }
-
-    def can_enter_new_trade(self, signal, order_manager, current_equity):
-        """Check if new trade entry is allowed per risk rules."""
-        if self.circuit_breaker_active:
-            return {
-                'allowed': False,
-                'reason': f'Circuit breaker active: {self.max_loss_hits} trades hit max loss',
-            }
-
-        new_risk_dollars = signal['max_loss'] * 100
-        portfolio_risk = self.get_current_portfolio_risk(order_manager)
-
-        contracts = self.calculate_contract_size(signal, current_equity)
-        total_new_risk = portfolio_risk['total_risk_dollars'] + (new_risk_dollars * contracts)
-
-        portfolio_risk_pct = total_new_risk / current_equity if current_equity > 0 else 1.0
-
-        if portfolio_risk_pct > MAX_PORTFOLIO_RISK_PCT:
-            return {
-                'allowed': False,
-                'reason': f'Portfolio risk would be {portfolio_risk_pct:.1%} (max {MAX_PORTFOLIO_RISK_PCT:.1%})',
-            }
-
-        return {
-            'allowed': True,
-            'reason': 'Risk check passed',
-            'contracts': contracts,
-            'projected_risk': total_new_risk,
-            'projected_risk_pct': portfolio_risk_pct,
-        }
-
-    def check_max_loss_hit(self, order_id, current_mark_price, signal):
-        """Check if position hit max loss threshold."""
-        max_loss_per_contract = signal['max_loss']
-        current_loss = current_mark_price - signal['estimated_credit']
-
-        if current_loss >= max_loss_per_contract:
-            self.max_loss_hits += 1
-            print(f"⚠ Order {order_id}: Max loss hit! Current loss: ${current_loss:.2f}")
-
-            if self.max_loss_hits >= MAX_LOSS_HITS_CIRCUIT_BREAKER:
-                self.circuit_breaker_active = True
-                print(f"🔴 CIRCUIT BREAKER ACTIVATED: {self.max_loss_hits} trades hit max loss")
-
-            return True
-
-        return False
-
-    def reset_circuit_breaker(self):
-        """Reset circuit breaker (manual intervention)."""
-        self.circuit_breaker_active = False
-        self.max_loss_hits = 0
-        print("✓ Circuit breaker reset by human intervention")
-
-    def get_risk_summary(self, order_manager, current_equity):
-        """Get comprehensive risk summary."""
-        portfolio_risk = self.get_current_portfolio_risk(order_manager)
-
-        risk_pct = (
-            portfolio_risk['total_risk_dollars'] / current_equity
-            if current_equity > 0
-            else 0
-        )
-
-        return {
-            'current_equity': current_equity,
-            'total_risk_dollars': portfolio_risk['total_risk_dollars'],
-            'total_risk_pct': risk_pct,
-            'open_positions': portfolio_risk['position_count'],
-            'max_loss_hits': self.max_loss_hits,
-            'circuit_breaker_active': self.circuit_breaker_active,
-            'risk_by_symbol': portfolio_risk['risk_by_symbol'],
-        }
+    def daily_loss_alert(self, start_equity: float | None, current_equity: float) -> tuple[bool, float]:
+        if not start_equity:
+            return False, 0.0
+        drop = (start_equity - current_equity) / start_equity
+        return drop >= self.config.DAILY_LOSS_ALERT_PCT, drop

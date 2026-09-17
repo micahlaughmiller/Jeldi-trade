@@ -1,239 +1,193 @@
-"""Market data handler for S&P 500 stock scanning and RSI calculation."""
+"""S&P 500 universe download and Wilder-RSI signal scan."""
 
-import pandas as pd
+from __future__ import annotations
+
+import math
+import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
 import numpy as np
-from datetime import datetime, timedelta
+import pandas as pd
 import yfinance as yf
-from alpaca_connector import AlpacaConnector
-from config_45dte import (
-    RSI_PERIOD_FAST,
-    RSI_PERIOD_SLOW,
-    RSI_OVERSOLD_THRESHOLD,
-    RSI_OVERBOUGHT_THRESHOLD,
-    DATA_LOOKBACK_MONTHS,
-)
 
-# Complete S&P 500 stock list (all 500+ stocks)
-SP500_TICKERS = [
-    # Top 50
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK.B", "JNJ", "WMT",
-    "JPM", "V", "PG", "UNH", "HD", "MA", "DIS", "NFLX", "ADBE", "CRM",
-    "ABT", "XOM", "NKE", "INTC", "AMD", "BA", "CSCO", "KO", "MCD", "PEP",
-    "IBM", "QCOM", "LLY", "COST", "MRK", "AVGO", "ACN", "HON", "AXP", "CMCSA",
-    "AMGN", "SBUX", "BLK", "MDLZ", "RTX", "TXN", "PM", "LOW", "GE", "CAT",
-    # 51-100
-    "CVX", "SO", "NEE", "T", "AMAT", "LRCX", "PYPL", "MNST", "GS", "EXC",
-    "ORLY", "AEP", "COP", "PLD", "DOW", "DUK", "FDX", "REGN", "ZM", "SNPS",
-    "MU", "CDNS", "VRTX", "BKNG", "CME", "GILD", "SYK", "PCAR", "KMI", "DASH",
-    "COIN", "ROST", "TROW", "YUM", "DECK", "CTVA", "ALGN", "APTV", "PARA", "RCL",
-    "MAR", "IQV", "ZTS", "HUM", "CI", "AZO", "PAYX", "TJX", "MCHP", "EL",
-    # 101-150
-    "PH", "OKE", "JKHY", "ROK", "HPE", "MCK", "ULTA", "APP", "VRSK", "TTWO",
-    "CTAS", "DLTR", "ROP", "FIS", "EXPD", "MTCH", "TT", "PTC", "SWKS", "CHTR",
-    "RPAY", "KKR", "DHI", "ODFL", "EMR", "TEL", "WTW", "ACGL", "WRB", "IDXX",
-    "AEE", "CPRT", "PEG", "JBHT", "ETSY", "PODD", "TRMB", "ENPH", "UPS", "SLB",
-    "IRM", "BIIB", "DNOW", "RMD", "FTNT", "XEL", "FFIV", "CRL", "FORM", "AIG",
-    # 151-200
-    "PNR", "INTU", "UDR", "ARE", "SJM", "WST", "BDX", "SNA", "FRT", "STWD",
-    "TAP", "MKTX", "SPG", "BBWI", "RPM", "EFX", "BLDR", "CLF", "AES", "LVS",
-    "DAL", "FOXA", "FOX", "LYV", "MAS", "FSLR", "KEYS", "HLI", "CAH", "PWR",
-    "TIGO", "KNSL", "RES", "MORN", "ALLY", "FITB", "NDSN", "DELL", "NTAP", "AFG",
-    "NXPI", "SWK", "MRNA", "AIZ", "WLK", "VICI", "LMNX", "PKG", "PHM", "RRGB",
-    # 201-250
-    "CASY", "CLX", "CBOE", "CHRW", "APOG", "MOH", "VSH", "FRPT", "TOST", "VOYA",
-    "TFX", "ERIE", "IEMG", "SCL", "CC", "QFIN", "RLI", "VSAT", "UGI", "LKQ",
-    "OC", "TXRH", "UMC", "UFPI", "PSA", "GWW", "UNM", "IEX", "THO", "WDAY",
-    "OWL", "QLYS", "NEGG", "SFM", "UTL", "VMC", "CNA", "AAL", "LW", "MXL",
-    "VRSN", "MOS", "CACC", "TOL", "OGE", "SQM", "HSY", "AAP", "TYL", "NRG",
-    # 251-300
-    "INGR", "AMCX", "TTD", "RNG", "DRI", "TNC", "HWKN", "ACM", "VCIT", "BAP",
-    "FAF", "RY", "LH", "SUI", "VST", "PAG", "HST", "KMX", "HLT", "BKR",
-    "PLNT", "APEI", "OMF", "UHS", "POOL", "JMIA", "XPO", "INSP", "VCTR", "SCKT",
-    "KHC", "CPT", "WTS", "IFF", "LHCG", "BFAM", "GNTX", "SIR", "BHC", "PKE",
-    "DXC", "BWA", "MLI", "CAG", "SKT", "RCMT", "SEM", "PRGO", "BXP", "MLM",
-    # 301-350
-    "VLY", "SHOO", "CRT", "TTEK", "HNI", "STX", "JNPR", "FND", "WHR", "BURL",
-    "WNC", "HAYW", "NI", "GPC", "LSCC", "BK", "LB", "EPRT", "GXO", "UPLD",
-    "ATO", "BRPT", "KRG", "KFY", "ASR", "SIL", "PSTG", "FFIN", "SMPL", "ARII",
-    "BSL", "WTRG", "DLB", "CBRL", "GFF", "KDP", "XY", "NUVX", "CLF", "RAMP",
-    "AIR", "NSA", "AVT", "LYB", "BIO", "LNC", "MAT", "EQH", "OGN", "RHI",
-    # 351-400
-    "LCII", "APKS", "WFRD", "BTU", "CLH", "SCCO", "EQT", "WDC", "SEIC", "EWBC",
-    "GBCI", "HBNC", "HCCI", "PQ", "PSTV", "BG", "NVEE", "FERG", "TAL", "TRM",
-    "CHT", "ATGE", "RIO", "ALK", "SLM", "AR", "TPH", "EV", "LAD", "PLUG",
-    "HA", "BDN", "LBRDK", "LBRDA", "MUSA", "DGII", "GDRX", "SMCI", "ION", "ASX",
-    "LPLA", "BLCO", "GKOS", "ACA", "LXP", "PLOW", "SEB", "SWC", "AMTM", "LRE",
-    # 401-450
-    "AMH", "IMAB", "AGX", "PEI", "NGL", "MLKN", "OBE", "SPA", "FRTA", "ENR",
-    "THG", "PRKR", "MAG", "MXC", "TCI", "CAPL", "PAM", "AXE", "CTRA", "XFOR",
-    "WEX", "PNRA", "REXR", "OPY", "FLR", "MNW", "ARWR", "UFI", "AMF", "AMRX",
-    "NEE", "ENZ", "ANDE", "BTE", "PVG", "PAAS", "APLE", "VABK", "AMK", "NGL",
-    "BRX", "PFGC", "CGL", "VOYA", "DAR", "SCKT", "PLTK", "TAK", "MGOL", "SCPL",
-    
-    "CDTX", "SOLN", "SPXC", "ATGE", "VUSE", "CEG", "GDDY", "DBX", "REG", "FELE",
-    "NVEC", "LYTS", "PRSP", "OHI", "TPB", "CALM", "TRIN",
-    "AGM", "BWXT", "PAC", "IPHI", "BFC", "PRCT", "NZR", "BRNW", "CHD", "RGEN",
-    "LW", "DORM", "WLL", "EPD", "FTCH", "CNHI", "ASGN", "MTZ", "OGI",
-    "EVA", "BKD", "PWM", "VEEV", "ASLE", "FOSL", "PMVP", "ATNY", "WSM",
-]
+import config_45dte
+
+HERE = Path(__file__).resolve().parent
 
 
-class MarketDataHandler:
-    """Handles market data fetching and technical analysis."""
+@dataclass
+class ScanResult:
+    results: list[dict[str, Any]] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    elapsed_sec: float = 0.0
 
-    def __init__(self):
-        """Initialize data handler with Alpaca connector."""
-        self.alpaca = AlpacaConnector()
-        self.rsi_fast_period = RSI_PERIOD_FAST
-        self.rsi_slow_period = RSI_PERIOD_SLOW
+    @property
+    def ok_count(self) -> int:
+        return len(self.results)
 
-    def calculate_rsi(self, prices, period):
-        """
-        Calculate Relative Strength Index (RSI).
+    @property
+    def signals(self) -> list[dict[str, Any]]:
+        return [r for r in self.results if r["signal"] is not None]
 
-        Args:
-            prices: Series of closing prices
-            period: RSI period (e.g., 14 or 28)
 
-        Returns:
-            Series of RSI values
-        """
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+def to_yf_symbol(broker_symbol: str) -> str:
+    return broker_symbol.replace(".", "-")
 
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
 
-    def fetch_and_enrich_data(self, symbol):
-        """
-        Fetch historical data and enrich with RSI indicators.
+def to_broker_symbol(yf_symbol: str) -> str:
+    return yf_symbol.replace("-", ".")
 
-        Args:
-            symbol: Stock ticker
 
-        Returns:
-            DataFrame with OHLCV + RSI(14) + RSI(28), or None if fetch fails
-        """
-        try:
-            # Calculate lookback: 6 months + buffer for RSI calculation
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=DATA_LOOKBACK_MONTHS * 30 + 100)
+def load_universe(path: str | Path | None = None, config: ModuleType = config_45dte) -> list[str]:
+    """Broker-spelled tickers (e.g. ``BRK.B``), de-duplicated, order preserved."""
+    file = Path(path) if path is not None else Path(config.UNIVERSE_FILE)
+    if not file.is_absolute():
+        file = HERE / file
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in file.read_text().splitlines():
+        sym = line.strip().upper()
+        if sym and not sym.startswith("#") and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
 
-            # Fetch bars from yfinance
-            bars = yf.download(symbol, start=start_date, end=end_date, progress=False)
 
-            if bars is None or bars.empty:
-                return None
+def _rsi_value(avg_gain: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
 
-            # Handle yfinance column format (may be MultiIndex or tuple)
-            if isinstance(bars.columns, pd.MultiIndex):
-                # If MultiIndex, get level 0 (column names)
-                bars.columns = bars.columns.get_level_values(0)
 
-            # Rename columns to lowercase for consistency
-            bars.columns = [str(col).lower() for col in bars.columns]
+def rsi_wilder(close: pd.Series, period: int) -> pd.Series:
+    """RSI seeded with an SMA of the first `period` changes, then Wilder-smoothed."""
+    values = close.to_numpy(dtype=float)
+    n = len(values)
+    out = np.full(n, np.nan)
+    if n <= period:
+        return pd.Series(out, index=close.index)
+    deltas = np.diff(values)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = float(gains[:period].mean())
+    avg_loss = float(losses[:period].mean())
+    out[period] = _rsi_value(avg_gain, avg_loss)
+    for i in range(period, n - 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        out[i + 1] = _rsi_value(avg_gain, avg_loss)
+    return pd.Series(out, index=close.index)
 
-            # Ensure close column exists
-            if 'close' not in bars.columns:
-                return None
 
-            # Calculate RSI indicators
-            bars['rsi_14'] = self.calculate_rsi(bars['close'], self.rsi_fast_period)
-            bars['rsi_28'] = self.calculate_rsi(bars['close'], self.rsi_slow_period)
+def classify(rsi_fast: float, rsi_slow: float, config: ModuleType = config_45dte) -> tuple[str | None, bool]:
+    """Return (signal, strong): 'oversold' / 'overbought' / None."""
+    if np.isnan(rsi_fast) or np.isnan(rsi_slow):
+        return None, False
+    if rsi_fast < config.RSI_OVERSOLD and rsi_slow < config.RSI_OVERSOLD:
+        strong = rsi_fast < config.RSI_STRONG_OVERSOLD and rsi_slow < config.RSI_STRONG_OVERSOLD
+        return "oversold", strong
+    if rsi_fast > config.RSI_OVERBOUGHT and rsi_slow > config.RSI_OVERBOUGHT:
+        strong = rsi_fast > config.RSI_STRONG_OVERBOUGHT and rsi_slow > config.RSI_STRONG_OVERBOUGHT
+        return "overbought", strong
+    return None, False
 
-            # Get the latest row
-            latest = bars.iloc[-1]
 
-            return {
-                'symbol': symbol,
-                'timestamp': bars.index[-1] if len(bars.index) > 0 else datetime.now(),
-                'close': float(latest['close']),
-                'rsi_14': float(latest['rsi_14']) if pd.notna(latest['rsi_14']) else None,
-                'rsi_28': float(latest['rsi_28']) if pd.notna(latest['rsi_28']) else None,
-                'bars': bars,  # Return full dataframe for debugging
-            }
-
-        except Exception as e:
-            print(f"Error enriching data for {symbol}: {e}")
-            return None
-
-    def scan_sp500_for_signals(self, skip_symbols=None, on_signal_callback=None):
-        """
-        Scan S&P 500 for overbought/oversold signals.
-        Yields signals immediately as they're found (no wait for full scan).
-
-        Args:
-            skip_symbols: List of symbols to skip (e.g., already in position)
-            on_signal_callback: Function to call immediately when signal found
-
-        Returns:
-            List of all signals found (also yields via callback)
-        """
-        skip_symbols = skip_symbols or []
-        signals = []
-        signal_count = 0
-
-        print(f"Scanning {len(SP500_TICKERS)} S&P 500 stocks for RSI confluence...")
-
-        for i, symbol in enumerate(SP500_TICKERS):
-            if symbol in skip_symbols:
-                print(f"[{i+1}/{len(SP500_TICKERS)}] {symbol}: Skipped (in position)")
+def extract_closes(frame: pd.DataFrame, yf_symbols: list[str]) -> dict[str, pd.Series]:
+    """Per-ticker close series from a batched yfinance frame (MultiIndex or flat)."""
+    closes: dict[str, pd.Series] = {}
+    if frame is None or frame.empty:
+        return closes
+    if isinstance(frame.columns, pd.MultiIndex):
+        # yfinance puts the ticker on level 0 with group_by="ticker", else the field.
+        ticker_level = 0 if "Close" in frame.columns.get_level_values(1) else 1
+        present = set(frame.columns.get_level_values(ticker_level))
+        for sym in yf_symbols:
+            if sym not in present:
                 continue
+            series = frame.xs(sym, axis=1, level=ticker_level).get("Close")
+            if series is not None:
+                series = series.dropna()
+                if not series.empty:
+                    closes[sym] = series.astype(float)
+    elif "Close" in frame.columns and len(yf_symbols) == 1:
+        series = frame["Close"].dropna()
+        if not series.empty:
+            closes[yf_symbols[0]] = series.astype(float)
+    return closes
 
-            data = self.fetch_and_enrich_data(symbol)
-            time.sleep(1)
 
-            if data is None:
-                print(f"[{i+1}/{len(SP500_TICKERS)}] {symbol}: No data")
-                continue
+def _download_chunk(job: tuple[list[str], str]) -> dict[str, pd.Series]:
+    yf_symbols, period = job
+    frame = yf.download(
+        yf_symbols,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        threads=True,
+        progress=False,
+        auto_adjust=False,
+    )
+    return extract_closes(frame, yf_symbols)
 
-            rsi_14 = data['rsi_14']
-            rsi_28 = data['rsi_28']
 
-            if rsi_14 is None or rsi_28 is None:
-                print(f"[{i+1}/{len(SP500_TICKERS)}] {symbol}: RSI not ready")
-                continue
+def download_closes(yf_symbols: list[str], config: ModuleType = config_45dte) -> dict[str, pd.Series]:
+    """One batched yf.download per worker PROCESS. yfinance serializes requests inside a process
+    (~0.26 s/ticker -> 130 s for 500 names) and concurrent downloads in one process corrupt its
+    shared result dict, so chunks go to separate processes."""
+    workers = max(1, min(int(config.DOWNLOAD_WORKERS), len(yf_symbols)))
+    if workers == 1:
+        return _download_chunk((yf_symbols, config.HISTORY_PERIOD))
+    size = math.ceil(len(yf_symbols) / workers)
+    jobs = [(yf_symbols[i:i + size], config.HISTORY_PERIOD) for i in range(0, len(yf_symbols), size)]
+    closes: dict[str, pd.Series] = {}
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for part in pool.map(_download_chunk, jobs):
+            closes.update(part)
+    return closes
 
-            # Check for RSI confluence
-            signal_type = None
 
-            # Oversold: Both RSI < 30
-            if rsi_14 < RSI_OVERSOLD_THRESHOLD and rsi_28 < RSI_OVERSOLD_THRESHOLD:
-                signal_type = "oversold"
-
-            # Overbought: Both RSI > 70
-            elif rsi_14 > RSI_OVERBOUGHT_THRESHOLD and rsi_28 > RSI_OVERBOUGHT_THRESHOLD:
-                signal_type = "overbought"
-
-            if signal_type:
-                signal_count += 1
-                print(f"[{i+1}/{len(SP500_TICKERS)}] {symbol}: ✓ {signal_type.upper()} (RSI14={rsi_14:.2f}, RSI28={rsi_28:.2f})")
-
-                signal = {
-                    'symbol': symbol,
-                    'signal_type': signal_type,  # "oversold" or "overbought"
-                    'rsi_14': rsi_14,
-                    'rsi_28': rsi_28,
-                    'close': data['close'],
-                    'timestamp': data['timestamp'],
-                }
-
-                signals.append(signal)
-
-                # Call callback immediately to process entry
-                if on_signal_callback:
-                    on_signal_callback(signal)
-            else:
-                print(f"[{i+1}/{len(SP500_TICKERS)}] {symbol}: No signal (RSI14={rsi_14:.2f}, RSI28={rsi_28:.2f})")
-
-        print(f"\n✓ Scan complete. Found {signal_count} signals.\n")
-        return signals
-
-    def get_latest_price(self, symbol):
-        """Get latest close price for a symbol."""
-        data = self.fetch_and_enrich_data(symbol)
-        if data:
-            return data['close']
+def analyze(broker_symbol: str, close: pd.Series, config: ModuleType = config_45dte) -> dict[str, Any] | None:
+    """RSI(14)/RSI(28) on daily closes; the last bar is today's live bar during the session."""
+    if len(close) <= config.RSI_SLOW:
         return None
+    rsi_fast = float(rsi_wilder(close, config.RSI_FAST).iloc[-1])
+    rsi_slow = float(rsi_wilder(close, config.RSI_SLOW).iloc[-1])
+    signal, strong = classify(rsi_fast, rsi_slow, config)
+    return {
+        "symbol": broker_symbol,
+        "broker_symbol": broker_symbol,
+        "yf_symbol": to_yf_symbol(broker_symbol),
+        "signal": signal,
+        "strong": strong,
+        "rsi14": round(rsi_fast, 2),
+        "rsi28": round(rsi_slow, 2),
+        "close": round(float(close.iloc[-1]), 4),
+        "as_of": close.index[-1].to_pydatetime() if hasattr(close.index[-1], "to_pydatetime") else None,
+    }
+
+
+def scan(tickers: list[str] | None = None, log: Any = None, config: ModuleType = config_45dte) -> ScanResult:
+    """One batched download of the universe, then RSI classification per ticker."""
+    universe = tickers if tickers is not None else load_universe(config=config)
+    yf_symbols = [to_yf_symbol(s) for s in universe]
+    started = time.perf_counter()
+    if log:
+        log.scan_start(len(universe))
+    closes = download_closes(yf_symbols, config)
+    result = ScanResult()
+    for broker_symbol, yf_symbol in zip(universe, yf_symbols):
+        series = closes.get(yf_symbol)
+        row = analyze(broker_symbol, series, config) if series is not None else None
+        if row is None:
+            result.failed.append(broker_symbol)
+        else:
+            result.results.append(row)
+    result.elapsed_sec = round(time.perf_counter() - started, 2)
+    if log:
+        log.scan_result(result.ok_count, len(result.failed), result.elapsed_sec, result.signals, result.failed)
+    return result

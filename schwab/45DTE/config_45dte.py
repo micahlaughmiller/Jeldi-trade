@@ -1,103 +1,98 @@
-# 45-60 DTE Credit Spread System Configuration
+"""Configuration for the 45-60 DTE S&P 500 credit-spread bot (Schwab).
 
-# ============================================================================
-# SCHWAB TRADING (OAuth2)
-# ============================================================================
-# Paper trading: True | Live trading: False
-PAPER_TRADING = True
+Secrets come from this folder's `.env` (never literal keys here):
+    SCHWAB_APP_KEY=...
+    SCHWAB_APP_SECRET=...
+    SCHWAB_CALLBACK_URL=https://127.0.0.1:8080
+    SCHWAB_ACCOUNT_INDEX=0
+    SCHWAB_LIVE_ORDERS=false     # true -> real orders are submitted
 
-# Get these from: https://developer.schwab.com
-# DO NOT hardcode credentials here - use .env file instead
+Schwab has NO paper-trading API: every submitted order is real money. Orders
+stay in DRY-RUN (logged, not sent) until SCHWAB_LIVE_ORDERS=true.
+Strategy parameters below are identical to Alpaca/45DTE/config_45dte.py; only
+the broker section differs. Run tools/check_sync.py to confirm.
+"""
+
 import os
+from datetime import date
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-SCHWAB_CLIENT_ID = os.getenv("SCHWAB_APP_KEY", "your_client_id")
-SCHWAB_SECRET_KEY = os.getenv("SCHWAB_APP_SECRET", "your_secret_key")
+SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
+SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
+SCHWAB_CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8080")
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", str(Path(__file__).resolve().parent / "token.json"))
+SCHWAB_ACCOUNT_INDEX = int(os.getenv("SCHWAB_ACCOUNT_INDEX", "0"))
+PAPER_TRADING = False
 
-# Dynamically resolve TOKEN_PATH relative to this file's folder
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-env_token_path = os.getenv("SCHWAB_TOKEN_PATH", "./token.json")
+DRY_RUN = os.getenv("SCHWAB_LIVE_ORDERS", "false").strip().lower() not in ("1", "true", "yes")
+RISK_FREE_RATE = 0.04
+CLOSE_SLIPPAGE = 0.05
+CLOSE_RETRY_SEC = 15
+CLOSE_MAX_RETRIES = 6
+LOG_DIR = "logs"
 
-if env_token_path.startswith("."):
-    TOKEN_PATH = os.path.abspath(os.path.join(BASE_DIR, env_token_path))
-else:
-    TOKEN_PATH = os.path.abspath(env_token_path)
+UNIVERSE_FILE = "data/sp500_tickers.txt"
+HISTORY_PERIOD = "1y"
+DOWNLOAD_WORKERS = 8
+RSI_FAST = 14
+RSI_SLOW = 28
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+RSI_STRONG_OVERSOLD = 25
+RSI_STRONG_OVERBOUGHT = 75
 
-# Schwab API endpoints
-SCHWAB_BASE_URL = "https://api.schwabapi.com/trader/v1"
+DTE_MIN = 45
+DTE_MAX = 60
+DTE_TARGET = 52
+DTE_TOLERANCE_DAYS = 10
+DTE_SEARCH_MIN = 30
+DTE_SEARCH_MAX = 80
+TARGET_DELTA = 0.30
+DELTA_MIN = 0.20
+DELTA_MAX = 0.40
+SPREAD_WIDTH = 5.0
+MIN_CREDIT = 1.50
+MIN_CREDIT_STRONG = 1.40
 
-# ============================================================================
-# ACCOUNT & RISK PARAMETERS
-# ============================================================================
-INITIAL_ACCOUNT_EQUITY = 5000.00
-MAX_RISK_PER_TRADE_PCT = 0.04  # 4% of account per trade
-MAX_PORTFOLIO_RISK_PCT = 0.52  # 52% maximum exposure across all trades
-MAX_CONTRACTS_PER_TRADE = 40
+POSITION_SIZE_TIERS = {10_000: 3, 30_000: 5, 50_000: 10, float("inf"): 15}
+MAX_RISK_PER_TRADE_PCT = 0.04
+MAX_PORTFOLIO_RISK_PCT = 0.52
+ALLOW_MIN_CONTRACT_OVERRIDE = True
+MAX_NEW_POSITIONS_PER_DAY = 10
+MAX_LOSS_HITS_CIRCUIT_BREAKER = 3
+MAX_LOSS_HIT_PCT = 0.90
+DAILY_LOSS_ALERT_PCT = 0.03
 
-# ============================================================================
-# POSITION SIZING TIERS (for account growth strategy)
-# ============================================================================
-EFFECTIVE_MAX_EQUITY = 10000.00  # Treat account as if it has this much for sizing
-POSITION_SIZE_TIERS = {
-    10000: 3,      # Up to $10k: max 3 contracts
-    25000: 5,      # Up to $25k: max 5 contracts
-    50000: 10,     # Up to $50k: max 10 contracts
-    100000: 15,    # Up to $100k: max 15 contracts
-}  # Tiers are evaluated in order - uses first tier where account_size <= tier_limit
+PROFIT_TARGET_PCT = 0.50
+EXIT_DTE = 7
+MAX_LOSS_EXIT = True
+ENTRY_TIME_IN_FORCE = "day"
+PRICE_REDUCTION_INTERVAL_MIN = 60
+PRICE_REDUCTION_AMOUNT = 0.02
+CANCEL_UNFILLED_AT = "15:55"
 
-# ============================================================================
-# SIGNAL & ENTRY PARAMETERS
-# ============================================================================
-# RSI Indicators
-RSI_PERIOD_FAST = 14
-RSI_PERIOD_SLOW = 28
-RSI_OVERSOLD_THRESHOLD = 30
-RSI_OVERBOUGHT_THRESHOLD = 70
+SCAN_SCHEDULE = [("09:30", "11:30", 5), ("11:30", "15:00", 30), ("15:00", "16:00", 5)]
+MAINTENANCE_INTERVAL_SEC = 60
+REPORT_INTERVAL_MIN = 60
+MARKET_OPEN = "09:30"
+MARKET_CLOSE = "16:00"
+EOD_TIME = "16:05"
+LOOP_SLEEP_SEC = 15
+IDLE_LOG_INTERVAL_SEC = 300
 
-# Timeframe
-DATA_LOOKBACK_MONTHS = 6  # 6-month chart
-CANDLE_TYPE = "1D"  # Daily candles
-
-# Entry Requirements
-TARGET_DELTA = 0.30  # Short strike delta
-SPREAD_WIDTH = 5.00  # $5 wide spread
-MIN_CREDIT_TARGET = 1.45  # Minimum credit to enter ($1.45)
-MIN_CREDIT_FLOOR = 1.35  # Minimum credit before canceling ($1.35)
-
-# ============================================================================
-# EXIT PARAMETERS
-# ============================================================================
-PROFIT_TARGET_PCT = 0.50  # Close at 50% of max profit
-EXPIRATION_DTE_MIN = 45
-EXPIRATION_DTE_MAX = 60
-
-# ============================================================================
-# ORDER MANAGEMENT
-# ============================================================================
-PRICE_REDUCTION_INTERVAL_HOURS = 1  # Reduce price every 1 hour
-PRICE_REDUCTION_AMOUNT = 0.02  # Reduce by $0.02 per interval
-ORDER_TYPE = "limit"
-TIME_IN_FORCE = "gtc"  # Good-Till-Cancelled for profit targets
-
-# ============================================================================
-# CIRCUIT BREAKERS & SAFETY
-# ============================================================================
-MAX_LOSS_HITS_CIRCUIT_BREAKER = 3  # If 3+ trades hit max loss, halt new entries
-DAILY_LOSS_LIMIT_PCT = 0.03  # 3% daily loss triggers alert
-PEAK_DRAWDOWN_LIMIT_PCT = 0.15  # 15% peak-to-trough triggers freeze
-
-# ============================================================================
-# SP500 SCAN
-# ============================================================================
-SP500_SCAN_TIME = "09:35"  # Scan 5 min after market open (ET)
-SP500_SCAN_WINDOW_SECONDS = 300  # 5-minute window to trigger scan
-CHECK_EXISTING_POSITIONS = True  # Skip tickers already in position
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-LOG_DIR = "./logs_45dte"
-LOG_LEVEL = "INFO"
-ENABLE_DAILY_SUMMARY = True
+MARKET_HOLIDAYS = [
+    date(2026, 1, 1),
+    date(2026, 1, 19),
+    date(2026, 2, 16),
+    date(2026, 4, 3),
+    date(2026, 5, 25),
+    date(2026, 6, 19),
+    date(2026, 7, 3),
+    date(2026, 9, 7),
+    date(2026, 11, 26),
+    date(2026, 12, 25),
+]

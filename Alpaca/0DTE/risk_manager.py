@@ -1,90 +1,72 @@
-# ============================================
-# RISK MANAGER - 0DTE TRADING
-# Manages account risk, position sizing, and risk tiers
-# ============================================
+"""Tiering, contract sizing, and daily circuit breakers."""
 
-import logging
+from dataclasses import asdict, dataclass, field
+from math import floor
 
-logger = logging.getLogger(__name__)
+import config
+
+
+def tier(equity: float) -> int:
+    for ceiling, t in config.TIER_BANDS:
+        if equity < ceiling:
+            return t
+    return config.TIER_BANDS[-1][1]
+
+
+def contracts_for(equity: float, width: int, credit: float, open_risk_dollars: float,
+                  news_day: bool = False) -> int:
+    max_loss = (width - credit) * 100.0
+    if max_loss <= 0 or equity <= 0:
+        return 0
+    n = floor(equity * config.RISK_PER_TRADE_PCT / max_loss)
+    if n == 0 and config.ALLOW_MIN_CONTRACT_OVERRIDE \
+            and (open_risk_dollars + max_loss) / equity <= config.MAX_PORTFOLIO_RISK_PCT:
+        n = 1
+    portfolio_cap = floor((config.MAX_PORTFOLIO_RISK_PCT * equity - open_risk_dollars) / max_loss)
+    n = min(n, max(portfolio_cap, 0), config.MAX_CONTRACTS_PER_TRADE)
+    if news_day and config.NEWS_DAY_MODE == "half_size" and n >= 1:
+        n = max(1, n // 2)
+    return max(n, 0)
+
+
+@dataclass
+class DayState:
+    start_equity: float
+    trades_today: int = 0
+    consecutive_losses: int = 0
+    realized_pnl: float = 0.0
+    closed_trades: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DayState":
+        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
 
 class RiskManager:
-    """Handles risk tier evaluations, position sizing, and account equity tracking."""
+    def __init__(self, start_equity: float, state: DayState | None = None):
+        self.state = state or DayState(start_equity=start_equity)
 
-    def __init__(self, api_handler=None, initial_equity=None):
-        self.api_handler = api_handler
-        self.current_equity = initial_equity
-        self.daily_pnl = 0.0
+    def record_trade(self, pnl: float, row: dict | None = None) -> None:
+        self.state.trades_today += 1
+        self.state.realized_pnl += pnl
+        self.state.consecutive_losses = self.state.consecutive_losses + 1 if pnl < 0 else 0
+        if row is not None:
+            self.state.closed_trades.append(row)
 
-    def update_equity(self, equity=None):
-        """Updates the internal equity tracking state from parameter or API."""
-        if equity is not None:
-            self.current_equity = float(equity)
-            return self.current_equity
+    def daily_loss_limit(self) -> float:
+        return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
-        if self.api_handler:
-            account_info = self.api_handler.get_account_info()
-            if account_info and "equity" in account_info:
-                self.current_equity = float(account_info["equity"])
-                return self.current_equity
-
-        logger.warning("Could not update equity from API handler.")
-        return self.current_equity
-
-    def tier(self):
-        """Determines current risk tier based on account equity."""
-        if self.current_equity is None:
-            self.update_equity()
-
-        if self.current_equity is None:
-            raise RuntimeError("Update equity before requesting tier.")
-
-        eq = self.current_equity
-
-        if eq >= 100000:
-            return "TIER_1"
-        elif eq >= 50000:
-            return "TIER_2"
-        elif eq >= 25000:
-            return "TIER_3"
-        else:
-            return "TIER_4"
-
-    def calculate_position_size(
-        self, short_strike, long_strike, credit_received
-    ):
-        """Calculates maximum contracts based on risk tier and max loss per spread."""
-        width = abs(short_strike - long_strike)
-        max_loss_per_contract = (width - credit_received) * 100
-
-        if max_loss_per_contract <= 0:
-            logger.error("Invalid spread parameters for position sizing.")
-            return 0
-
-        current_tier = self.tier()
-
-        if current_tier == "TIER_1":
-            max_risk = 5000.0
-        elif current_tier == "TIER_2":
-            max_risk = 2500.0
-        elif current_tier == "TIER_3":
-            max_risk = 1000.0
-        else:
-            max_risk = 500.0
-
-        contracts = int(max_risk // max_loss_per_contract)
-        return max(1, contracts)
-
-    def snapshot(self):
-        """Generates a snapshot of the current risk state safely."""
-        self.update_equity()
-
-        current_tier = self.tier()
-        return {
-            "equity": self.current_equity,
-            "tier": current_tier,
-            "daily_pnl": self.daily_pnl,
-        }
-    def reset_day(self):
-        """Resets daily risk metrics."""
-        pass
+    def trading_allowed(self, equity: float | None = None) -> tuple[bool, str]:
+        s = self.state
+        if s.trades_today >= config.MAX_TRADES_PER_DAY:
+            return False, f"MAX_TRADES_PER_DAY ({s.trades_today})"
+        if s.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            return False, f"MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
+        if s.realized_pnl <= self.daily_loss_limit():
+            return False, f"DAILY_LOSS_LIMIT realized={s.realized_pnl:.2f}"
+        if equity is not None and equity - s.start_equity <= self.daily_loss_limit():
+            return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={s.start_equity:.2f}"
+        return True, "OK"

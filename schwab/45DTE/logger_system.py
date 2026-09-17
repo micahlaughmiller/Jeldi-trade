@@ -1,208 +1,194 @@
-"""Logging system for 45-60 DTE trading strategy."""
+"""JSONL event log, trades CSV and end-of-day summary."""
 
-import os
+from __future__ import annotations
+
+import csv
 import json
-from datetime import datetime
+import math
+from collections import Counter
+from datetime import date, datetime
 from pathlib import Path
-from config_45dte import LOG_DIR, LOG_LEVEL
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("US/Eastern")
+
+TRADE_COLUMNS = [
+    "timestamp", "action", "spread_id", "symbol", "right", "expiration", "short_strike", "long_strike",
+    "qty", "entry_credit", "exit_debit", "realized_pl", "reason", "order_id",
+]
 
 
-class LoggerSystem:
-    """Manages daily trading logs and summaries."""
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (set, frozenset, tuple)):
+        return list(value)
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return str(value)
 
-    def __init__(self):
-        """Initialize logger system."""
-        self.log_dir = Path(LOG_DIR)
+
+class TradingLogger:
+    def __init__(self, log_dir: str | Path, now_fn: Callable[[], datetime] | None = None, echo: bool = True) -> None:
+        self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.now_fn = now_fn or (lambda: datetime.now(ET))
+        self.echo = echo
+        self.counts: Counter[str] = Counter()
+        self.counts_date: date = self.now_fn().date()
 
-        self.session_date = datetime.now().strftime("%Y-%m-%d")
-        self.session_file = self.log_dir / f"session_{self.session_date}.log"
-        self.trades_file = self.log_dir / f"trades_{self.session_date}.csv"
+    def session_file(self, day: date | None = None) -> Path:
+        return self.log_dir / f"session_{(day or self.now_fn().date()).isoformat()}.jsonl"
 
-        self.session_log = []
-        self.trades_log = []
-        self.daily_summary = {
-            'date': self.session_date,
-            'start_time': datetime.now().isoformat(),
-            'end_time': None,
-            'tickers_analyzed': [],
-            'signals_generated': [],
-            'trades_opened': [],
-            'trades_closed': [],
-            'daily_pnl': 0.0,
-            'events': [],
+    def trades_file(self, day: date | None = None) -> Path:
+        return self.log_dir / f"trades_{(day or self.now_fn().date()).isoformat()}.csv"
+
+    def summary_file(self, day: date | None = None) -> Path:
+        return self.log_dir / f"summary_{(day or self.now_fn().date()).isoformat()}.json"
+
+    def _roll_counts(self, today: date) -> None:
+        if today != self.counts_date:
+            self.counts = Counter()
+            self.counts_date = today
+
+    def log_event(self, event_type: str, message: str, **fields: Any) -> dict[str, Any]:
+        now = self.now_fn()
+        self._roll_counts(now.date())
+        self.counts[event_type] += 1
+        event = {"timestamp": now.isoformat(), "type": event_type, "message": message, **fields}
+        line = json.dumps(event, default=_json_default)
+        with self.session_file(now.date()).open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        if self.echo:
+            print(f"{now.strftime('%H:%M:%S')} [{event_type}] {message}", flush=True)
+        return event
+
+    def scan_start(self, ticker_count: int) -> None:
+        self.log_event("SCAN_START", f"Scanning {ticker_count} tickers", ticker_count=ticker_count)
+
+    def scan_result(self, ok: int, failed: int, elapsed_sec: float, signals: list[dict[str, Any]],
+                    failed_symbols: list[str]) -> None:
+        self.log_event(
+            "SCAN_RESULT",
+            f"Downloaded {ok} ok / {failed} failed in {elapsed_sec:.1f}s; {len(signals)} signal(s)",
+            ok=ok, failed=failed, elapsed_sec=elapsed_sec,
+            signals=[s["symbol"] for s in signals], failed_symbols=failed_symbols,
+        )
+
+    def signal(self, row: dict[str, Any]) -> None:
+        strong = " STRONG" if row.get("strong") else ""
+        self.log_event(
+            "SIGNAL",
+            f"{row['symbol']}: {row['signal']}{strong} RSI14={row['rsi14']:.1f} RSI28={row['rsi28']:.1f} close={row['close']}",
+            **row,
+        )
+
+    def trade_spec(self, spec: dict[str, Any]) -> None:
+        if spec.get("accepted"):
+            msg = (f"{spec['symbol']} {spec['right']} {spec['short_strike']}/{spec['long_strike']} exp {spec['expiration']} "
+                   f"dte={spec['dte']} delta={spec['short_delta']:.2f} credit={spec['credit']:.2f} bid_side={spec['bid_side']:.2f}")
+        else:
+            msg = f"{spec['symbol']} skipped: {spec['reason']}"
+        self.log_event("TRADE_SPEC", msg, **spec)
+
+    def risk_check(self, symbol: str, allowed: bool, qty: int, reason: str, **details: Any) -> None:
+        verdict = "ALLOWED" if allowed else "REJECTED"
+        self.log_event("RISK_CHECK", f"{symbol}: {verdict} qty={qty} {reason}", symbol=symbol, allowed=allowed,
+                       qty=qty, reason=reason, **details)
+
+    def order_submitted(self, kind: str, spread: dict[str, Any], order: dict[str, Any], limit: float) -> None:
+        self.log_event(
+            f"{kind.upper()}_SUBMITTED",
+            f"{spread['symbol']} {spread['right']} {spread['short_strike']}/{spread['long_strike']} x{spread['qty']} "
+            f"limit={limit:.2f} tif={order.get('time_in_force')} id={order.get('id')} status={order.get('status')}",
+            spread_id=spread.get("id"), order_id=order.get("id"), status=order.get("status"), limit=limit,
+            qty=spread["qty"], symbol=spread["symbol"],
+        )
+
+    def fill(self, spread: dict[str, Any], order: dict[str, Any]) -> None:
+        self.log_event(
+            "FILL",
+            f"{spread['symbol']} entry filled x{order.get('filled_qty')} @ {order.get('filled_avg_price')} (id={order.get('id')})",
+            spread_id=spread.get("id"), order_id=order.get("id"), filled_qty=order.get("filled_qty"),
+            filled_avg_price=order.get("filled_avg_price"), symbol=spread["symbol"],
+        )
+        self.record_trade("ENTRY_FILL", spread, order_id=order.get("id"))
+
+    def close_submitted(self, spread: dict[str, Any], order: dict[str, Any], limit: float) -> None:
+        self.order_submitted("close", spread, order, limit)
+
+    def price_reduction(self, symbol: str, old_id: str, new_id: str, old_limit: float, new_limit: float) -> None:
+        self.log_event("PRICE_REDUCTION", f"{symbol}: {old_limit:.2f} -> {new_limit:.2f} ({old_id} -> {new_id})",
+                       symbol=symbol, old_order_id=old_id, new_order_id=new_id, old_limit=old_limit, new_limit=new_limit)
+
+    def entry_canceled(self, symbol: str, order_id: str, reason: str) -> None:
+        self.log_event("ENTRY_CANCELED", f"{symbol}: canceled {order_id} ({reason})", symbol=symbol,
+                       order_id=order_id, reason=reason)
+
+    def position_closed(self, spread: dict[str, Any], exit_debit: float | None, realized_pl: float | None,
+                        reason: str, order_id: str | None) -> None:
+        pl = "n/a" if realized_pl is None else f"{realized_pl:+.2f}"
+        exit_txt = "n/a" if exit_debit is None else f"{exit_debit:.2f}"
+        self.log_event(
+            "POSITION_CLOSED",
+            f"{spread['symbol']} {spread['right']} {spread['short_strike']}/{spread['long_strike']} x{spread['qty']} "
+            f"exit={exit_txt} P&L={pl} ({reason})",
+            spread_id=spread.get("id"), symbol=spread["symbol"], exit_debit=exit_debit, realized_pl=realized_pl,
+            reason=reason, order_id=order_id,
+        )
+        self.record_trade("CLOSE", spread, exit_debit=exit_debit, realized_pl=realized_pl, reason=reason, order_id=order_id)
+
+    def breaker(self, tripped: bool, hits: int, message: str) -> None:
+        self.log_event("BREAKER", message, tripped=tripped, hits=hits)
+
+    def reconcile(self, ok: bool, mismatches: list[dict[str, Any]], path: Path | None) -> None:
+        kind = "RECONCILE_OK" if ok else "RECONCILE_MISMATCH"
+        self.log_event(kind, f"{len(mismatches)} mismatch(es)", mismatches=mismatches, path=path)
+
+    def start_of_day(self, **fields: Any) -> None:
+        self.log_event("START_OF_DAY", "Start-of-day report", **fields)
+
+    def end_of_day(self, **fields: Any) -> None:
+        self.log_event("END_OF_DAY", "End-of-day summary written", **fields)
+
+    def record_trade(self, action: str, spread: dict[str, Any], exit_debit: float | None = None,
+                     realized_pl: float | None = None, reason: str = "", order_id: str | None = None) -> None:
+        path = self.trades_file()
+        new = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=TRADE_COLUMNS)
+            if new:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp": self.now_fn().isoformat(), "action": action, "spread_id": spread.get("id"),
+                "symbol": spread["symbol"], "right": spread["right"], "expiration": spread["expiration"],
+                "short_strike": spread["short_strike"], "long_strike": spread["long_strike"], "qty": spread["qty"],
+                "entry_credit": spread.get("entry_credit"), "exit_debit": exit_debit, "realized_pl": realized_pl,
+                "reason": reason, "order_id": order_id,
+            })
+
+    def write_daily_summary(self, summary: dict[str, Any]) -> Path:
+        now = self.now_fn()
+        self._roll_counts(now.date())
+        payload = {
+            "date": now.date().isoformat(),
+            "written_at": now.isoformat(),
+            "counts": {
+                "scans": self.counts["SCAN_RESULT"],
+                "signals": self.counts["SIGNAL"],
+                "entries_submitted": self.counts["ENTRY_SUBMITTED"],
+                "fills": self.counts["FILL"],
+                "closes": self.counts["POSITION_CLOSED"],
+                "price_reductions": self.counts["PRICE_REDUCTION"],
+            },
+            **summary,
         }
-
-    def log_event(self, event_type, message, **kwargs):
-        """Log an event with timestamp."""
-        timestamp = datetime.now().isoformat()
-        # Convert any datetime objects in kwargs to ISO format strings
-        clean_kwargs = {}
-        for k, v in kwargs.items():
-            if isinstance(v, datetime):
-                clean_kwargs[k] = v.isoformat()
-            elif isinstance(v, dict):
-                # Recursively clean dict values
-                clean_kwargs[k] = {kk: vv.isoformat() if isinstance(vv, datetime) else vv for kk, vv in v.items()}
-            else:
-                clean_kwargs[k] = v
-
-        event = {
-            'timestamp': timestamp,
-            'type': event_type,
-            'message': message,
-            **clean_kwargs,
-        }
-
-        self.session_log.append(event)
-        self.daily_summary['events'].append(event)
-
-        print(f"[{event_type}] {message}")
-
-        self._write_session_log()
-
-    def log_scan_start(self, ticker_count):
-        """Log start of S&P 500 scan."""
-        self.log_event(
-            'SCAN_START',
-            f'Beginning scan of {ticker_count} S&P 500 stocks',
-            ticker_count=ticker_count,
-        )
-
-    def log_ticker_analyzed(self, symbol, rsi_14, rsi_28, signal_type=None):
-        """Log ticker analysis result."""
-        self.daily_summary['tickers_analyzed'].append(symbol)
-
-        if signal_type:
-            self.log_event(
-                'SIGNAL',
-                f'{symbol}: {signal_type.upper()} (RSI14={rsi_14:.2f}, RSI28={rsi_28:.2f})',
-                symbol=symbol,
-                rsi_14=rsi_14,
-                rsi_28=rsi_28,
-                signal_type=signal_type,
-            )
-
-    def log_signal_generated(self, signal):
-        """Log trade signal generation."""
-        signal_summary = {
-            'symbol': signal['symbol'],
-            'spread_direction': signal['spread_direction'],
-            'estimated_credit': signal['estimated_credit'],
-            'dte': signal['dte'],
-            'timestamp': datetime.now().isoformat(),
-        }
-        self.daily_summary['signals_generated'].append(signal_summary)
-
-        self.log_event(
-            'ENTRY_SIGNAL',
-            f"{signal['symbol']} {signal['spread_name']} | Credit: ${signal['estimated_credit']:.2f} | DTE: {signal['dte']}",
-            signal=signal_summary,
-        )
-
-    def log_trade_opened(self, order_metadata):
-        """Log trade entry."""
-        trade_summary = {
-            'order_id': order_metadata['order_id'],
-            'symbol': order_metadata['symbol'],
-            'direction': order_metadata['spread_direction'],
-            'quantity': order_metadata['quantity'],
-            'entry_credit': order_metadata['initial_credit'],
-            'dte': order_metadata['dte_at_entry'],
-            'timestamp': datetime.now().isoformat(),
-        }
-        self.daily_summary['trades_opened'].append(trade_summary)
-
-        self.log_event(
-            'TRADE_OPENED',
-            f"{order_metadata['symbol']} {order_metadata['spread_direction']} | Qty: {order_metadata['quantity']} | Credit: ${order_metadata['initial_credit']:.2f}",
-            trade=trade_summary,
-        )
-
-    def log_trade_closed(self, close_details):
-        """Log trade exit and P&L."""
-        self.daily_summary['trades_closed'].append(close_details)
-        self.daily_summary['daily_pnl'] += close_details['total_pnl']
-
-        self.log_event(
-            'TRADE_CLOSED',
-            f"{close_details['symbol']} | Exit: ${close_details['exit_price']:.2f} | P&L: ${close_details['total_pnl']:.2f} ({close_details['pnl_pct']:.1f}%) | Reason: {close_details['exit_reason']}",
-            trade=close_details,
-        )
-
-    def log_price_reduction(self, order_id, old_price, new_price):
-        """Log order price reduction."""
-        self.log_event(
-            'PRICE_REDUCTION',
-            f"{order_id}: ${old_price:.2f} → ${new_price:.2f}",
-            order_id=order_id,
-            old_price=old_price,
-            new_price=new_price,
-        )
-
-    def log_risk_check(self, symbol, result):
-        """Log risk check result."""
-        status = "✓ ALLOWED" if result['allowed'] else "✗ REJECTED"
-        reason = result['reason']
-
-        self.log_event(
-            'RISK_CHECK',
-            f"{symbol}: {status} - {reason}",
-            symbol=symbol,
-            result=result,
-        )
-
-    def log_circuit_breaker(self, max_loss_hits):
-        """Log circuit breaker activation."""
-        self.log_event(
-            'CIRCUIT_BREAKER',
-            f'🔴 CIRCUIT BREAKER ACTIVATED: {max_loss_hits} trades hit max loss. New entries PAUSED.',
-            max_loss_hits=max_loss_hits,
-        )
-
-    def log_account_summary(self, equity, buying_power, portfolio_risk):
-        """Log account status summary."""
-        self.log_event(
-            'ACCOUNT_SUMMARY',
-            f'Equity: ${equity:.2f} | Buying Power: ${buying_power:.2f} | Portfolio Risk: {portfolio_risk:.1%}',
-            equity=equity,
-            buying_power=buying_power,
-            portfolio_risk_pct=portfolio_risk,
-        )
-
-    def _write_session_log(self):
-        """Write session log to file."""
-        try:
-            with open(self.session_file, 'w') as f:
-                for event in self.session_log:
-                    f.write(json.dumps(event) + '\n')
-        except Exception as e:
-            print(f"Error writing session log: {e}")
-
-    def write_daily_summary(self):
-        """Write end-of-day summary."""
-        self.daily_summary['end_time'] = datetime.now().isoformat()
-
-        summary_file = self.log_dir / f"summary_{self.session_date}.json"
-
-        try:
-            with open(summary_file, 'w') as f:
-                json.dump(self.daily_summary, f, indent=2)
-
-            print(f"\n{'='*70}")
-            print(f"DAILY SUMMARY - {self.session_date}")
-            print(f"{'='*70}")
-            print(f"Tickers Analyzed: {len(self.daily_summary['tickers_analyzed'])}")
-            print(f"Signals Generated: {len(self.daily_summary['signals_generated'])}")
-            print(f"Trades Opened: {len(self.daily_summary['trades_opened'])}")
-            print(f"Trades Closed: {len(self.daily_summary['trades_closed'])}")
-            print(f"Daily P&L: ${self.daily_summary['daily_pnl']:.2f}")
-            print(f"Log Location: {summary_file}")
-            print(f"{'='*70}\n")
-
-        except Exception as e:
-            print(f"Error writing daily summary: {e}")
-
-    def get_daily_summary(self):
-        """Get current daily summary."""
-        return self.daily_summary.copy()
+        path = self.summary_file(now.date())
+        path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+        self.end_of_day(path=path)
+        return path

@@ -1,6 +1,7 @@
-alpaca-trade-api>=3.0.0
+yfinance>=0.2.58
 pandas
 numpy
-yfinance
-requests
 pytz
+python-dotenv
+requests
+pytest

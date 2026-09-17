@@ -1,126 +1,124 @@
-# ============================================
-# MARKET DATA
-# Fetches ES/SPX bars for ORB calculation
-# ============================================
+"""yfinance market data: ES overnight levels, SPX/ES basis, completed candles, opening range.
 
-import yfinance as yf
-import pandas as pd
+Every function takes `now` (tz-aware ET) so tests can inject time. Downloads are
+cached for config.DATA_CACHE_SEC to avoid hammering Yahoo on a 15 s tick.
+"""
+
 import logging
+import time as _time
+from datetime import datetime, timedelta
 
-logger = logging.getLogger(__name__)
+import pandas as pd
+import yfinance as yf
+
+import config
+from strategy import Levels, at_time
+
+log = logging.getLogger(__name__)
+
+_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_COLUMNS = ["open", "high", "low", "close", "volume"]
 
 
-def get_intraday(symbol, period="1d", interval="1m"):
-    """
-    Get intraday bars from yfinance
-    
-    Args:
-        symbol: 'ES=F' for ES futures, '^GSPC' for SPX
-        period: '1d', '5d', etc
-        interval: '1m', '5m', '15m', etc
-    
-    Returns:
-        DataFrame with OHLCV
-    """
+def _now(now: datetime | None) -> datetime:
+    return now or datetime.now(config.ET)
+
+
+def _download(symbol: str, period: str, interval: str, prepost: bool) -> pd.DataFrame:
+    key = (symbol, period, interval, prepost)
+    hit = _CACHE.get(key)
+    if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
+        return hit[1]
     try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-        )
-        
-        if df.empty:
-            logger.warning(f"No data for {symbol}")
-            return df
-        
-        # Normalize column names
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0].lower() for c in df.columns]
-        else:
-            df.columns = [str(c).lower() for c in df.columns]
-        
-        return df.dropna()
-    
+        raw = yf.download(symbol, period=period, interval=interval, prepost=prepost,
+                          auto_adjust=False, progress=False, threads=False)
     except Exception as e:
-        logger.error(f"Error fetching {symbol}: {e}")
-        return pd.DataFrame()
+        log.warning("yfinance download failed for %s %s: %s", symbol, interval, e)
+        raw = pd.DataFrame()
+    df = _normalize(raw)
+    _CACHE[key] = (_time.monotonic(), df)
+    return df
 
 
-def get_overnight_levels(symbol='ES=F'):
-    """
-    Get yesterday's high/low (overnight levels)
-    
-    Returns:
-        {'high': float, 'low': float}
-    """
-    try:
-        df = get_intraday(symbol, period="5d", interval="1d")
-        
-        if df.empty or len(df) < 2:
-            return None
-        
-        # Last row is yesterday
-        yesterday = df.iloc[-2]
-        
-        return {
-            'high': float(yesterday['high']),
-            'low': float(yesterday['low']),
-        }
-    
-    except Exception as e:
-        logger.error(f"Error getting overnight levels: {e}")
+def _normalize(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=_COLUMNS)
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]).lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+    df = df[[c for c in _COLUMNS if c in df.columns]].dropna(subset=["open", "high", "low", "close"])
+    idx = pd.DatetimeIndex(df.index)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx
+    df.index = idx.tz_convert(config.ET)
+    return df.sort_index()
+
+
+def _prior_session_date(now: datetime) -> datetime:
+    d = now - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def get_overnight_levels(now: datetime | None = None) -> Levels | None:
+    now = _now(now)
+    start = at_time(_prior_session_date(now), config.OVERNIGHT_SESSION_START)
+    end = at_time(now, config.MARKET_OPEN)
+    df = _download(config.ES_SYMBOL, "5d", "5m", True)
+    window = df[(df.index >= start) & (df.index < end)]
+    if window.empty:
         return None
+    return Levels(float(window["high"].max()), float(window["low"].min()), end)
 
 
-def get_opening_range(symbol='ES=F', minutes=15):
-    """
-    Calculate opening range (first N minutes of today)
-    
-    Args:
-        symbol: 'ES=F' for ES futures
-        minutes: minutes to include (default 15)
-    
-    Returns:
-        {'high': float, 'low': float}
-    """
-    try:
-        df = get_intraday(symbol, period="1d", interval="1m")
-        
-        if df.empty or len(df) < minutes:
-            return None
-        
-        # Take first N bars (9:30-9:45 ET)
-        or_bars = df.iloc[:minutes]
-        
-        return {
-            'high': float(or_bars['high'].max()),
-            'low': float(or_bars['low'].min()),
-        }
-    
-    except Exception as e:
-        logger.error(f"Error calculating ORB: {e}")
+def get_spx_es_basis(now: datetime | None = None) -> float | None:
+    now = _now(now)
+    open_dt = at_time(now, config.MARKET_OPEN)
+    spx = _download(config.SPX_SYMBOL, "2d", "1m", False)
+    es = _download(config.ES_SYMBOL, "2d", "1m", True)
+    common = spx.index.intersection(es.index)
+    common = common[(common >= open_dt) & (common <= now)]
+    if common.empty:
         return None
+    t = common[-1]
+    return round(float(spx.loc[t, "close"] - es.loc[t, "close"]), 2)
 
 
-def get_current_price(ticker):
-    try:
-        # Assuming you download minute data using yf.Ticker or yf.download
-        data = yf.download(ticker, period="1d", interval="1m", progress=False)
-        
-        if data.empty:
-            return None
-            
-        # FIX: Access the last price and convert to scalar using .iloc[-1]
-        latest_price = data['Close'].iloc[-1]
-        
-        # If latest_price is still a 1-element Series (multi-index DataFrame)
-        if hasattr(latest_price, 'item'):
-            return float(latest_price.item())
-            
-        return float(latest_price)
-        
-    except Exception as e:
-        logger.error(f"Error getting price for {ticker}: {e}")
+def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
+                now: datetime | None = None) -> pd.DataFrame:
+    now = _now(now)
+    df = _download(symbol, "2d", interval, symbol == config.ES_SYMBOL)
+    if df.empty:
+        return df
+    minutes = int(interval.rstrip("m"))
+    df = df[df.index >= now - timedelta(minutes=lookback_min)]
+    df = df[df.index + timedelta(minutes=minutes) <= now]
+    return df
+
+
+def get_opening_range(now: datetime | None = None) -> Levels | None:
+    now = _now(now)
+    start = at_time(now, config.MARKET_OPEN)
+    end = start + timedelta(minutes=config.OPENING_RANGE_MINUTES)
+    if now < end:
         return None
+    df = _download(config.SPX_SYMBOL, "2d", "1m", False)
+    window = df[(df.index >= start) & (df.index < end)]
+    if window.empty:
+        return None
+    return Levels(float(window["high"].max()), float(window["low"].min()), end)
+
+
+def get_spot(symbol: str = "^GSPC", now: datetime | None = None) -> float | None:
+    now = _now(now)
+    df = _download(symbol, "2d", "1m", symbol == config.ES_SYMBOL)
+    df = df[df.index <= now]
+    if df.empty:
+        return None
+    return float(df["close"].iloc[-1])
+
+
+def is_trading_day(now: datetime) -> bool:
+    return now.weekday() < 5

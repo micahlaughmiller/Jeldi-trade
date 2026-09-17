@@ -1,135 +1,101 @@
-# ============================================
-# 0DTE STRATEGY CONFIG - ASTRA & CLAUDE
-# ORB + RSI Confluence for SPX 0DTE Options
-# ============================================
+"""0DTE SPX credit-spread bot configuration.
 
-import pytz
-from datetime import time
-from dataclasses import dataclass
+Secrets come from the folder's .env (python-dotenv); this file holds no keys.
+All times are US/Eastern wall-clock.
+"""
+
 import os
+from datetime import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
-MARKET_TIMEZONE = pytz.timezone('US/Eastern')
-MARKET_OPEN = time(9, 30)
-START_TRADING = time(9, 0)
-END_TRADING = time(12, 30)
+ET = ZoneInfo("US/Eastern")
 
-# ============================================
-# ALPACA API CONFIGURATION
-# ============================================
-
-PAPER_TRADING = True
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if PAPER_TRADING else "https://api.alpaca.markets"
-
-ACCOUNT_ID = "paper_trading"
-LOG_FILE = "0dte_trading.log"
-DEBUG_MODE = False
-
-# ============================================
-# TRADER CONFIGURATION (ASTRA & CLAUDE)
-# ============================================
-
-ACTIVE_TRADER = os.getenv('ACTIVE_TRADER', 'ASTRA')
-
-if ACTIVE_TRADER == 'ASTRA':
-    ALPACA_API_KEY = os.getenv('ASTRA_API_KEY', '')
-    ALPACA_SECRET_KEY = os.getenv('ASTRA_API_SECRET', '')
-    TRADER_NAME = 'ASTRA'
-    ACCOUNT_NAME = 'Account 1 ($10000)'
-
-elif ACTIVE_TRADER == 'CLAUDE':
-    ALPACA_API_KEY = os.getenv('CLAUDE_API_KEY', '')
-    ALPACA_SECRET_KEY = os.getenv('CLAUDE_API_SECRET', '')
-    TRADER_NAME = 'CLAUDE'
-    ACCOUNT_NAME = 'Account 2 ($10000)'
-
+ACTIVE_TRADER = os.getenv("ACTIVE_TRADER", "ASTRA").upper()
+if ACTIVE_TRADER == "ASTRA":
+    ALPACA_API_KEY = os.getenv("ASTRA_API_KEY", "")
+    ALPACA_SECRET_KEY = os.getenv("ASTRA_API_SECRET", "")
+elif ACTIVE_TRADER == "CLAUDE":
+    ALPACA_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+    ALPACA_SECRET_KEY = os.getenv("CLAUDE_API_SECRET", "")
 else:
-    raise ValueError(f"Unknown trader: {ACTIVE_TRADER}")
+    raise ValueError(f"Unknown ACTIVE_TRADER: {ACTIVE_TRADER}")
+TRADER_NAME = ACTIVE_TRADER
 
-# ============================================
-# ACCOUNT & RISK PARAMETERS
-# ============================================
+PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("1", "true", "yes")
+ALPACA_BASE_URL = os.getenv(
+    "ALPACA_BASE_URL",
+    "https://paper-api.alpaca.markets" if PAPER_TRADING else "https://api.alpaca.markets",
+)
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 
-INITIAL_ACCOUNT_EQUITY = 10000.00
-MAX_RISK_PER_TRADE_PCT = 0.05
+DRY_RUN = False
+RISK_FREE_RATE = 0.04
+CLOSE_SLIPPAGE = 0.05
+CLOSE_RETRY_SEC = 15
+CLOSE_MAX_RETRIES = 6
+LOG_DIR = "logs"
+
+UNDERLYING = "SPX"
+OPTION_ROOT = "SPXW"
+SPX_SYMBOL = "^GSPC"
+ES_SYMBOL = "ES=F"
+
+MARKET_OPEN = time(9, 30)
+OVERNIGHT_SESSION_START = time(18, 0)
+OPENING_RANGE_MINUTES = 15
+OVERNIGHT_ENTRY_END_MIN = 30
+LAST_ENTRY_TIME = time(12, 0)
+FORCE_CLOSE_TIME = time(12, 30)
+
+TICK_SECONDS = 15
+CANDLE_INTERVAL = "2m"
+CANDLE_LOOKBACK_MIN = 180
+DATA_CACHE_SEC = 20
+
+# ES_TO_SPX: ES overnight levels + (SPX - ES) basis, compared against live SPX candles.
+# ES: compare ES candles directly against ES levels (Yahoo ES is ~10 min delayed).
+BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
+
+WIDTH_BY_TIER = {1: 5, 2: 5, 3: 10, 4: 10}
+CREDIT_RANGE_BY_WIDTH = {5: (2.75, 3.50), 10: (5.50, 7.00)}
+
+TIER_BANDS = [(10_000, 1), (30_000, 2), (50_000, 3), (float("inf"), 4)]
+RISK_PER_TRADE_PCT = 0.05
+ALLOW_MIN_CONTRACT_OVERRIDE = True
 MAX_PORTFOLIO_RISK_PCT = 0.52
 MAX_CONTRACTS_PER_TRADE = 10
-
-# ============================================
-# POSITION SIZING TIERS
-# ============================================
-
-EFFECTIVE_MAX_EQUITY = 10000.00
-POSITION_SIZE_TIERS = {
-    10000: 3,
-    25000: 5,
-    50000: 10,
-    100000: 15,
-}
-
-# ============================================
-# OPTIONS PARAMETERS
-# ============================================
-
-RSI_PERIOD_FAST = 14
-RSI_PERIOD_SLOW = 28
-RSI_OVERSOLD_THRESHOLD = 30
-RSI_OVERBOUGHT_THRESHOLD = 70
-
-TARGET_DELTA = 0.30
-SPREAD_WIDTH = 5.00
-MIN_CREDIT_TARGET = 1.45
-MIN_CREDIT_FLOOR = 1.35
-
-# ============================================
-# ORDER MANAGEMENT
-# ============================================
-
-PRICE_REDUCTION_INTERVAL_HOURS = 0.5
-PRICE_REDUCTION_AMOUNT = 0.02
-ORDER_TYPE = "limit"
-TIME_IN_FORCE = "gtc"
-
-# ============================================
-# EXIT PARAMETERS
-# ============================================
-
-PROFIT_TARGET_PCT = 0.50
-EXPIRATION_DTE_MIN = 0
-EXPIRATION_DTE_MAX = 1
-
-# ============================================
-# CIRCUIT BREAKERS
-# ============================================
-
-MAX_LOSS_HITS_CIRCUIT_BREAKER = 3
+MAX_TRADES_PER_DAY = 5
+MAX_CONSECUTIVE_LOSSES = 2
 DAILY_LOSS_LIMIT_PCT = 0.10
-PEAK_DRAWDOWN_LIMIT_PCT = 0.20
+MAX_CONCURRENT_POSITIONS = 1
 
-# ============================================
-# STRATEGY CONFIG
-# ============================================
+PROFIT_TARGET = 0.30
+STOP_LOSS = 0.30
+RUNNER_ENABLED = True
+RUNNER_MIN_CONTRACTS = 2
+TRAIL_AMOUNT = 0.50
+MOMENTUM_CANDLES = 3
+MOMENTUM_CONTINUE_RATIO = 0.80
+MOMENTUM_SLOWDOWN_PCT = 0.20
 
-@dataclass(frozen=True)
-class StrategyConfig:
-    orb_minutes: int = 15
-    confirmation_candles: int = 2
-    min_credit: float = 1.45
-    preferred_credit: float = 2.00
-    max_credit: float = 3.00
-    stop_amount: float = 0.30
-    profit_trigger: float = 0.30
-    risk_per_trade: float = 0.05
-    max_daily_loss_percent: float = 0.10
-    max_consecutive_losses: int = 2
-    max_trades_per_day: int = 5
-    short_strike_distance: float = 10.0
-    absolute_max_contracts: int = 10
-    absolute_max_spread_width: int = 10
-    paper_only: bool = True
+ENTRY_STEP_SEC = 20
+ENTRY_PRICE_STEP = 0.05
+ENTRY_TIMEOUT_SEC = 120
 
-CONFIG = StrategyConfig()
-DATA_SOURCE = "yfinance"
-LOGGING_DIR = f"./{TRADER_NAME.lower()}_logs_0dte"
+# 2026 FOMC decision dates -- verify against federalreserve.gov
+NEWS_DAYS = [
+    "2026-01-28",
+    "2026-03-18",
+    "2026-04-29",
+    "2026-06-17",
+    "2026-07-29",
+    "2026-09-16",
+    "2026-10-28",
+    "2026-12-09",
+]
+NEWS_DAY_MODE = "half_size"

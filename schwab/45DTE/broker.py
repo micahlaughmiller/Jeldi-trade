@@ -20,12 +20,13 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-warnings.filterwarnings("ignore", message=".*httpx module is deprecated.*")
-
-import httpx
 from dotenv import load_dotenv
-from schwab.auth import client_from_token_file
-from schwab.client import Client as SchwabClient
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import httpx
+    from schwab.auth import client_from_token_file
+    from schwab.client import Client as SchwabClient
 
 try:
     from . import options_math

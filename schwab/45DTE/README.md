@@ -19,7 +19,9 @@ SCHWAB_APP_KEY=...
 SCHWAB_APP_SECRET=...
 SCHWAB_CALLBACK_URL=https://127.0.0.1:8080
 SCHWAB_ACCOUNT_INDEX=0
-SCHWAB_LIVE_ORDERS=false   # true -> REAL orders are submitted (Schwab has no paper API)
+SCHWAB_MODE=sim            # sim | dry_run | live (see "Paper simulation")
+SIM_STARTING_EQUITY=30000  # simulated account size in sim mode
+SCHWAB_LIVE_ORDERS=false   # live mode only: true -> REAL orders are submitted
 ```
 
 Then run `python schwab_login.py` once to create `token.json` (refresh token lasts 7 days).
@@ -30,11 +32,33 @@ Then run `python schwab_login.py` once to create `token.json` (refresh token las
 
 ```
 cd schwab/45DTE
-python run_45dte.py                  # trade (paper or live per .env)
+python run_45dte.py                  # trade per SCHWAB_MODE (sim by default)
 python run_45dte.py --dry-run        # read from broker, log orders instead of sending them
 python run_45dte.py --once           # exit after today's 16:05 end-of-day summary
 python run_45dte.py --reset-breaker  # clear the max-loss circuit breaker, then run
+python sim_reset.py [--equity N]     # wipe the simulated account (sim mode)
 ```
+
+## Paper simulation
+
+Schwab has no paper-trading API, so `SCHWAB_MODE` selects what `broker.Broker` returns:
+
+| Mode | Broker | Orders |
+| --- | --- | --- |
+| `sim` (default) | `paper_sim.PaperBroker` wrapping a dry-run `SchwabBroker` for market data | Filled locally against live Schwab quotes; account persisted in `logs/sim_state.json` |
+| `dry_run` | `SchwabBroker(dry_run=True)` | Payloads logged, nothing sent |
+| `live` | `SchwabBroker` | Real orders, only with `SCHWAB_LIVE_ORDERS=true`; otherwise forced to dry-run |
+
+`--dry-run` always gives the log-only broker regardless of mode. The simulator starts
+with `SIM_STARTING_EQUITY` cash and fills all-or-nothing at the limit during regular
+hours (09:30-16:00 ET; SPX/SPXW until 16:15): a credit spread when short bid - long ask
+reaches the limit, a debit close when short ask - long bid falls to it. `day` orders
+expire at the close, `gtc` orders persist across restarts, legs past expiration
+cash-settle at intrinsic value. Equity = cash + marks; options buying power = cash -
+(width - credit) x 100 x qty per spread. Every event is logged with a `SIM` prefix
+(`SIM ORDER new`, `SIM FILL`, `SIM CANCEL`, `SIM REPLACE`, `SIM EXPIRE`, `SIM SETTLE`),
+and the daily equity journal goes to `logs/sim_equity_history.csv`. The start-of-day
+report shows `broker=schwab-sim PAPER`.
 
 `run_45dte.py` `chdir`s to its own folder, so `logs/` and `data/` resolve regardless of
 where you launch from. Ctrl+C saves state and exits.
@@ -111,8 +135,11 @@ touch the network. `tests/test_broker_schwab.py` covers the Schwab broker with a
 
 | Knob | Default | Meaning |
 | --- | --- | --- |
-| `DRY_RUN` | true unless `SCHWAB_LIVE_ORDERS=true` | Schwab has no paper API; dry-run logs orders instead of sending |
-| `DRY_RUN` | `False` | log order payloads instead of sending (`--dry-run` forces on) |
+| `SCHWAB_MODE` | `sim` | `sim` (local simulator on live quotes), `dry_run` (log only), `live` (real orders, needs `SCHWAB_LIVE_ORDERS=true`) |
+| `SIM_STARTING_EQUITY` | `30000` | simulated account cash on first run / after `sim_reset.py` |
+| `SIM_QUOTE_CACHE_SEC` | `10` | simulator chain-quote cache |
+| `SIM_FILL_START` / `SIM_FILL_END` / `SIM_INDEX_FILL_END` | `09:30` / `16:00` / `16:15` | simulator fill window (index options until 16:15) |
+| `DRY_RUN` | true in `dry_run`/`live` modes unless `SCHWAB_LIVE_ORDERS=true`; always false in `sim` | log order payloads instead of sending (`--dry-run` forces on) |
 | `RISK_FREE_RATE` | `0.04` | for Black-Scholes delta when the feed has no greeks |
 | `CLOSE_SLIPPAGE` / `CLOSE_RETRY_SEC` / `CLOSE_MAX_RETRIES` | `0.05` / `15` / `6` | marketable-close ladder used by `close_spread_at_market` |
 | `LOG_DIR` | `logs` | all log/state output |

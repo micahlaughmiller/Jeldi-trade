@@ -5,10 +5,15 @@ Secrets come from this folder's `.env` (never literal keys here):
     SCHWAB_APP_SECRET=...
     SCHWAB_CALLBACK_URL=https://127.0.0.1:8080
     SCHWAB_ACCOUNT_INDEX=0
-    SCHWAB_LIVE_ORDERS=false     # true -> real orders are submitted
+    SCHWAB_MODE=sim              # sim | dry_run | live
+    SIM_STARTING_EQUITY=30000    # simulated account size for sim mode
+    SCHWAB_LIVE_ORDERS=false     # true -> real orders are submitted (live mode only)
 
-Schwab has NO paper-trading API: every submitted order is real money. Orders
-stay in DRY-RUN (logged, not sent) until SCHWAB_LIVE_ORDERS=true.
+Schwab has NO paper-trading API: every submitted order is real money. SCHWAB_MODE
+picks how orders are handled: `sim` (default) trades a local simulated account
+filled against live Schwab quotes (paper_sim.py), `dry_run` only logs order
+payloads, and `live` sends real orders -- but only when SCHWAB_LIVE_ORDERS=true is
+also set; otherwise live is forced back to dry-run.
 Strategy parameters below are identical to Alpaca/45DTE/config_45dte.py; only
 the broker section differs. Run tools/check_sync.py to confirm.
 """
@@ -28,7 +33,23 @@ SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", str(Path(__file__).resolve().
 SCHWAB_ACCOUNT_INDEX = int(os.getenv("SCHWAB_ACCOUNT_INDEX", "0"))
 PAPER_TRADING = False
 
-DRY_RUN = os.getenv("SCHWAB_LIVE_ORDERS", "false").strip().lower() not in ("1", "true", "yes")
+# Optional. Schwab serves no option chain for some indexes; with Alpaca keys present,
+# index option quotes and expirations are read from Alpaca's indicative feed instead.
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+
+SCHWAB_MODE = os.getenv("SCHWAB_MODE", "sim").strip().lower()   # sim | dry_run | live
+SIM_STARTING_EQUITY = float(os.getenv("SIM_STARTING_EQUITY", "30000"))
+SIM_QUOTE_CACHE_SEC = 10
+SIM_FILL_START = "09:30"
+SIM_FILL_END = "16:00"
+SIM_INDEX_FILL_END = "16:15"
+
+# Only consulted in dry_run/live modes; kept False in sim mode so the simulator is selected.
+DRY_RUN = SCHWAB_MODE != "sim" and \
+    os.getenv("SCHWAB_LIVE_ORDERS", "false").strip().lower() not in ("1", "true", "yes")
 RISK_FREE_RATE = 0.04
 CLOSE_SLIPPAGE = 0.05
 CLOSE_RETRY_SEC = 15

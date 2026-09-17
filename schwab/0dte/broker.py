@@ -1,8 +1,17 @@
 """Charles Schwab implementation of the Broker contract (docs/BROKER_INTERFACE.md).
 
-Schwab has no paper-trading API: every submitted order is real money. This class
-therefore defaults to dry-run and only sends orders when BOTH `dry_run=False` is
-passed AND the environment variable SCHWAB_LIVE_ORDERS=true is set.
+Schwab has no paper-trading API: every submitted order is real money. `Broker(...)`
+is a factory that picks the implementation from `config.SCHWAB_MODE`:
+
+    sim      (default) PaperBroker from paper_sim.py: a simulated account filled
+             against live Schwab quotes. The wrapped SchwabBroker is dry-run and only
+             supplies market data.
+    dry_run  SchwabBroker that logs every order payload and never sends it.
+    live     SchwabBroker sending real orders, but only when SCHWAB_LIVE_ORDERS=true
+             is also set; otherwise it is forced to dry-run with a loud warning.
+
+Passing `dry_run=True` (the schedulers' --dry-run flag) always yields the log-only
+SchwabBroker, whatever the mode.
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ import uuid
 import warnings
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -35,6 +44,9 @@ try:
     from . import options_math
 except ImportError:  # running as a plain script from the folder
     import options_math  # type: ignore
+
+if TYPE_CHECKING:
+    from paper_sim import PaperBroker
 
 ET = ZoneInfo("US/Eastern")
 HERE = Path(__file__).resolve().parent
@@ -144,31 +156,55 @@ def _strip_index(symbol: str | None) -> str | None:
     return symbol[1:] if symbol.startswith("$") else symbol
 
 
-class Broker:
+class _CallableLog:
+    """Adapts the plain `log(message)` callable the strategies pass to the Logger calls used here."""
+
+    def __init__(self, fn: Callable[[str], Any]):
+        self._fn = fn
+
+    def _emit(self, msg: str, *args: Any) -> None:
+        self._fn(msg % args if args else msg)
+
+    info = warning = error = critical = _emit
+
+
+class SchwabBroker:
     name = "schwab"
     is_paper = False
     _forced_dry_run_warned = False
 
+    occ_symbol = staticmethod(occ_symbol)
+    parse_occ = staticmethod(parse_occ)
+
     def __init__(self, config_module, dry_run: bool | None = None, log=None):
         self.config = config_module
-        self.log = log or logging.getLogger("broker.schwab")
+        if log is None:
+            self.log: Any = logging.getLogger("broker.schwab")
+        else:
+            self.log = log if hasattr(log, "info") else _CallableLog(log)
         self._sleep = time.sleep
         self._client: SchwabClient | None = None
         self._account_hash: str | None = None
         self._account_number: str | None = None
         self._dry_orders: dict[str, dict] = {}
+        self._fallback: Any = None
+        self._fallback_warned = False
 
+        mode = str(self._cfg("SCHWAB_MODE", "live")).strip().lower()
         requested = dry_run if dry_run is not None else bool(self._cfg("DRY_RUN", True))
+        if mode in ("sim", "dry_run"):
+            requested = True
         live_env = os.getenv("SCHWAB_LIVE_ORDERS", "").strip().lower() == "true"
+        cls = type(self)
         if not requested and not live_env:
             requested = True
-            if not Broker._forced_dry_run_warned:
+            if not cls._forced_dry_run_warned:
                 self.log.warning(
                     "SCHWAB: dry_run=False requested but SCHWAB_LIVE_ORDERS is not 'true'; "
                     "FORCING dry_run=True. Schwab has no paper trading - set SCHWAB_LIVE_ORDERS=true "
                     "only when you intend to trade real money."
                 )
-                Broker._forced_dry_run_warned = True
+                cls._forced_dry_run_warned = True
         self.dry_run = bool(requested)
         if not self.dry_run:
             self.log.warning("SCHWAB: LIVE ORDERS ENABLED. Every order placed is REAL MONEY.")
@@ -764,9 +800,43 @@ class Broker:
             return (bid + ask) / 2.0
         raise BrokerError(f"quote for {symbol!r} has no usable price: {q}")
 
+    def _index_data_fallback(self):
+        """Alpaca indicative option data for indexes Schwab returns no chain for (e.g. $SPX)."""
+        if self._fallback is not None:
+            return self._fallback or None
+        key = self._cfg("ALPACA_API_KEY", None) or os.getenv("ALPACA_API_KEY")
+        secret = self._cfg("ALPACA_SECRET_KEY", None) or os.getenv("ALPACA_SECRET_KEY")
+        if not key or not secret:
+            self._fallback = False
+            return None
+        try:
+            from .alpaca_data import AlpacaOptionData
+        except ImportError:
+            from alpaca_data import AlpacaOptionData  # type: ignore
+        self._fallback = AlpacaOptionData(
+            key, secret,
+            trading_url=self._cfg("ALPACA_BASE_URL", None) or "https://paper-api.alpaca.markets",
+            data_url=self._cfg("ALPACA_DATA_URL", None) or "https://data.alpaca.markets",
+            risk_free_rate=self.risk_free_rate, log=self.log.info)
+        return self._fallback
+
+    def _fallback_or_raise(self, underlying: str, what: str, detail: str):
+        fb = self._index_data_fallback()
+        if fb is None:
+            raise BrokerError(
+                f"Schwab returned no {what} for {underlying} ({detail}). Schwab does not serve option "
+                f"chains for this index on this account; set ALPACA_API_KEY/ALPACA_SECRET_KEY in .env to "
+                f"use Alpaca's indicative quotes as the data source.")
+        if not self._fallback_warned:
+            self.log.warning("Schwab returned no %s for %s (%s); using Alpaca indicative option data instead.",
+                             what, underlying, detail)
+            self._fallback_warned = True
+        return fb
+
     def get_expirations(self, underlying: str, min_dte: int = 0, max_dte: int = 120) -> list[date]:
         client = self._get_client()
         sym = self._quote_symbol(underlying)
+        is_index = sym.startswith("$")
         today = datetime.now(ET).date()
         found: set[date] = set()
         if hasattr(client, "get_option_expiration_chain"):
@@ -782,14 +852,18 @@ class Broker:
                                  contract_type=SchwabClient.Options.ContractType.ALL,
                                  strike_count=1, strategy=SchwabClient.Options.Strategy.SINGLE,
                                  from_date=today + timedelta(days=min_dte),
-                                 to_date=today + timedelta(days=max_dte))
-            data = self._json(resp) or {}
+                                 to_date=today + timedelta(days=max_dte),
+                                 allow=(400, 404) if is_index else ())
+            data = {} if resp.is_error else (self._json(resp) or {})
             for key in ("putExpDateMap", "callExpDateMap"):
                 for exp_key in (data.get(key) or {}):
                     try:
                         found.add(date.fromisoformat(exp_key.split(":")[0]))
                     except ValueError:
                         continue
+        if not found and is_index:
+            fb = self._fallback_or_raise(underlying, "expirations", f"HTTP {resp.status_code}")
+            found = set(fb.expirations(_strip_index(sym) or underlying, min_dte, max_dte))
         return sorted(d for d in found if min_dte <= (d - today).days <= max_dte)
 
     def _normalize_chain_row(self, row: dict, right: str, spot: float | None) -> dict | None:
@@ -832,10 +906,15 @@ class Broker:
         if right not in ("P", "C"):
             raise BrokerError(f"right must be 'P' or 'C', got {right!r}")
         sym = self._quote_symbol(underlying)
+        is_index = sym.startswith("$")
         contract = SchwabClient.Options.ContractType.PUT if right == "P" else SchwabClient.Options.ContractType.CALL
         resp = self._request(client.get_option_chain, sym, contract_type=contract,
                              strategy=SchwabClient.Options.Strategy.SINGLE,
-                             from_date=expiration, to_date=expiration, include_underlying_quote=True)
+                             from_date=expiration, to_date=expiration, include_underlying_quote=True,
+                             allow=(400, 404) if is_index else ())
+        if resp.is_error:
+            fb = self._fallback_or_raise(underlying, "option chain", f"HTTP {resp.status_code}")
+            return fb.chain(_strip_index(sym) or underlying, expiration, right, strike_min, strike_max, spot)
         data = self._json(resp) or {}
         if str(data.get("status", "SUCCESS")).upper() not in ("SUCCESS", ""):
             raise BrokerError(f"Schwab chain status {data.get('status')} for {underlying} {expiration}")
@@ -859,3 +938,23 @@ class Broker:
                     rows.append(q)
         rows.sort(key=lambda q: (q["strike"], q["root"]))
         return rows
+
+
+class Broker(SchwabBroker):
+    """Factory the strategies construct: `Broker(config, dry_run=..., log=...)`.
+
+    Returns a PaperBroker (wrapping a dry-run SchwabBroker for data) when
+    `config.SCHWAB_MODE == "sim"` and dry_run was not requested; otherwise a
+    SchwabBroker whose dry-run state follows the mode (see module docstring).
+    """
+
+    def __new__(cls, config_module, dry_run: bool | None = None, log=None) -> "SchwabBroker | PaperBroker":
+        mode = str(getattr(config_module, "SCHWAB_MODE", "live")).strip().lower()
+        if mode == "sim" and not dry_run:
+            try:
+                from .paper_sim import PaperBroker
+            except ImportError:
+                from paper_sim import PaperBroker  # type: ignore
+            data = SchwabBroker(config_module, dry_run=True, log=log)
+            return PaperBroker(data, config_module, log=log)
+        return super().__new__(cls)

@@ -8,8 +8,31 @@ for a strategy share byte-identical strategy code and differ only in
 |---|---|---|---|
 | `Alpaca/0DTE` | 0DTE SPX credit spreads (ES overnight breakout + ORB) | Alpaca | paper |
 | `Alpaca/45DTE` | 45–60 DTE S&P 500 credit spreads (RSI confluence) | Alpaca | paper |
-| `schwab/0dte` | same as Alpaca/0DTE | Schwab | **LIVE** (dry-run until `SCHWAB_LIVE_ORDERS=true`) |
-| `schwab/45DTE` | same as Alpaca/45DTE | Schwab | **LIVE** (dry-run until `SCHWAB_LIVE_ORDERS=true`) |
+| `schwab/0dte` | same as Alpaca/0DTE | Schwab | simulated by default (`SCHWAB_MODE=sim`); see below |
+| `schwab/45DTE` | same as Alpaca/45DTE | Schwab | simulated by default (`SCHWAB_MODE=sim`); see below |
+
+### Schwab modes
+
+Schwab has no paper-trading API, so the Schwab folders run a local simulator
+by default. `SCHWAB_MODE` in the folder's `.env` picks the behaviour:
+
+| Mode | Orders | Data |
+|---|---|---|
+| `sim` (default) | filled against live Schwab quotes into a simulated account (`logs/sim_state.json`, starting cash `SIM_STARTING_EQUITY`; reset with `python sim_reset.py`) | live Schwab |
+| `dry_run` | logged, never sent | live Schwab |
+| `live` | **real money** — also requires `SCHWAB_LIVE_ORDERS=true`, otherwise forced back to dry-run | live Schwab |
+
+The simulator fills an opening credit spread when the natural credit
+(short bid − long ask) reaches your limit, a closing debit when the natural
+debit falls to your limit, marks positions to live mids, cash-settles expired
+legs at intrinsic value, and reports equity / P&L / positions exactly like a
+real account.
+
+Schwab returns no option chain for `$SPX` on some accounts. If
+`ALPACA_API_KEY`/`ALPACA_SECRET_KEY` are present in the Schwab folder's `.env`,
+SPX/SPXW quotes and expirations are read from Alpaca's free indicative feed
+instead (data only — no Alpaca orders). Without them the 0DTE Schwab bot cannot
+price SPX spreads and says so.
 
 ## Setup (per folder)
 

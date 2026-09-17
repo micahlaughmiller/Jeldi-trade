@@ -1,23 +1,49 @@
-from alpaca.trading.client import TradingClient
+"""Cancel every open order and liquidate every position on the Alpaca PAPER account.
 
-# Replace with your actual Paper Trading API keys
-API_KEY = "PKP2L6LQ5WZNQZQPKXQAZFVI4R"
-SECRET_KEY = "JD3DniYFdpp7Znr4g5HJzdnCKaaujoJfvjZGjtiB54aR"
+    python alpaca-reset.py [--yes]
 
-# Initialize client for Paper Trading
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+Keys come from this folder's .env via config_45dte. Refuses to run against the
+live URL. To restore the paper account's starting cash, use Settings -> Reset
+Paper Account at https://app.alpaca.markets/.
+"""
 
-def reset_paper_account():
-    print("1. Cancelling all open orders...")
-    trading_client.cancel_orders()
-    print("   ✓ All orders cancelled.")
+import argparse
+import sys
 
-    print("2. Liquidating all open positions...")
-    trading_client.close_all_positions(cancel_orders=True)
-    print("   ✓ All positions closed.")
+import requests
 
-    print("\nAccount cleared of active trades! To set your equity back to maximum ($100k+),")
-    print("visit: https://app.alpaca.markets/ -> Settings -> Reset Paper Account.")
+import config_45dte as config
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    args = parser.parse_args()
+
+    if "paper-api" not in config.ALPACA_BASE_URL:
+        sys.exit(f"Refusing to reset a non-paper account: {config.ALPACA_BASE_URL}")
+    if not config.ALPACA_API_KEY or not config.ALPACA_SECRET_KEY:
+        sys.exit("ALPACA_API_KEY / ALPACA_SECRET_KEY not set in .env")
+
+    headers = {"APCA-API-KEY-ID": config.ALPACA_API_KEY, "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY}
+    base = config.ALPACA_BASE_URL.rstrip("/")
+
+    account = requests.get(f"{base}/v2/account", headers=headers, timeout=30).json()
+    print(f"Paper account {account.get('id', '?')[:8]}  equity ${float(account.get('equity', 0)):,.2f}")
+    if not args.yes and input("Cancel all orders and close all positions? [y/N] ").strip().lower() != "y":
+        print("Aborted.")
+        return
+
+    r = requests.delete(f"{base}/v2/orders", headers=headers, timeout=30)
+    print(f"1. Cancel all orders -> HTTP {r.status_code}")
+    r = requests.delete(f"{base}/v2/positions", headers=headers, params={"cancel_orders": "true"}, timeout=60)
+    print(f"2. Close all positions -> HTTP {r.status_code}")
+
+    remaining = requests.get(f"{base}/v2/positions", headers=headers, timeout=30).json()
+    open_orders = requests.get(f"{base}/v2/orders", headers=headers, params={"status": "open"}, timeout=30).json()
+    print(f"Remaining positions: {len(remaining)}   open orders: {len(open_orders)}")
+    print("To restore starting cash: https://app.alpaca.markets/ -> Settings -> Reset Paper Account.")
+
 
 if __name__ == "__main__":
-    reset_paper_account()
+    main()

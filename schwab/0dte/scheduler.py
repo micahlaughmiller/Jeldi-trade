@@ -419,6 +419,14 @@ def main() -> None:
         bot.start()
     except KeyboardInterrupt:
         bot.on_interrupt()
+    except BrokerError as exc:
+        log.error("BROKER ERROR: %s", exc)
+        if "401" in str(exc) or "unauthorized" in str(exc).lower():
+            log.error("The broker rejected the API keys. Open the .env file in this folder and check the "
+                      "key/secret values (no quotes, no spaces). If you rotated keys, paste the new ones.")
+        else:
+            log.error("Check the .env file in this folder and your internet connection, then start again.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

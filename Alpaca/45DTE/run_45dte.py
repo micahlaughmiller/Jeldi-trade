@@ -11,10 +11,13 @@ os.chdir(Path(__file__).resolve().parent)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config_45dte
-from broker import Broker
+from broker import Broker, BrokerError
 from logger_system import TradingLogger
 from order_manager import OrderManager
 from scheduler_45dte import Scheduler
+
+# "Alpaca" or "schwab" from the parent folder, so this file is identical in both copies.
+LABEL = f"[{Path(__file__).resolve().parents[1].name.upper()} 45DTE]"
 
 
 def main() -> None:
@@ -25,32 +28,35 @@ def main() -> None:
     args = parser.parse_args()
 
     log = TradingLogger(config_45dte.LOG_DIR)
-    print(f"[ALPACA 45DTE] Starting bot (log: {config_45dte.LOG_DIR})")
+    print(f"{LABEL} Starting bot (log folder: {Path(config_45dte.LOG_DIR).resolve()})")
     if args.dry_run:
-        print("[ALPACA 45DTE] DRY-RUN mode: orders logged but not sent")
+        print(f"{LABEL} DRY-RUN mode: orders logged but not sent")
     if args.once:
-        print("[ALPACA 45DTE] ONCE mode: will exit after end-of-day")
-    
+        print(f"{LABEL} ONCE mode: will exit after end-of-day")
+
     broker = Broker(config_45dte, dry_run=True if args.dry_run else None,
                     log=lambda message: log.log_event("BROKER", message))
-    print(f"[ALPACA 45DTE] Broker initialized")
-    
     orders = OrderManager(broker, log, config_45dte)
-    print(f"[ALPACA 45DTE] OrderManager initialized")
-    
     if args.reset_breaker:
         orders.risk.reset_breaker()
-        print(f"[ALPACA 45DTE] Circuit breaker reset")
-    
+        print(f"{LABEL} Circuit breaker reset")
     scheduler = Scheduler(broker, orders, log, config_45dte, once=args.once)
-    print(f"[ALPACA 45DTE] Scheduler started\n")
-    
+
     try:
         scheduler.run()
     except KeyboardInterrupt:
         log.log_event("SHUTDOWN", "stopped by user; state saved")
         orders.save()
-        print("[ALPACA 45DTE] Stopped by user")
+        print(f"{LABEL} Stopped by user")
+    except BrokerError as exc:
+        log.log_event("STARTUP_ERROR", str(exc))
+        print(f"\n{LABEL} BROKER ERROR: {exc}")
+        if "401" in str(exc) or "unauthorized" in str(exc).lower():
+            print(f"{LABEL} The broker rejected the API keys. Open the .env file in this folder and check "
+                  f"the key/secret values (no quotes, no spaces). If you rotated keys, paste the new ones.")
+        else:
+            print(f"{LABEL} Check the .env file in this folder and your internet connection, then start again.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

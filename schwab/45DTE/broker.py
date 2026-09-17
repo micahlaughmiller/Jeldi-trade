@@ -23,7 +23,10 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 with warnings.catch_warnings():
-    warnings.simplefilter("ignore", DeprecationWarning)
+    # authlib.deprecate installs an "always" filter for its own warning class at
+    # import, so the ignore must be added after it to take precedence.
+    import authlib.deprecate
+    warnings.simplefilter("ignore", authlib.deprecate.AuthlibDeprecationWarning)
     import httpx
     from schwab.auth import client_from_token_file
     from schwab.client import Client as SchwabClient

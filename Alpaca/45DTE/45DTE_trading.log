@@ -1,0 +1,19 @@
+2026-09-16 07:12:10,794 - __main__ - INFO - [SYSTEM_START] Scheduler initialized and ready
+2026-09-16 07:12:10,949 - signal_engine - ERROR - Error loading S&P 500 symbols: HTTP Error 403: Forbidden
+2026-09-16 07:12:10,950 - __main__ - INFO - ================================================================================
+2026-09-16 07:12:10,951 - __main__ - INFO - 45DTE SCHEDULER INITIALIZED
+2026-09-16 07:12:10,952 - __main__ - INFO - ================================================================================
+2026-09-16 07:12:10,953 - __main__ - ERROR - Error loading positions: 'AlpacaConnector' object has no attribute 'get_positions'
+2026-09-16 07:12:10,954 - __main__ - INFO - 45DTE Schedule configured
+2026-09-16 07:12:10,955 - __main__ - INFO -   • 9:30 AM: Start
+2026-09-16 07:12:10,956 - __main__ - INFO -   • Every hour: Scan for signals
+2026-09-16 07:12:10,957 - __main__ - INFO -   • Every 5 min: Manage positions
+2026-09-16 07:12:10,958 - __main__ - INFO -   • 4:00 PM: End day
+2026-09-16 07:12:10,958 - __main__ - INFO - 
+45DTE SCHEDULER RUNNING - Press Ctrl+C to stop
+
+2026-09-16 07:12:27,240 - __main__ - INFO - 
+45DTE SCHEDULER STOPPED
+2026-09-16 07:12:27,241 - __main__ - INFO - ================================================================================
+2026-09-16 07:12:27,243 - __main__ - INFO - 45DTE TRADING DAY ENDED
+2026-09-16 07:12:27,245 - __main__ - INFO - ================================================================================

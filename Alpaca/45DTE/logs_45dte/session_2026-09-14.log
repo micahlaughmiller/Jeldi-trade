@@ -1,5 +1,0 @@
-{"timestamp": "2026-09-14T09:10:40.843264", "type": "SYSTEM_START", "message": "Scheduler initialized and ready"}
-{"timestamp": "2026-09-14T09:10:40.847808", "type": "SCHEDULER_STARTED", "message": "Trading system now running"}
-{"timestamp": "2026-09-14T09:10:40.851053", "type": "STARTUP_SCAN", "message": "Past scan time (10:10 ET). Running scan immediately."}
-{"timestamp": "2026-09-14T09:10:40.982238", "type": "ACCOUNT_SUMMARY", "message": "Equity: $5000.00 | Buying Power: $20000.00 | Portfolio Risk: 0.0%", "equity": 5000.0, "buying_power": 20000.0, "portfolio_risk_pct": 0.0}
-{"timestamp": "2026-09-14T09:10:40.987481", "type": "SCAN_START", "message": "Beginning scan of 495 S&P 500 stocks", "ticker_count": 495}

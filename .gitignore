@@ -1,0 +1,21 @@
+# secrets
+.env
+token.json
+*.token
+
+# runtime output
+__pycache__/
+*.pyc
+*.log
+logs/
+logs_45dte/
+*_logs_0dte/
+trading_log.txt
+2026-*/
+
+# environments / tooling
+venv/
+.venv/
+.pytest_cache/
+.vscode/
+.idea/

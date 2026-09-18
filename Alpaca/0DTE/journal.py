@@ -1,4 +1,4 @@
-"""JSONL event log, trades.csv, and state.json persistence."""
+"""Persona-scoped JSONL event log, trades.csv, and state persistence."""
 
 import csv
 import json
@@ -12,7 +12,6 @@ TRADE_FIELDS = [
     "short_strike", "long_strike", "width", "qty", "entry_credit", "exit_price",
     "pnl", "exit_reason", "runner",
 ]
-
 
 RULE = "=" * 70
 THIN = "-" * 70
@@ -130,12 +129,13 @@ class Journal:
     def __init__(self, log_dir: str | Path, trader_name: str):
         self.dir = Path(log_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.trader = trader_name
-        self.state_path = self.dir / f"state_{trader_name.lower()}.json"
-        self.trades_path = self.dir / "trades.csv"
+        self.trader = trader_name.upper()
+        self.slug = self.trader.lower()
+        self.state_path = self.dir / f"state_{self.slug}.json"
+        self.trades_path = self.dir / f"trades_{self.slug}.csv"
 
     def event(self, kind: str, now: datetime, **data: Any) -> None:
-        path = self.dir / f"events_{now.date().isoformat()}.jsonl"
+        path = self.dir / f"events_{self.slug}_{now.date().isoformat()}.jsonl"
         record = {"ts": now.isoformat(), "trader": self.trader, "event": kind, **jsonable(data)}
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, default=str) + "\n")
@@ -149,7 +149,7 @@ class Journal:
             w.writerow(jsonable(row))
 
     def card(self, text: str, now: datetime) -> None:
-        path = self.dir / f"trades_{now.date().isoformat()}.txt"
+        path = self.dir / f"trades_{self.slug}_{now.date().isoformat()}.txt"
         with path.open("a", encoding="utf-8") as f:
             f.write(text + "\n\n")
 

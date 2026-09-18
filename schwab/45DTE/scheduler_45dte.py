@@ -58,6 +58,7 @@ class Scheduler:
         self.last_idle_log: datetime | None = None
         self.eod_done_for: date | None = None
         self.equity: float | None = None
+        self._skip_logged: set[tuple[date, str]] = set()
         self.orders.on_position_change = self.print_report
 
     # ---------------------------------------------------------------- reports
@@ -125,9 +126,21 @@ class Scheduler:
 
     def try_enter(self, row: dict[str, Any], today: date) -> None:
         symbol = row["broker_symbol"]
-        busy = {p["broker_symbol"] for p in self.orders.positions} | {e["broker_symbol"] for e in self.orders.working_entries}
-        if symbol in busy or symbol in self.orders.blocked_symbols or self.risk.breaker_tripped:
-            self.log.risk_check(symbol, False, 0, "pre-check: busy, blocked or breaker tripped")
+        if self.risk.breaker_tripped:
+            self.log.risk_check(symbol, False, 0, "circuit breaker tripped (run with --reset-breaker to clear)")
+            return
+        if symbol in self.orders.blocked_symbols:
+            self.log.risk_check(symbol, False, 0, "symbol blocked: unpaired option leg at broker, fix manually")
+            return
+        in_position = {p["broker_symbol"] for p in self.orders.positions}
+        working = {e["broker_symbol"] for e in self.orders.working_entries}
+        if symbol in in_position or symbol in working:
+            # Held names re-signal on every scan; say so once per day instead of every 5 minutes.
+            key = (today, symbol)
+            if key not in self._skip_logged:
+                self._skip_logged.add(key)
+                why = "already holding a spread" if symbol in in_position else "entry order already working"
+                self.log.log_event("SIGNAL_SKIPPED", f"{symbol}: {why}; will not add a second position", symbol=symbol)
             return
         try:
             spec = build_trade(self.broker, row, today, self.config)

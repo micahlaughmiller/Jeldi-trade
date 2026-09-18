@@ -221,6 +221,7 @@ class PositionManager:
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
+            "total_qty": p.qty, "root": p.root,
         }
         log.warning("CLOSED %d @ %.2f (%s) pnl %.2f | position realized %.2f, %d left",
                     fill_qty, exit_price, reason, pnl, p.realized_pnl, p.remaining)

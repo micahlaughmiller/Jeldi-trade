@@ -19,7 +19,7 @@ import config
 import market_data
 import strategy
 from broker import Broker, BrokerError
-from journal import Journal
+from journal import Journal, format_close_card, format_day_table, format_entry_card
 from position_manager import OpenSpread, PositionManager, spxw_legs
 from risk_manager import DayState, RiskManager, contracts_for, tier
 from strategy import Phase
@@ -37,12 +37,18 @@ def now_et() -> datetime:
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
     fmt.converter = lambda ts: datetime.fromtimestamp(ts, config.ET).timetuple()
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    for handler in (logging.StreamHandler(sys.stdout),
-                    logging.FileHandler(LOG_DIR / f"0dte_{config.TRADER_NAME.lower()}.log", encoding="utf-8")):
+    root.setLevel(logging.DEBUG)
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    # Raw broker payload dumps and per-request chatter go to the file only.
+    console.addFilter(lambda r: not (r.getMessage().startswith("[broker]") and ": {" in r.getMessage()))
+    console.addFilter(lambda r: not r.name.startswith(("httpx", "urllib3", "yfinance", "peewee")))
+    file_handler = logging.FileHandler(LOG_DIR / f"0dte_{config.TRADER_NAME.lower()}.log", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    for handler in (console, file_handler):
         handler.setFormatter(fmt)
         root.addHandler(handler)
 
@@ -144,7 +150,7 @@ class Bot:
         if new_candle:
             self.last_candle = candles.index[-1].to_pydatetime()
             last = candles.iloc[-1]
-            log.info("Candle %s O %.2f H %.2f L %.2f C %.2f | phase %s",
+            log.debug("Candle %s O %.2f H %.2f L %.2f C %.2f | phase %s",
                      self.last_candle.strftime("%H:%M"), last.open, last.high, last.low, last.close, ph)
         if self.pm.position is not None:
             self.manage(now, candles)
@@ -254,6 +260,9 @@ class Bot:
             expiration=self.today, short_strike=short_strike, long_strike=long_strike, width=width,
             qty=filled_qty, entry_credit=credit, entry_time=now_et(), current_price=credit,
             best_price=credit))
+        card = format_entry_card(self.pm.position, self.risk.state.trades_today + 1)
+        log.info("\n%s", card)
+        self.journal.card(card, now)
         self.save_state()
 
     def work_entry(self, order: dict, start_limit: float, floor_limit: float) -> dict:
@@ -298,8 +307,18 @@ class Bot:
     def record_fills(self, fills: list[dict]) -> None:
         for row in fills:
             self.journal.trade(row)
+            s = self.risk.state
+            trade_no = s.trades_today + 1
             if row["position_closed"]:
                 self.risk.record_trade(row["position_pnl"], row)
+                remaining = 0
+                day_pnl = s.realized_pnl
+            else:
+                remaining = self.pm.position.remaining if self.pm.position else 0
+                day_pnl = s.realized_pnl + row["position_pnl"]
+            card = format_close_card(row, trade_no, day_pnl, s.trades_today, remaining)
+            log.info("\n%s", card)
+            self.journal.card(card, now_et())
         if fills:
             self.save_state()
 
@@ -363,10 +382,8 @@ class Bot:
                  f"Trades closed: {s.trades_today}   Realized P&L: {fmt_money(s.realized_pnl)}",
                  f"Equity start {fmt_money(s.start_equity)} -> end {fmt_money(acct['equity'])} "
                  f"({acct['equity'] - s.start_equity:+,.2f})"]
-        for row in s.closed_trades:
-            lines.append(f"   {row['setup']} {row['direction']} {row['short_strike']}{row['right']}/"
-                         f"{row['long_strike']} x{row['qty']} {row['entry_credit']:.2f}->{row['exit_price']:.2f} "
-                         f"{row['exit_reason']} pnl {row['pnl']:+.2f} runner={row['runner']}")
+        table = format_day_table(s.closed_trades, s.realized_pnl)
+        self.journal.card(table, now)
         mismatches = []
         if legs:
             mismatches.append(f"broker still holds {config.OPTION_ROOT} legs: {[(l['symbol'], l['qty']) for l in legs]}")
@@ -379,6 +396,7 @@ class Bot:
         lines.append("=" * 72)
         for line in lines:
             (log.critical if mismatches else log.info)(line)
+        log.info("\n%s", table)
         self.journal.event("END", now, account=acct, day=s.to_dict(), mismatches=mismatches)
 
     # ----------------------------------------------------------------- state

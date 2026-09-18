@@ -556,7 +556,9 @@ class Broker:
             "legs": legs,
         }
         if client_tag:
-            payload["client_order_id"] = str(client_tag)[:128]
+            # Alpaca requires client_order_id to be unique across every order the account has
+            # ever placed, so a fixed tag would be rejected from the second use onward.
+            payload["client_order_id"] = f"{str(client_tag)[:110]}-{uuid.uuid4().hex[:12]}"
         return payload
 
     def _submit(self, payload: dict, label: str) -> dict:

@@ -262,7 +262,10 @@ def test_place_credit_spread_payload(b):
     o = b.place_credit_spread("SPX", date(2026, 9, 17), "P", 6300, 6295, 1, 1.5, time_in_force="day", root="SPXW", client_tag="tag1")
     sent = b._session.calls[0]["json"]
     assert sent["order_class"] == "mleg" and sent["qty"] == "1" and sent["type"] == "limit" and sent["limit_price"] == "1.50" and sent["time_in_force"] == "day"
-    assert sent["client_order_id"] == "tag1"
+    assert sent["client_order_id"].startswith("tag1-") and len(sent["client_order_id"]) == len("tag1-") + 12
+    b._session.add("POST", "/v2/orders", body=dict(MLEG_RAW, status="pending_new"))
+    b.place_credit_spread("SPX", date(2026, 9, 17), "P", 6300, 6295, 1, 1.5, time_in_force="day", root="SPXW", client_tag="tag1")
+    assert b._session.calls[1]["json"]["client_order_id"] != sent["client_order_id"]
     assert sent["legs"] == [
         {"symbol": "SPXW260917P06300000", "ratio_qty": "1", "side": "sell", "position_intent": "sell_to_open"},
         {"symbol": "SPXW260917P06295000", "ratio_qty": "1", "side": "buy", "position_intent": "buy_to_open"},

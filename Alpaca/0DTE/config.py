@@ -15,15 +15,19 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 ET = ZoneInfo("US/Eastern")
 
-ACTIVE_TRADER = os.getenv("ACTIVE_TRADER", "ASTRA").upper()
-if ACTIVE_TRADER == "ASTRA":
-    ALPACA_API_KEY = os.getenv("ASTRA_API_KEY", "")
-    ALPACA_SECRET_KEY = os.getenv("ASTRA_API_SECRET", "")
-elif ACTIVE_TRADER == "CLAUDE":
-    ALPACA_API_KEY = os.getenv("CLAUDE_API_KEY", "")
-    ALPACA_SECRET_KEY = os.getenv("CLAUDE_API_SECRET", "")
-else:
-    raise ValueError(f"Unknown ACTIVE_TRADER: {ACTIVE_TRADER}")
+# The selected persona determines both the Alpaca credentials and the names of
+# all local state/log files. Run one process per persona/account.
+TRADER_NAMES = (
+    "ASTRA", "CLAUDE", "JAMES", "SARAH", "MARCUS", "ELENA", "DAVID", "ARIA", "JORDAN",
+)
+ACTIVE_TRADER = os.getenv("ACTIVE_TRADER", "ASTRA").strip().upper()
+if ACTIVE_TRADER not in TRADER_NAMES:
+    raise ValueError(
+        f"Unknown ACTIVE_TRADER: {ACTIVE_TRADER}. "
+        f"Choose one of {', '.join(TRADER_NAMES)}"
+    )
+ALPACA_API_KEY = os.getenv(f"{ACTIVE_TRADER}_API_KEY", "").strip()
+ALPACA_SECRET_KEY = os.getenv(f"{ACTIVE_TRADER}_API_SECRET", "").strip()
 TRADER_NAME = ACTIVE_TRADER
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("1", "true", "yes")
@@ -57,13 +61,10 @@ CANDLE_INTERVAL = "2m"
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
 
-# ES_TO_SPX: ES overnight levels + (SPX - ES) basis, compared against live SPX candles.
-# ES: compare ES candles directly against ES levels (Yahoo ES is ~10 min delayed).
 BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 
 WIDTH_BY_TIER = {1: 5, 2: 5, 3: 10, 4: 10}
 CREDIT_RANGE_BY_WIDTH = {5: (2.75, 3.50), 10: (5.50, 7.00)}
-
 TIER_BANDS = [(10_000, 1), (30_000, 2), (50_000, 3), (float("inf"), 4)]
 RISK_PER_TRADE_PCT = 0.05
 ALLOW_MIN_CONTRACT_OVERRIDE = True
@@ -87,15 +88,8 @@ ENTRY_STEP_SEC = 20
 ENTRY_PRICE_STEP = 0.05
 ENTRY_TIMEOUT_SEC = 120
 
-# 2026 FOMC decision dates -- verify against federalreserve.gov
 NEWS_DAYS = [
-    "2026-01-28",
-    "2026-03-18",
-    "2026-04-29",
-    "2026-06-17",
-    "2026-07-29",
-    "2026-09-16",
-    "2026-10-28",
-    "2026-12-09",
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
 ]
 NEWS_DAY_MODE = "half_size"

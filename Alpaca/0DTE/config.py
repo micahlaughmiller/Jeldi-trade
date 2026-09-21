@@ -166,6 +166,10 @@ PERSONA_OVERRIDES: dict[str, dict] = {
     "ARIA":   {"STOP_LOSS": 0.60},
     "DAVID":  {"STOP_LOSS": 0.70},
     "ELENA":  {"PROFIT_TARGET": 0.50},                                                    # runner starts at 0.50
-    "JORDAN": {"STOP_LOSS": 0.60, "PROFIT_TARGET": 0.50, "PROFIT_LOCK_ENABLED": False},   # best hybrid on the model
+    # best hybrid on the model; the lock is switched off for A only (B keeps its own lock)
+    "JORDAN": {"STOP_LOSS": 0.60, "PROFIT_TARGET": 0.50,
+               "EXIT_TUNING_BY_STRATEGY": {"A": {"PROFIT_LOCK_ENABLED": False, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
+                                                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False},
+                                           "B": {}}},
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

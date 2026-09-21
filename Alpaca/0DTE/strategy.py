@@ -24,6 +24,8 @@ import config
 
 BULLISH = "BULLISH"
 BEARISH = "BEARISH"
+MOMENTUM = "MOMENTUM"     # ORB entry kinds
+PULLBACK = "PULLBACK"
 
 
 class Phase(StrEnum):
@@ -119,12 +121,14 @@ class OrbSetup:
         self.direction: str | None = None
         self.break_close: float | None = None
         self.candles_since_break = 0
+        self.entry_kind: str | None = None   # MOMENTUM or PULLBACK for the entry just fired
 
     def _reset(self) -> None:
         self.state = self.WAITING
         self.direction = None
         self.break_close = None
         self.candles_since_break = 0
+        self.entry_kind = None
 
     def _arm(self, direction: str, close: float) -> None:
         self.state = self.BROKEN
@@ -132,8 +136,9 @@ class OrbSetup:
         self.break_close = close
         self.candles_since_break = 0
 
-    def _enter(self) -> str:
+    def _enter(self, kind: str) -> str:
         self.state = self.DONE
+        self.entry_kind = kind
         return self.direction
 
     def update(self, candle: pd.Series) -> str | None:
@@ -164,10 +169,10 @@ class OrbSetup:
             if sign * (touch - level) <= 0:
                 self.state = self.PULLED_BACK
             elif sign * (close - self.break_close) > 0:
-                return self._enter()
+                return self._enter(MOMENTUM)
             return None
         if sign * (close - open_) > 0:
-            return self._enter()
+            return self._enter(PULLBACK)
         return None
 
 
@@ -200,6 +205,12 @@ def credit_range(width: int) -> tuple[float, float]:
 
 def credit_range_b(width: int) -> tuple[float, float]:
     return config.B_CREDIT_RANGE_BY_WIDTH[width]
+
+
+def exit_setting(strat: str, name: str, default=None):
+    """Per-strategy exit knob from EXIT_TUNING_BY_STRATEGY, else the module-level config value."""
+    v = config.EXIT_TUNING_BY_STRATEGY.get(strat, {}).get(name)
+    return v if v is not None else getattr(config, name, default)
 
 
 def exit_levels(strat: str) -> tuple[float, float]:
@@ -235,6 +246,51 @@ def entry_credit(chain_quotes: list[dict], short_strike: float, long_strike: flo
     if quote.mid > hi:
         return quote, f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f}"
     return quote, None
+
+
+def credit_bias(width: int) -> float:
+    return config.A_CREDIT_BIAS_BY_WIDTH[width]
+
+
+def select_strikes_a(spot: float, right: str, width: int,
+                     chain_rows: list[dict]) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """Strategy A strikes: the ITM spread from select_strikes, walked toward spot while too deep.
+
+    A mid above credit_bias(width) -- or above the band's max -- means the short strike is deeper
+    ITM than wanted. Step both strikes one strike toward spot, up to A_MAX_STRIKE_WALK times, as
+    long as the short strike stays ITM. The first quote at or under the bias wins; if the walk runs
+    out (or would drop the credit below the band's minimum) the last in-band quote is used.
+    Returns (short, long, quote) or (None, None, reason).
+    """
+    short, long = select_strikes(spot, right, width)
+    lo, hi = credit_range(width)
+    bias = credit_bias(width)
+    step = -5.0 if right == "P" else 5.0
+    best: tuple[float, float, SpreadQuote] | None = None
+    reason = ""
+    for _ in range(config.A_MAX_STRIKE_WALK + 1):
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            reason = f"STRIKES_NOT_IN_CHAIN short={short:g} long={long:g}"
+            break
+        if quote.mid < lo:
+            reason = f"CREDIT_BELOW_MIN mid={quote.mid:.2f} < {lo:.2f} at {short:g}/{long:g}"
+            break
+        if quote.mid <= bias:
+            return short, long, quote
+        if quote.mid <= hi:
+            best = (short, long, quote)
+        reason = f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f} at {short:g}/{long:g}"
+        next_short = short + step
+        if not (next_short > spot if right == "P" else next_short < spot):
+            reason += " (next strike would not be ITM)"
+            break
+        short, long = next_short, long + step
+    else:
+        reason += f" after {config.A_MAX_STRIKE_WALK} strike walk(s)"
+    if best is not None:
+        return best
+    return None, None, reason
 
 
 def expected_move(chain_calls: list[dict], chain_puts: list[dict], spot: float) -> float | None:

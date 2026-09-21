@@ -13,6 +13,7 @@ TRADE_FIELDS = [
     "date", "strategy", "entry_time", "exit_time", "direction", "setup", "right",
     "short_strike", "long_strike", "width", "qty", "entry_credit", "exit_price",
     "pnl", "exit_reason", "runner",
+    "trigger_price", "exit_slippage", "entry_mid", "entry_slippage",
 ]
 
 RULE = "=" * 70
@@ -153,6 +154,14 @@ class Journal:
 
     def trade(self, row: dict) -> None:
         exists = self.trades_path.exists()
+        if exists:
+            with self.trades_path.open(newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), [])
+            if header != TRADE_FIELDS:
+                # Columns changed: park the old file rather than appending misaligned rows to it.
+                parked = self.trades_path.with_name(f"{self.trades_path.stem}_until_{row.get('date', 'x')}.csv")
+                self.trades_path.replace(parked)
+                exists = False
         with self.trades_path.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
             if not exists:

@@ -1,7 +1,8 @@
 import pytest
 
 import config
-from risk_manager import DayState, RiskManager, contracts_for, tier
+from conftest import et
+from risk_manager import DayState, RiskManager, contracts_for, limit, tier
 
 
 @pytest.mark.parametrize("equity, expected", [
@@ -59,7 +60,7 @@ def test_invalid_spread_returns_zero():
 def test_consecutive_loss_stop_is_per_strategy():
     rm = RiskManager(10_000)
     assert rm.trading_allowed("A") == (True, "OK")
-    for _ in range(config.MAX_CONSECUTIVE_LOSSES - 1):
+    for _ in range(limit("A", "MAX_CONSECUTIVE_LOSSES") - 1):
         rm.record_trade("A", -60.0)
     assert rm.trading_allowed("A")[0] is True
     rm.record_trade("A", -60.0)
@@ -70,11 +71,43 @@ def test_consecutive_loss_stop_is_per_strategy():
 
 def test_win_resets_consecutive_losses():
     rm = RiskManager(10_000)
-    rm.record_trade("A", -60.0)
-    rm.record_trade("A", 90.0)
-    rm.record_trade("A", -60.0)
-    assert rm.state.for_strategy("A").consecutive_losses == 1
-    assert rm.trading_allowed("A")[0] is True
+    rm.record_trade("B", -60.0)
+    rm.record_trade("B", 90.0)
+    rm.record_trade("B", -60.0)
+    assert rm.state.for_strategy("B").consecutive_losses == 1
+    assert rm.trading_allowed("B")[0] is True
+
+
+def test_a_limits_are_tighter_than_b():
+    assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (3, 2, 30)
+    assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (20, 5, 0)
+    rm = RiskManager(10_000)
+    for _ in range(3):
+        rm.record_trade("A", 10.0)
+        rm.record_trade("B", 10.0)
+    ok, reason = rm.trading_allowed("A")
+    assert ok is False and reason == "A: MAX_TRADES_PER_DAY (3)"
+    assert rm.trading_allowed("B") == (True, "OK")
+    rm2 = RiskManager(10_000)
+    rm2.record_trade("A", -10.0)
+    rm2.record_trade("A", -10.0)
+    assert rm2.trading_allowed("A")[0] is False and "CONSECUTIVE" in rm2.trading_allowed("A")[1]
+
+
+def test_cooldown_after_exit_applies_to_a_only():
+    rm = RiskManager(10_000)
+    rm.record_trade("A", -50.0, {"strategy": "A", "pnl": -50.0, "exit_time": et(10, 30)})
+    rm.record_trade("B", -50.0, {"strategy": "B", "pnl": -50.0, "exit_time": et(10, 30)})
+    ok, reason = rm.trading_allowed("A", now=et(10, 45))
+    assert ok is False and reason == "A: COOLDOWN until 11:00"
+    assert rm.trading_allowed("A", now=et(10, 59, 59))[0] is False
+    assert rm.trading_allowed("A", now=et(11, 0)) == (True, "OK")
+    assert rm.trading_allowed("B", now=et(10, 31)) == (True, "OK")
+    # no clock given (legacy callers) -> the cool-down is not evaluated
+    assert rm.trading_allowed("A") == (True, "OK")
+    # the last exit survives a state round-trip
+    restored = DayState.from_dict(rm.state.to_dict())
+    assert restored.for_strategy("A").last_exit == et(10, 30).isoformat()
 
 
 def test_max_trades_per_day_is_per_strategy():

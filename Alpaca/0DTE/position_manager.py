@@ -37,6 +37,7 @@ class OpenSpread:
     momentum_at_target: float | None = None
     closed_qty: int = 0
     realized_pnl: float = 0.0
+    entry_mid: float | None = None   # quote mid when the entry was placed (fill quality)
 
     @property
     def remaining(self) -> int:
@@ -183,10 +184,14 @@ class PositionManager:
         if spread_price >= p.stop_price:
             return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
         if spread_price <= p.target_price:
-            if (config.RUNNER_ENABLED and p.remaining >= config.RUNNER_MIN_CONTRACTS
-                    and strategy.momentum_continuing(candles, p.direction)):
-                fills = self._close(p, p.remaining // 2, "TARGET_HALF", now, spread_price)
-                if fills and p.remaining > 0:
+            fraction = config.RUNNER_CLOSE_FRACTION_BY_STRATEGY.get(p.strategy, 0.5)
+            book = int(p.remaining * fraction)
+            enough = fraction == 0 or p.remaining >= config.RUNNER_MIN_CONTRACTS
+            gate = strategy.exit_setting(p.strategy, "RUNNER_MOMENTUM_GATE", True)
+            continuing = strategy.momentum_continuing(candles, p.direction) if gate else True
+            if config.RUNNER_ENABLED and enough and continuing:
+                fills = self._close(p, book, "TARGET_HALF", now, spread_price) if book > 0 else []
+                if p.remaining > 0 and (book == 0 or fills):
                     p.runner = True
                     p.runner_best = spread_price
                     p.momentum_at_target = strategy.momentum(candles, p.direction)
@@ -195,13 +200,17 @@ class PositionManager:
                     self.journal.event("RUNNER_START", now, strategy=p.strategy, position=p.to_dict())
                 return fills
             return self._close(p, p.remaining, "PROFIT_TARGET", now, spread_price)
-        if config.PROFIT_LOCK_ENABLED and (p.entry_credit - p.best_price) >= config.PROFIT_LOCK_ARM:
+        lock_on = strategy.exit_setting(p.strategy, "PROFIT_LOCK_ENABLED", True)
+        arm = strategy.exit_setting(p.strategy, "PROFIT_LOCK_ARM")
+        if lock_on and (p.entry_credit - p.best_price) >= arm:
             profit = p.entry_credit - spread_price
-            if spread_price >= p.best_price + config.PROFIT_LOCK_GIVEBACK:
+            giveback = strategy.exit_setting(p.strategy, "PROFIT_LOCK_GIVEBACK")
+            if spread_price >= p.best_price + giveback:
                 log.info("[%s] PROFIT LOCK: best %.2f, now %.2f (gave back %.2f); locking %+.2f",
                          p.strategy, p.best_price, spread_price, spread_price - p.best_price, profit)
                 return self._close(p, p.remaining, "PROFIT_LOCK_GIVEBACK", now, spread_price)
-            if config.PROFIT_LOCK_ON_MOMENTUM_FLIP and profit > 0 and strategy.candle_against(candles, p.direction):
+            on_flip = strategy.exit_setting(p.strategy, "PROFIT_LOCK_ON_MOMENTUM_FLIP", True)
+            if on_flip and profit > 0 and strategy.candle_against(candles, p.direction):
                 log.info("[%s] PROFIT LOCK: candle closed against the trade with %+.2f open profit",
                          p.strategy, profit)
                 return self._close(p, p.remaining, "PROFIT_LOCK_MOMENTUM", now, spread_price)
@@ -214,7 +223,8 @@ class PositionManager:
             reason = "RUNNER_STOP"
         elif spread_price >= p.runner_best + config.TRAIL_AMOUNT:
             reason = "RUNNER_TRAIL"
-        elif p.momentum_at_target is not None and p.momentum_at_target > 0 \
+        elif strategy.exit_setting(p.strategy, "RUNNER_SLOWDOWN_EXIT", True) \
+                and p.momentum_at_target is not None and p.momentum_at_target > 0 \
                 and strategy.momentum_slowed(strategy.momentum(candles, p.direction), p.momentum_at_target):
             reason = "RUNNER_MOMENTUM_SLOWED"
         if reason is None:
@@ -274,6 +284,9 @@ class PositionManager:
         pnl = round((p.entry_credit - exit_price) * 100 * fill_qty, 2)
         p.closed_qty += fill_qty
         p.realized_pnl = round(p.realized_pnl + pnl, 2)
+        # Fill quality: positive slippage = the fill cost us relative to the quote mid that triggered it.
+        exit_slippage = round(exit_price - spread_price, 2)
+        entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
         row = {
             "date": now.date().isoformat(), "strategy": p.strategy,
             "entry_time": p.entry_time, "exit_time": now,
@@ -281,11 +294,14 @@ class PositionManager:
             "short_strike": p.short_strike, "long_strike": p.long_strike, "width": p.width,
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
+            "trigger_price": spread_price, "exit_slippage": exit_slippage,
+            "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
             "total_qty": p.qty, "root": p.root,
         }
-        log.warning("[%s] CLOSED %d @ %.2f (%s) pnl %.2f | position realized %.2f, %d left",
-                    p.strategy, fill_qty, exit_price, reason, pnl, p.realized_pnl, p.remaining)
+        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f | position realized %.2f, %d left",
+                    p.strategy, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl,
+                    p.realized_pnl, p.remaining)
         self.journal.event("EXIT", now, **row)
         if p.remaining == 0:
             del self.positions[p.strategy]

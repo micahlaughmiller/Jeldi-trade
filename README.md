@@ -68,13 +68,25 @@ launched during the session.
 **0DTE** — 09:30–09:45: ES overnight high/low (translated to SPX via the
 open basis) breakout, confirmed on 2-minute SPX candles (break, then next
 candle holds and extends). 09:45–10:00: overnight breakout or opening-range
-breakout. After 10:00: ORB only. No new entries after 12:00; everything is
-force-closed at 12:30. Bullish → sell an ITM put spread (buy first ITM strike,
+breakout. After 10:00: ORB only. No new entries after 15:00 ET (2:00 pm CST);
+everything is force-closed at 15:30 ET (2:30 pm CST). Bullish → sell an ITM put spread (buy first ITM strike,
 sell one width deeper); bearish → sell an ITM call spread. $5-wide below $30k
-equity (credit 2.75–3.50), $10-wide above (5.50–7.00). Exit at +$0.30 / −$0.30;
-with 2+ contracts and continuing momentum, half closes at target and the rest
-runs with the stop moved to the target level, a $0.50 trailing stop, and an
-exit on a 20% momentum slowdown.
+equity (credit 2.75–3.50), $10-wide above (5.50–7.00); a mid above 3.25 / 6.50
+walks both strikes one strike toward spot (max 2, short stays ITM) instead of
+entering deep ITM or rejecting. Exit at +$0.30 / −$0.55 (strategy B: −$0.50).
+Strategy A: profit lock arms at +$0.30 and exits on a $0.35 giveback (no
+candle-against exit); at the target the whole position always becomes the
+runner (stop moved to the target level, $0.50 trailing stop, no momentum
+slowdown exit). Strategy B: lock arms at +$0.15 / $0.10 giveback with the
+candle-against exit, books half at target when momentum continues and runs the
+rest with the 20% slowdown exit. A takes both ORB entry kinds (momentum close
+and pullback) but not the overnight setup, at most 3 trades / 2 consecutive
+losses a day, with a 30-minute cool-down after each exit; B keeps the 20 / 5
+defaults and both setups. Per-strategy exit knobs live in
+`EXIT_TUNING_BY_STRATEGY`. Ctrl+C or SIGTERM closes every open spread before the process exits.
+Every trade row records the trigger mid next to the fill (slippage columns).
+Per-persona parameter overrides live in `PERSONA_OVERRIDES` at the bottom of
+the Alpaca config.
 
 **45DTE** — scans the S&P 500 (`data/sp500_tickers.txt`) every 5 min from
 09:30–11:30, every 30 min until 15:00, then every 5 min to the close. Both

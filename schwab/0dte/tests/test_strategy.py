@@ -16,10 +16,11 @@ from strategy import BEARISH, BULLISH, OrbSetup, Phase
     (10, 0, Phase.ORB_ONLY),
     (10, 37, Phase.ORB_ONLY),
     (11, 59, Phase.ORB_ONLY),
-    (12, 0, Phase.NO_NEW_ENTRIES),
-    (12, 29, Phase.NO_NEW_ENTRIES),
-    (12, 30, Phase.CLOSED),
-    (15, 0, Phase.CLOSED),
+    (14, 59, Phase.ORB_ONLY),
+    (15, 0, Phase.NO_NEW_ENTRIES),
+    (15, 29, Phase.NO_NEW_ENTRIES),
+    (15, 30, Phase.CLOSED),
+    (16, 0, Phase.CLOSED),
 ])
 def test_phase_boundaries(h, m, expected):
     assert strategy.phase(et(h, m)) == expected
@@ -93,7 +94,7 @@ def test_orb_momentum_entry_without_pullback():
     s = OrbSetup(ORH, ORL)
     # break closes 7624; next candle never touches 7620 and closes above 7624 -> momentum entry
     assert feed(s, [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]) == [None, BULLISH]
-    assert s.state == OrbSetup.DONE
+    assert s.state == OrbSetup.DONE and s.entry_kind == strategy.MOMENTUM
 
 
 def test_orb_break_without_new_high_keeps_waiting():
@@ -116,6 +117,9 @@ def test_orb_pullback_entry_owner_example():
         (7621, 7623, 7620.5, 7622), # green candle closing above 7620 -> enter at 7622
     ]
     assert feed(s, bars) == [None, None, BULLISH]
+    assert s.entry_kind == strategy.PULLBACK
+    s.update(make_candles(et(10, 15), [(7622, 7623, 7600, 7605)], minutes=5).iloc[0])   # back inside -> reset
+    assert s.state == OrbSetup.WAITING and s.entry_kind is None
 
 
 def test_orb_pullback_then_red_candle_does_not_enter():
@@ -207,7 +211,7 @@ def test_width_and_credit_range():
 
 
 def test_exit_levels_per_strategy():
-    assert strategy.exit_levels("A") == (0.30, 0.30)
+    assert strategy.exit_levels("A") == (0.30, 0.55)
     assert strategy.exit_levels("B") == (0.30, 0.50)
 
 
@@ -230,6 +234,75 @@ def test_entry_credit_rejections():
     assert reason.startswith("CREDIT_ABOVE_MAX")
     q, reason = strategy.entry_credit(chain({7510: (8.0, 8.2)}), 7510, 7505, 5)
     assert q is None and reason.startswith("STRIKES_NOT_IN_CHAIN")
+
+
+# ------------------------------------------------------ strategy A strike walk
+
+def test_select_strikes_a_keeps_base_strikes_at_or_under_bias():
+    # 7510/7505 pays 3.00 <= bias 3.25: no walk even though 7505/7500 would also be in band
+    rows = chain({7510: (7.9, 8.1), 7505: (4.9, 5.1), 7500: (1.9, 2.1)})
+    short, long, q = strategy.select_strikes_a(7500.0, "P", 5, rows)
+    assert (short, long, q.mid) == (7510.0, 7505.0, pytest.approx(3.00))
+
+
+def test_select_strikes_a_walks_toward_spot_when_above_bias():
+    # 7510/7505 pays 3.40 (in band, above bias) -> 7505/7500 pays 3.00
+    rows = chain({7510: (8.3, 8.5), 7505: (4.9, 5.1), 7500: (1.9, 2.1)})
+    short, long, q = strategy.select_strikes_a(7500.5, "P", 5, rows)
+    assert (short, long, q.mid) == (7505.0, 7500.0, pytest.approx(3.00))
+
+
+def test_select_strikes_a_walks_instead_of_rejecting_above_max():
+    # 7515/7505 pays 7.24 > max 7.00 -> 7510/7500 pays 6.40
+    rows = chain({7515: (12.2, 12.4), 7510: (9.9, 10.1), 7505: (5.0, 5.1), 7500: (3.5, 3.7)})
+    short, long, q = strategy.select_strikes_a(7501.0, "P", 10, rows)
+    assert (short, long, q.mid) == (7510.0, 7500.0, pytest.approx(6.40))
+
+
+def test_select_strikes_a_uses_last_in_band_when_walk_drops_below_min():
+    # 7510/7505 pays 3.40 (in band); 7505/7500 pays 2.50 < min 2.75 -> keep 7510/7505
+    rows = chain({7510: (8.3, 8.5), 7505: (4.9, 5.1), 7500: (2.4, 2.6)})
+    short, long, q = strategy.select_strikes_a(7500.5, "P", 5, rows)
+    assert (short, long, q.mid) == (7510.0, 7505.0, pytest.approx(3.40))
+
+
+def test_select_strikes_a_walk_is_capped(monkeypatch):
+    # $10 wide, spot 7500.5: 7515/7505, 7510/7500 and 7505/7495 all pay 7.50 > max 7.00.
+    rows = chain({7515: (15.9, 16.1), 7510: (12.4, 12.6), 7505: (8.4, 8.6), 7500: (4.9, 5.1), 7495: (0.9, 1.1)})
+    # default two walks: 7505/7495 is the last ITM rung (next short 7500 is below spot)
+    short, long, reason = strategy.select_strikes_a(7500.5, "P", 10, rows)
+    assert short is None and long is None
+    assert reason.startswith("CREDIT_ABOVE_MAX mid=7.50") and "7505/7495" in reason
+    assert reason.endswith("(next strike would not be ITM)")
+    # one walk: the cap binds at 7510/7500 although 7505 would still be ITM
+    monkeypatch.setattr(config, "A_MAX_STRIKE_WALK", 1)
+    short, long, reason = strategy.select_strikes_a(7500.5, "P", 10, rows)
+    assert short is None and "7510/7500" in reason and reason.endswith("after 1 strike walk(s)")
+    # no walk: the base strikes reject as before
+    monkeypatch.setattr(config, "A_MAX_STRIKE_WALK", 0)
+    short, long, reason = strategy.select_strikes_a(7500.5, "P", 10, rows)
+    assert short is None and reason.startswith("CREDIT_ABOVE_MAX mid=7.50") and "7515/7505" in reason
+
+
+def test_select_strikes_a_stops_walking_when_short_would_leave_itm():
+    # $5 wide, spot 7500.5: 7510/7505 pays 3.60, 7505/7500 pays 3.60; the next short (7500) is below spot
+    rows = chain({7510: (8.6, 8.8), 7505: (5.0, 5.2), 7500: (1.4, 1.6), 7495: (0.4, 0.6)})
+    short, long, reason = strategy.select_strikes_a(7500.5, "P", 5, rows)
+    assert short is None and long is None
+    assert "7505/7500" in reason and reason.endswith("(next strike would not be ITM)")
+
+
+def test_select_strikes_a_calls_walk_up_toward_spot():
+    # bearish: 7490/7495 pays 3.40 -> 7495/7500 pays 3.00
+    rows = chain({7490: (8.3, 8.5), 7495: (4.9, 5.1), 7500: (1.9, 2.1)})
+    short, long, q = strategy.select_strikes_a(7499.5, "C", 5, rows)
+    assert (short, long, q.mid) == (7495.0, 7500.0, pytest.approx(3.00))
+
+
+def test_select_strikes_a_below_min_rejects_without_walking():
+    rows = chain({7510: (7.0, 7.2), 7505: (4.9, 5.1), 7500: (1.9, 2.1)})
+    short, long, reason = strategy.select_strikes_a(7500.0, "P", 5, rows)
+    assert short is None and reason.startswith("CREDIT_BELOW_MIN")
 
 
 def test_expected_move_is_atm_straddle():

@@ -1,9 +1,16 @@
 """Tiering, contract sizing, and daily circuit breakers (per strategy plus combined)."""
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from math import floor
 
 import config
+
+
+def limit(strat: str, name: str, default=None):
+    """Per-strategy limit from LIMITS_BY_STRATEGY, else the module-level config value."""
+    v = config.LIMITS_BY_STRATEGY.get(strat, {}).get(name)
+    return v if v is not None else getattr(config, name, default)
 
 
 def tier(equity: float) -> int:
@@ -40,6 +47,7 @@ class StrategyState:
     consecutive_losses: int = 0
     realized_pnl: float = 0.0
     closed_trades: list[dict] = field(default_factory=list)
+    last_exit: str | None = None
 
     def record(self, pnl: float, row: dict | None) -> None:
         self.trades_today += 1
@@ -47,6 +55,8 @@ class StrategyState:
         self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
         if row is not None:
             self.closed_trades.append(row)
+            if row.get("exit_time") is not None:
+                self.last_exit = _exit_key(row)
 
 
 def _fresh_strategies() -> dict[str, StrategyState]:
@@ -98,12 +108,18 @@ class RiskManager:
     def daily_loss_limit(self) -> float:
         return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
-    def trading_allowed(self, strat: str, equity: float | None = None) -> tuple[bool, str]:
+    def trading_allowed(self, strat: str, equity: float | None = None,
+                        now: datetime | None = None) -> tuple[bool, str]:
         s = self.state.for_strategy(strat)
-        if s.trades_today >= config.MAX_TRADES_PER_DAY:
+        if s.trades_today >= limit(strat, "MAX_TRADES_PER_DAY"):
             return False, f"{strat}: MAX_TRADES_PER_DAY ({s.trades_today})"
-        if s.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+        if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
+        cooldown = limit(strat, "COOLDOWN_MIN", 0)
+        if cooldown and now is not None and s.last_exit:
+            until = datetime.fromisoformat(s.last_exit) + timedelta(minutes=cooldown)
+            if now < until:
+                return False, f"{strat}: COOLDOWN until {until.astimezone(config.ET).strftime('%H:%M')}"
         realized = self.state.realized_pnl
         if realized <= self.daily_loss_limit():
             return False, f"DAILY_LOSS_LIMIT realized={realized:.2f}"

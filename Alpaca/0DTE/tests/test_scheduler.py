@@ -45,12 +45,29 @@ def events(bot: scheduler.Bot, kind: str) -> list[dict]:
     return [r for r in rows if r["event"] == kind]
 
 
+def test_a_walks_one_strike_toward_spot_when_credit_is_deep(bot):
+    # spot 7605.5: base 7615/7610 pays 3.40 (above the 3.25 bias) -> A walks to 7610/7605 at 3.00.
+    # ATM straddle at 7605: call 22 + put 2 = EM 24 -> B starts at 7585 and takes 7585/7580 at 0.90.
+    bot.broker.spot = 7605.5
+    bot.broker.set_chain("C", {7605.0: (21.0, 23.0)})
+    rows = put_chain()
+    rows.update({7615.0: (8.3, 8.5), 7610.0: (4.9, 5.1), 7605.0: (1.9, 2.1),
+                 7585.0: (2.9, 3.1), 7580.0: (2.0, 2.2)})
+    bot.broker.set_chain("P", rows)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    a, b = bot.pm.positions["A"], bot.pm.positions["B"]
+    assert (a.short_strike, a.long_strike, a.entry_credit) == (7610.0, 7605.0, 3.00)
+    assert (b.short_strike, b.long_strike, b.entry_credit) == (7585.0, 7580.0, 0.90)
+    rejected = events(bot, "ENTRY_REJECTED")
+    assert rejected == []
+
+
 def test_signal_opens_a_then_b(bot, caplog):
     caplog.set_level("INFO")
     bot.enter(et(10, 15), "ORB", BULLISH)
     a, b = bot.pm.positions["A"], bot.pm.positions["B"]
     assert (a.short_strike, a.long_strike, a.qty, a.entry_credit) == (7610.0, 7605.0, 2, 3.00)
-    assert (a.profit_target, a.stop_loss) == (0.30, 0.30)
+    assert (a.profit_target, a.stop_loss) == (0.30, 0.55)
     assert (b.short_strike, b.long_strike, b.entry_credit) == (7565.0, 7560.0, 0.90)
     assert (b.profit_target, b.stop_loss) == (0.30, 0.50)
     # B sized against A's just-placed risk: A = 2 x $200 = $400 open; B max loss $410 -> 5% of 10k -> 1
@@ -109,11 +126,93 @@ def test_manage_prices_both_positions_from_one_chain_and_records_per_strategy(bo
     calls_before = len(bot.broker.close_calls)
     prices = bot.spread_prices()
     assert prices == {"A": 3.00, "B": 0.90}
-    bot.broker.spread_close_price = 3.35
-    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.35, "B": 0.95}, None))
+    bot.broker.spread_close_price = 3.60
+    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.60, "B": 0.95}, None))
     assert set(bot.pm.positions) == {"B"}
     assert len(bot.broker.close_calls) == calls_before + 1
     s = bot.risk.state
     assert s.for_strategy("A").trades_today == 1 and s.for_strategy("A").consecutive_losses == 1
     assert s.for_strategy("B").trades_today == 0
     assert bot.journal.trades_path.read_text().splitlines()[1].startswith("2026-09-17,A,")
+
+
+# ------------------------------------------------------------ strategy A entry policy
+
+def test_a_takes_both_orb_entry_kinds(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH, kind="MOMENTUM")
+    assert set(bot.pm.positions) == {"A", "B"}
+    bot.pm.positions.clear()
+    bot.risk.state.for_strategy("A").last_exit = None
+    bot.enter(et(10, 25), "ORB", BULLISH, kind="PULLBACK")
+    assert set(bot.pm.positions) == {"A", "B"}
+
+
+def test_entry_kind_policy_can_restrict_a(bot, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "ORB_ENTRY_KINDS_BY_STRATEGY", {"A": ("PULLBACK",), "B": ("MOMENTUM", "PULLBACK")})
+    bot.enter(et(10, 15), "ORB", BULLISH, kind="MOMENTUM")
+    assert set(bot.pm.positions) == {"B"}
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ORB BULLISH at 10:15")][0]
+    assert "A: skip: ORB MOMENTUM entry disabled for A" in line and "B: sell 7565P" in line
+
+
+def test_a_skips_the_overnight_setup_b_trades_it(bot, caplog):
+    caplog.set_level("INFO")
+    bot.enter(et(9, 40), "OVERNIGHT", BULLISH)
+    assert set(bot.pm.positions) == {"B"}
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL OVERNIGHT")][0]
+    assert "A: skip: OVERNIGHT setup disabled for A" in line
+
+
+def test_a_cooldown_blocks_reentry_after_its_exit(bot, caplog):
+    caplog.set_level("INFO")
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.broker.spread_close_price = 3.60
+    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.60}, None))       # A stopped out at 10:30
+    assert set(bot.pm.positions) == {"B"}
+    bot.pm.positions.pop("B")
+    bot.enter(et(10, 45), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"B"}
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ORB BULLISH at 10:45")][0]
+    assert "A: skip: A: COOLDOWN until 11:00" in line
+    bot.pm.positions.pop("B")
+    bot.enter(et(11, 5), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}
+
+
+def test_entry_records_quote_mid_for_fill_quality(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert bot.pm.positions["A"].entry_mid == 3.00 and bot.pm.positions["B"].entry_mid == 0.90
+
+
+# ------------------------------------------------------------------- interrupt
+
+def test_interrupt_closes_every_open_spread(bot, caplog):
+    caplog.set_level("WARNING")
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}
+    bot.on_interrupt()
+    assert bot.pm.positions == {} and bot.broker.get_positions() == []
+    exits = events(bot, "EXIT")
+    assert sorted(e["strategy"] for e in exits) == ["A", "B"]
+    assert {e["exit_reason"] for e in exits} == {"INTERRUPT_CLOSE"}
+    assert bot.risk.state.trades_today == 2
+    assert any("closing them now" in r.getMessage() for r in caplog.records)
+    assert json.loads(bot.journal.state_path.read_text())["positions"] == {}
+
+
+def test_interrupt_leaves_positions_when_disabled(bot, monkeypatch, caplog):
+    caplog.set_level("WARNING")
+    monkeypatch.setattr(config, "CLOSE_ON_INTERRUPT", False)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.on_interrupt()
+    assert set(bot.pm.positions) == {"A", "B"} and bot.broker.close_calls == []
+    assert any("OPEN POSITION [A]" in r.getMessage() for r in caplog.records)
+
+
+def test_signal_handlers_route_to_keyboard_interrupt():
+    import signal
+    scheduler.install_signal_handlers()
+    assert signal.getsignal(signal.SIGTERM) is scheduler._raise_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        scheduler._raise_interrupt(signal.SIGTERM, None)

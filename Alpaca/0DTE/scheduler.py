@@ -10,6 +10,7 @@ move away), each with its own position, sizing and daily counters.
 
 import argparse
 import logging
+import signal
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -210,7 +211,7 @@ class Bot:
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
                 continue
-            allowed, reason = self.risk.trading_allowed(strat, equity)
+            allowed, reason = self.risk.trading_allowed(strat, equity, now_et())
             if allowed:
                 return True
             reasons.append(reason)
@@ -240,8 +241,11 @@ class Bot:
                            candles=list(bo.candle_times), high=levels.high, low=levels.low)
         self.enter(now, "OVERNIGHT", bo.direction)
 
-    def orb_signal(self, now: datetime) -> tuple[str, datetime] | None:
-        """Feed new completed ORB candles to the setup; a signal counts only from the newest one."""
+    def orb_signal(self, now: datetime) -> tuple[str, datetime, str | None] | None:
+        """Feed new completed ORB candles to the setup; a signal counts only from the newest one.
+
+        Returns (direction, candle_time, entry_kind) with entry_kind MOMENTUM or PULLBACK.
+        """
         if self.orb_setup is None:
             return None
         candles = market_data.get_candles(config.SPX_SYMBOL, config.ORB_CANDLE_INTERVAL,
@@ -258,27 +262,28 @@ class Bot:
             if fired is None:
                 continue
             if t == candles.index[-1]:
-                signal = (fired, self.last_orb_candle)
+                signal = (fired, self.last_orb_candle, self.orb_setup.entry_kind)
             else:
                 log.info("Stale ORB %s signal on replayed candle %s ignored.", fired, t.strftime("%H:%M"))
         return signal
 
-    def try_orb_entry(self, now: datetime, direction: str, candle_time: datetime) -> None:
+    def try_orb_entry(self, now: datetime, direction: str, candle_time: datetime,
+                      kind: str | None = None) -> None:
         if not strategy.setup_allowed("ORB", now.date()):
             return
         key = f"ORB:{candle_time.isoformat()}"
         if key in self.acted:
             return
         self.acted.add(key)
-        log.info("SIGNAL ORB %s on 5m candle %s vs %.2f/%.2f", direction, candle_time.strftime("%H:%M"),
-                 self.orb.high, self.orb.low)
-        self.journal.event("SIGNAL", now, setup="ORB", direction=direction, candles=[candle_time],
+        log.info("SIGNAL ORB %s (%s) on 5m candle %s vs %.2f/%.2f", direction, kind or "?",
+                 candle_time.strftime("%H:%M"), self.orb.high, self.orb.low)
+        self.journal.event("SIGNAL", now, setup="ORB", direction=direction, kind=kind, candles=[candle_time],
                            high=self.orb.high, low=self.orb.low)
-        self.enter(now, "ORB", direction)
+        self.enter(now, "ORB", direction, kind)
 
     # ----------------------------------------------------------------- entry
 
-    def enter(self, now: datetime, setup: str, direction: str) -> None:
+    def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None) -> None:
         equity = self.broker.get_account()["equity"]
         if not self.entry_possible(equity):
             return
@@ -291,6 +296,8 @@ class Bot:
         em = self.expected_move(spot)
         short_a, long_a = strategy.select_strikes(spot, right, width)
         lo, hi = min(short_a, long_a), max(short_a, long_a)
+        # A may walk up to A_MAX_STRIKE_WALK strikes toward spot.
+        lo, hi = lo - 5 * config.A_MAX_STRIKE_WALK, hi + 5 * config.A_MAX_STRIKE_WALK
         if em is not None:
             # One chain wide enough for A and for B's whole strike walk (spot +/- 2 EM + width).
             lo, hi = min(lo, spot - 2 * em - width), max(hi, spot + 2 * em + width)
@@ -300,7 +307,7 @@ class Bot:
         for strat in config.STRATEGIES:
             try:
                 summaries[strat], added = self.enter_leg(strat, now, setup, direction, equity, spot, width,
-                                                         right, chain, em, open_risk)
+                                                         right, chain, em, open_risk, kind)
             except BrokerError as e:
                 log.error("[%s] broker error during entry: %s", strat, e)
                 self.journal.event("BROKER_ERROR", now, strategy=strat, error=str(e))
@@ -322,18 +329,24 @@ class Bot:
 
     def enter_leg(self, strat: str, now: datetime, setup: str, direction: str, equity: float, spot: float,
                   width: int, right: str, chain: list[dict], em: float | None,
-                  open_risk: float) -> tuple[str, float]:
+                  open_risk: float, kind: str | None = None) -> tuple[str, float]:
         """Place one strategy's spread. Returns (operator summary, risk dollars added)."""
         if strat in self.pm.positions:
             return "skip: position open", 0.0
-        allowed, reason = self.risk.trading_allowed(strat, equity)
+        if setup not in config.SETUPS_BY_STRATEGY.get(strat, (setup,)):
+            return f"skip: {setup} setup disabled for {strat}", 0.0
+        if setup == "ORB" and kind is not None and kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
+            return f"skip: ORB {kind} entry disabled for {strat}", 0.0
+        allowed, reason = self.risk.trading_allowed(strat, equity, now)
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":
-            short_strike, long_strike = strategy.select_strikes(spot, right, width)
-            quote, reject = strategy.entry_credit(chain, short_strike, long_strike, width)
+            short_strike, long_strike, result = strategy.select_strikes_a(spot, right, width, chain)
+            quote, reject = (result, None) if short_strike is not None else (None, result)
             floor_credit = strategy.credit_range(width)[0]
-            detail = ""
+            base_short, _ = strategy.select_strikes(spot, right, width)
+            walked = int(abs((short_strike if short_strike is not None else base_short) - base_short) // 5)
+            detail = f" walked {walked} strike(s) toward spot" if walked else ""
         else:
             if em is None:
                 return "skip: NO_EXPECTED_MOVE", 0.0
@@ -371,7 +384,7 @@ class Bot:
             strategy=strat, direction=direction, setup=setup, right=right, root=config.OPTION_ROOT,
             expiration=self.today, short_strike=short_strike, long_strike=long_strike, width=width,
             qty=filled_qty, entry_credit=credit, entry_time=now_et(), current_price=credit,
-            best_price=credit, profit_target=target, stop_loss=stop)
+            best_price=credit, profit_target=target, stop_loss=stop, entry_mid=quote.mid)
         self.pm.open(spread)
         card = format_entry_card(spread, self.risk.state.for_strategy(strat).trades_today + 1)
         log.info("\n%s", card)
@@ -543,10 +556,20 @@ class Bot:
     def on_interrupt(self) -> None:
         if self.risk is not None:
             self.save_state()
-        log.warning("Interrupted by user. Nothing was closed automatically.")
         if not self.pm.positions:
-            log.warning("No open position.")
+            log.warning("Interrupted by user. No open position.")
             return
+        if config.CLOSE_ON_INTERRUPT and self.risk is not None:
+            log.warning("Interrupted by user with %d open position(s): closing them now.", len(self.pm.positions))
+            try:
+                self.record_fills(self.pm.force_close(now_et(), self.spread_prices(), reason="INTERRUPT_CLOSE"))
+            except BrokerError as e:
+                log.error("Close on interrupt failed: %s", e)
+            self.save_state()
+            if not self.pm.positions:
+                log.warning("All positions closed; flat.")
+                return
+        log.warning("Nothing (more) was closed automatically.")
         for strat, p in self.pm.positions.items():
             log.warning("OPEN POSITION [%s]: %s sell %s%s / buy %s%s x%d, entry credit %.2f, last %.2f, exp %s",
                         strat, p.direction, p.short_strike, p.right, p.long_strike, p.right, p.remaining,
@@ -556,12 +579,24 @@ class Bot:
                     "or close the SPXW legs in the Alpaca dashboard.")
 
 
+def _raise_interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    """Route SIGTERM (and Windows Ctrl+Break) through the same close-on-interrupt path as Ctrl+C."""
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise_interrupt)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="0DTE SPX credit-spread bot")
     parser.add_argument("--dry-run", action="store_true", help="log orders instead of sending them")
     parser.add_argument("--once", action="store_true", help="run a single tick and exit")
     args = parser.parse_args()
     setup_logging()
+    install_signal_handlers()
     bot = Bot(dry_run=args.dry_run or config.DRY_RUN, once=args.once)
     try:
         bot.start()

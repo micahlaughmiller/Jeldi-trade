@@ -67,11 +67,11 @@ def tick(pm: PositionManager, when, price: float, candles, strat: str = "A") -> 
 
 def test_stop_hit_closes_all(pm, broker, journal):
     open_put_spread(pm, broker, qty=2)
-    broker.spread_close_price = 3.35
-    assert tick(pm, et(10, 2), 3.29, rising()) == []
-    fills = tick(pm, et(10, 4), 3.30, rising())
+    broker.spread_close_price = 3.60
+    assert tick(pm, et(10, 2), 3.54, rising()) == []
+    fills = tick(pm, et(10, 4), 3.55, rising())
     assert len(fills) == 1 and fills[0]["exit_reason"] == "STOP_LOSS"
-    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-70.0)
+    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-120.0)
     assert fills[0]["position_closed"] is True and fills[0]["strategy"] == "A"
     assert pm.positions == {}
     assert spxw_legs(broker.get_positions()) == []
@@ -80,16 +80,103 @@ def test_stop_hit_closes_all(pm, broker, journal):
     assert events(journal, "EXIT")[0]["strategy"] == "A"
 
 
-def test_target_with_one_contract_full_close(pm, broker):
-    open_put_spread(pm, broker, qty=1)
-    broker.spread_close_price = 2.70
-    fills = tick(pm, et(10, 2), 2.70, rising())
+def test_b_target_with_one_contract_full_close(pm, broker):
+    # B books half at target, but one contract cannot be split -> full close at the target
+    open_b_put_spread(pm, broker, qty=1)
+    broker.spread_close_price = 0.70
+    fills = tick(pm, et(10, 2), 0.70, rising(), strat="B")
     assert fills[0]["exit_reason"] == "PROFIT_TARGET" and fills[0]["qty"] == 1
     assert fills[0]["pnl"] == pytest.approx(30.0)
     assert pm.positions == {} and broker.get_positions() == []
 
 
-def test_target_two_contracts_without_momentum_full_close(pm, broker):
+def test_a_runs_whole_position_at_target(pm, broker, journal):
+    # A books nothing at the target: the whole position becomes the runner (stop at target, trail 0.50)
+    open_put_spread(pm, broker, qty=2)
+    assert tick(pm, et(10, 2), 2.70, rising()) == []
+    p = pm.positions["A"]
+    assert p.runner is True and p.remaining == 2 and p.closed_qty == 0
+    assert p.runner_best == 2.70 and p.momentum_at_target == pytest.approx(2.0)
+    assert len(events(journal, "RUNNER_START")) == 1 and broker.close_calls == []
+    assert tick(pm, et(10, 4), 2.00, rising()) == []
+    broker.spread_close_price = 2.50
+    fills = tick(pm, et(10, 6), 2.50, rising())
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["qty"] == 2
+    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(100.0)
+    assert fills[0]["position_closed"] is True and pm.positions == {}
+
+
+def test_a_single_contract_runs_too(pm, broker):
+    # with nothing to book, RUNNER_MIN_CONTRACTS does not apply to A
+    open_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 2.70, rising()) == []
+    assert pm.positions["A"].runner is True and pm.positions["A"].remaining == 1
+
+
+def test_a_runs_at_target_even_without_momentum(pm, broker):
+    # A's RUNNER_MOMENTUM_GATE is off: the target always starts the runner
+    open_put_spread(pm, broker, qty=2)
+    flat = make_candles(et(9, 54), [(100, 101, 99, 100.2), (100.2, 101, 99.5, 100.1), (100.1, 100.5, 99.8, 100.0)])
+    assert tick(pm, et(10, 2), 2.70, flat) == []
+    assert pm.positions["A"].runner is True and pm.positions["A"].remaining == 2
+
+
+def test_a_runner_ignores_momentum_slowdown(pm, broker):
+    open_put_spread(pm, broker, qty=2)
+    tick(pm, et(10, 2), 2.70, rising())
+    slower = make_candles(et(9, 56), [(100, 103, 99, 101.5), (101.5, 104, 101, 103), (103, 105, 102, 104.5)])
+    assert tick(pm, et(10, 4), 2.60, slower) == []
+    assert pm.positions["A"].runner is True
+
+
+def test_a_profit_lock_arms_at_030_and_gives_back_035(pm, broker):
+    open_put_spread(pm, broker, qty=2)
+    assert tick(pm, et(10, 2), 2.80, rising()) == []      # +0.20: below A's 0.30 arm
+    assert tick(pm, et(10, 4), 3.00, rising()) == []      # all given back, never armed, no exit
+    assert tick(pm, et(10, 6), 2.72, rising()) == []      # +0.28: still below the arm
+    pm.positions["A"].profit_target = 1.00                  # keep the runner out of the way for this test
+    assert tick(pm, et(10, 8), 2.65, rising()) == []      # +0.35 arms, best 2.65
+    assert tick(pm, et(10, 10), 2.99, rising()) == []     # gave back 0.34 < 0.35
+    broker.spread_close_price = 3.00
+    fills = tick(pm, et(10, 12), 3.00, rising())          # gave back 0.35 -> lock
+    assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK" and pm.positions == {}
+
+
+def test_a_profit_lock_ignores_candle_against(pm, broker):
+    open_put_spread(pm, broker, qty=1)
+    pm.positions["A"].profit_target = 1.00
+    assert tick(pm, et(10, 2), 2.60, rising()) == []      # +0.40 armed
+    assert tick(pm, et(10, 4), 2.62, falling_last()) == []   # red candle: ignored for A
+    assert "A" in pm.positions
+
+
+def test_b_keeps_shared_lock_gate_and_slowdown(pm, broker):
+    from strategy import exit_setting
+    assert (exit_setting("B", "PROFIT_LOCK_ARM"), exit_setting("B", "PROFIT_LOCK_GIVEBACK")) == (0.15, 0.10)
+    assert exit_setting("B", "PROFIT_LOCK_ON_MOMENTUM_FLIP") is True
+    assert exit_setting("B", "RUNNER_MOMENTUM_GATE", True) is True and exit_setting("B", "RUNNER_SLOWDOWN_EXIT", True) is True
+    assert (exit_setting("A", "PROFIT_LOCK_ARM"), exit_setting("A", "PROFIT_LOCK_GIVEBACK")) == (0.30, 0.35)
+    open_b_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 0.80, rising(), strat="B") == []           # +0.20 arms B's lock
+    broker.spread_close_price = 0.90
+    fills = tick(pm, et(10, 4), 0.90, rising(), strat="B")                # 0.10 giveback -> B locks
+    assert fills[0]["strategy"] == "B" and fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK"
+
+
+def test_exit_row_records_trigger_and_slippage(pm, broker):
+    spread = open_put_spread(pm, broker, qty=1)
+    spread.entry_mid = 3.05
+    broker.spread_close_price = 3.60
+    fills = tick(pm, et(10, 2), 3.56, rising())
+    row = fills[0]
+    assert row["trigger_price"] == 3.56 and row["exit_price"] == 3.60
+    assert row["exit_slippage"] == pytest.approx(0.04)
+    assert row["entry_mid"] == 3.05 and row["entry_slippage"] == pytest.approx(0.05)
+
+
+def test_target_two_contracts_without_momentum_full_close(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     open_put_spread(pm, broker, qty=2)
     broker.spread_close_price = 2.70
     stalling = make_candles(et(9, 54), [(100, 103, 99, 102), (102, 105, 101, 104), (104, 105, 103, 104.5)])
@@ -98,7 +185,9 @@ def test_target_two_contracts_without_momentum_full_close(pm, broker):
     assert pm.positions == {}
 
 
-def test_target_with_momentum_enters_runner_then_trails_out(pm, broker, journal):
+def test_target_with_momentum_enters_runner_then_trails_out(pm, broker, journal, monkeypatch):
+    # half-off runner mechanics (B's default); A now runs the whole position, see test_a_runs_whole_position
+    monkeypatch.setattr(config, "RUNNER_CLOSE_FRACTION_BY_STRATEGY", {"A": 0.5, "B": 0.5})
     open_put_spread(pm, broker, qty=3)
     broker.spread_close_price = 2.70
     fills = tick(pm, et(10, 2), 2.70, rising())
@@ -121,7 +210,9 @@ def test_target_with_momentum_enters_runner_then_trails_out(pm, broker, journal)
     assert pm.positions == {} and broker.get_positions() == []
 
 
-def test_runner_stop_at_target_level(pm, broker):
+def test_runner_stop_at_target_level(pm, broker, monkeypatch):
+    # half-off runner mechanics (B's default); A now runs the whole position, see test_a_runs_whole_position
+    monkeypatch.setattr(config, "RUNNER_CLOSE_FRACTION_BY_STRATEGY", {"A": 0.5, "B": 0.5})
     open_put_spread(pm, broker, qty=2)
     broker.spread_close_price = 2.70
     tick(pm, et(10, 2), 2.70, rising())
@@ -133,7 +224,11 @@ def test_runner_stop_at_target_level(pm, broker):
     assert pm.positions == {}
 
 
-def test_runner_momentum_slowdown_exits(pm, broker):
+def test_runner_momentum_slowdown_exits(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
+    # half-off runner mechanics (B's default); A now runs the whole position, see test_a_runs_whole_position
+    monkeypatch.setattr(config, "RUNNER_CLOSE_FRACTION_BY_STRATEGY", {"A": 0.5, "B": 0.5})
     open_put_spread(pm, broker, qty=2)
     broker.spread_close_price = 2.70
     tick(pm, et(10, 2), 2.70, rising())
@@ -156,8 +251,8 @@ def test_runner_disabled_closes_all(pm, broker, monkeypatch):
 def test_close_retries_after_broker_error(pm, broker, journal):
     open_put_spread(pm, broker, qty=1)
     broker.close_failures = 1
-    broker.spread_close_price = 3.35
-    fills = tick(pm, et(10, 2), 3.31, rising())
+    broker.spread_close_price = 3.60
+    fills = tick(pm, et(10, 2), 3.56, rising())
     assert len(fills) == 1 and pm.positions == {}
     assert len(broker.close_calls) == 2
     failed = events(journal, "CLOSE_FAILED")
@@ -168,7 +263,7 @@ def test_close_gives_up_after_max_retries(pm, broker, journal, monkeypatch):
     monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 2)
     open_put_spread(pm, broker, qty=1)
     broker.close_failures = 5
-    fills = tick(pm, et(10, 2), 3.31, rising())
+    fills = tick(pm, et(10, 2), 3.56, rising())
     assert fills == [] and "A" in pm.positions
     assert len(broker.close_calls) == 2
     assert len(events(journal, "CLOSE_FAILED")) == 2
@@ -177,7 +272,7 @@ def test_close_gives_up_after_max_retries(pm, broker, journal, monkeypatch):
 def test_force_close(pm, broker):
     open_put_spread(pm, broker, qty=2)
     broker.spread_close_price = 2.95
-    fills = pm.force_close(et(12, 30), {"A": 2.95})
+    fills = pm.force_close(et(15, 30), {"A": 2.95})
     assert fills[0]["exit_reason"] == "FORCE_CLOSE" and fills[0]["qty"] == 2
     assert fills[0]["pnl"] == pytest.approx(10.0)
     assert pm.positions == {}
@@ -186,12 +281,12 @@ def test_force_close(pm, broker):
 # -------------------------------------------------------- two strategies at once
 
 def test_a_stops_out_while_b_keeps_running(pm, broker):
-    open_put_spread(pm, broker, qty=2)          # A: entry 3.00, stop 3.30
+    open_put_spread(pm, broker, qty=2)          # A: entry 3.00, stop 3.55
     open_b_put_spread(pm, broker, qty=1)        # B: entry 1.00, stop 1.50
     assert set(pm.positions) == {"A", "B"}
     assert pm.total_open_risk() == pytest.approx(2 * 200.0 + 400.0)
-    broker.spread_close_price = 3.35
-    fills = pm.on_tick(et(10, 4), {"A": 3.31, "B": 1.20}, rising())
+    broker.spread_close_price = 3.60
+    fills = pm.on_tick(et(10, 4), {"A": 3.56, "B": 1.20}, rising())
     assert [f["strategy"] for f in fills] == ["A"] and fills[0]["exit_reason"] == "STOP_LOSS"
     assert set(pm.positions) == {"B"}
     b = pm.positions["B"]
@@ -202,7 +297,7 @@ def test_a_stops_out_while_b_keeps_running(pm, broker):
 def test_b_hits_its_own_wider_stop_a_unaffected(pm, broker):
     open_put_spread(pm, broker, qty=1)
     open_b_put_spread(pm, broker, qty=1)
-    # 1.45 is +0.45: past A's 0.30 stop distance but inside B's 0.50
+    # B stops at +0.50 (1.50) while A, at +0.10, is nowhere near its 0.55 stop
     assert pm.on_tick(et(10, 2), {"A": 3.10, "B": 1.45}, rising()) == []
     broker.spread_close_price = 1.55
     fills = pm.on_tick(et(10, 4), {"A": 3.10, "B": 1.50}, rising())
@@ -221,8 +316,8 @@ def test_b_target_uses_its_own_profit_target(pm, broker):
 def test_missing_price_skips_that_position_only(pm, broker):
     open_put_spread(pm, broker, qty=1)
     open_b_put_spread(pm, broker, qty=1)
-    broker.spread_close_price = 3.35
-    fills = pm.on_tick(et(10, 2), {"A": 3.31}, rising())
+    broker.spread_close_price = 3.60
+    fills = pm.on_tick(et(10, 2), {"A": 3.56}, rising())
     assert [f["strategy"] for f in fills] == ["A"]
     assert pm.positions["B"].current_price == 1.00
 
@@ -230,7 +325,7 @@ def test_missing_price_skips_that_position_only(pm, broker):
 def test_force_close_closes_both(pm, broker):
     open_put_spread(pm, broker, qty=1)
     open_b_put_spread(pm, broker, qty=1)
-    fills = pm.force_close(et(12, 30), {"A": 2.95, "B": None})
+    fills = pm.force_close(et(15, 30), {"A": 2.95, "B": None})
     assert sorted(f["strategy"] for f in fills) == ["A", "B"]
     assert pm.positions == {} and spxw_legs(broker.get_positions()) == []
 
@@ -312,7 +407,9 @@ def test_adopt_ignores_non_spxw_and_empty(pm, broker):
     assert pm.positions == {}
 
 
-def test_state_roundtrip_and_trades_csv(pm, broker, journal):
+def test_state_roundtrip_and_trades_csv(pm, broker, journal, monkeypatch):
+    # half-off runner mechanics (B's default); A now runs the whole position, see test_a_runs_whole_position
+    monkeypatch.setattr(config, "RUNNER_CLOSE_FRACTION_BY_STRATEGY", {"A": 0.5, "B": 0.5})
     spread = open_put_spread(pm, broker, qty=1)
     assert OpenSpread.from_dict(spread.to_dict()) == spread
     broker.spread_close_price = 2.70
@@ -320,22 +417,27 @@ def test_state_roundtrip_and_trades_csv(pm, broker, journal):
     journal.trade(fills[0])
     text = journal.trades_path.read_text().splitlines()
     assert text[0].startswith("date,strategy,entry_time,exit_time,direction")
+    assert text[0].endswith("runner,trigger_price,exit_slippage,entry_mid,entry_slippage")
     assert text[1].startswith("2026-09-17,A,")
-    assert "PROFIT_TARGET" in text[1] and ",n" in text[1]
+    assert "PROFIT_TARGET" in text[1] and ",n," in text[1]
 
 
 def falling_last():
     return make_candles(et(9, 54), [(100, 103, 99, 102), (102, 105, 101, 104), (104, 105, 101, 102)])
 
 
-def test_profit_lock_not_armed_below_arm_level(pm, broker):
+def test_profit_lock_not_armed_below_arm_level(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     open_put_spread(pm, broker, qty=1)
     assert tick(pm, et(10, 2), 2.90, rising()) == []      # +0.10 profit: below PROFIT_LOCK_ARM
     assert tick(pm, et(10, 4), 3.00, rising()) == []      # gave it all back, but never armed
     assert "A" in pm.positions
 
 
-def test_profit_lock_giveback_exits_once_armed(pm, broker):
+def test_profit_lock_giveback_exits_once_armed(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     open_put_spread(pm, broker, qty=2)
     assert tick(pm, et(10, 2), 2.80, rising()) == []      # +0.20 arms the rule, best = 2.80
     assert tick(pm, et(10, 4), 2.89, rising()) == []      # gave back 0.09 < 0.10
@@ -346,7 +448,9 @@ def test_profit_lock_giveback_exits_once_armed(pm, broker):
     assert pm.positions == {}
 
 
-def test_profit_lock_momentum_flip_exits_once_armed(pm, broker):
+def test_profit_lock_momentum_flip_exits_once_armed(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     open_put_spread(pm, broker, qty=1)
     assert tick(pm, et(10, 2), 2.80, rising()) == []
     broker.spread_close_price = 2.82
@@ -355,12 +459,16 @@ def test_profit_lock_momentum_flip_exits_once_armed(pm, broker):
     assert fills[0]["pnl"] == pytest.approx(18.0)
 
 
-def test_profit_lock_momentum_flip_ignored_before_arming(pm, broker):
+def test_profit_lock_momentum_flip_ignored_before_arming(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     open_put_spread(pm, broker, qty=1)
     assert tick(pm, et(10, 2), 2.95, falling_last()) == []
 
 
 def test_profit_lock_disabled(pm, broker, monkeypatch):
+    # shared exit defaults (what B runs); A's own tuning is covered by the test_a_* tests
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {}, "B": {}})
     monkeypatch.setattr(config, "PROFIT_LOCK_ENABLED", False)
     open_put_spread(pm, broker, qty=1)
     assert tick(pm, et(10, 2), 2.80, rising()) == []

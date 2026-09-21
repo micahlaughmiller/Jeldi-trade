@@ -1,3 +1,4 @@
+import csv
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -96,3 +97,22 @@ def test_day_table_empty():
     table = format_day_table([], 0.0)
     assert "(no trades closed today)" in table
     assert "win rate n/a" in table
+
+
+def test_trades_csv_with_old_header_is_parked(tmp_path):
+    from journal import TRADE_FIELDS, Journal
+    j = Journal(tmp_path, "TEST")
+    old_fields = TRADE_FIELDS[:16]
+    with j.trades_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=old_fields)
+        w.writeheader()
+        w.writerow({k: "x" for k in old_fields})
+    j.trade({"date": "2026-09-22", "strategy": "A", "exit_reason": "STOP_LOSS", "trigger_price": 3.56})
+    parked = tmp_path / "trades_test_until_2026-09-22.csv"
+    assert parked.exists() and parked.read_text().splitlines()[0] == ",".join(old_fields)
+    lines = j.trades_path.read_text().splitlines()
+    assert lines[0] == ",".join(TRADE_FIELDS) and len(lines) == 2 and "3.56" in lines[1]
+    # a second trade appends to the new file without parking again
+    j.trade({"date": "2026-09-22", "strategy": "B", "exit_reason": "PROFIT_TARGET"})
+    assert len(j.trades_path.read_text().splitlines()) == 3
+    assert len(list(tmp_path.glob("trades_test_until_*.csv"))) == 1

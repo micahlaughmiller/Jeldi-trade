@@ -44,7 +44,7 @@ def rising(n: int = 3):
 
 
 def events(journal: Journal, kind: str) -> list[dict]:
-    path = journal.dir / f"events_{TODAY.isoformat()}.jsonl"
+    path = journal.dir / f"events_{journal.slug}_{TODAY.isoformat()}.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     return [r for r in rows if r["event"] == kind]
 

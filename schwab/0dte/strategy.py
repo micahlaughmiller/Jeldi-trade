@@ -1,4 +1,4 @@
-"""Pure 0DTE strategy logic: phases, breakout detection, strikes, credit, momentum.
+"""Pure 0DTE strategy logic: phases, breakout detection, ORB setup, strikes, credit, momentum.
 
 No I/O here. Candles are pandas DataFrames indexed by tz-aware ET bar START
 time with columns open/high/low/close/volume, containing completed bars only.
@@ -14,7 +14,7 @@ Breakout level source (config.BREAKOUT_LEVEL_SOURCE):
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from enum import StrEnum
 from math import ceil, floor
 
@@ -29,15 +29,14 @@ BEARISH = "BEARISH"
 class Phase(StrEnum):
     PRE_OPEN = "PRE_OPEN"
     OVERNIGHT_ONLY = "OVERNIGHT_ONLY"
-    OVERNIGHT_OR_ORB = "OVERNIGHT_OR_ORB"
     ORB_ONLY = "ORB_ONLY"
     NO_NEW_ENTRIES = "NO_NEW_ENTRIES"
     CLOSED = "CLOSED"
 
 
-ENTRY_PHASES = {Phase.OVERNIGHT_ONLY, Phase.OVERNIGHT_OR_ORB, Phase.ORB_ONLY}
-OVERNIGHT_PHASES = {Phase.OVERNIGHT_ONLY, Phase.OVERNIGHT_OR_ORB}
-ORB_PHASES = {Phase.OVERNIGHT_OR_ORB, Phase.ORB_ONLY}
+ENTRY_PHASES = {Phase.OVERNIGHT_ONLY, Phase.ORB_ONLY}
+OVERNIGHT_PHASES = {Phase.OVERNIGHT_ONLY}
+ORB_PHASES = {Phase.ORB_ONLY}
 
 
 @dataclass(frozen=True)
@@ -79,10 +78,8 @@ def phase(now: datetime) -> Phase:
     m = minutes_since_open(now)
     if m < 0:
         return Phase.PRE_OPEN
-    if m < config.OPENING_RANGE_MINUTES:
-        return Phase.OVERNIGHT_ONLY
     if m < config.OVERNIGHT_ENTRY_END_MIN:
-        return Phase.OVERNIGHT_OR_ORB
+        return Phase.OVERNIGHT_ONLY
     return Phase.ORB_ONLY
 
 
@@ -99,6 +96,79 @@ def detect_breakout(candles: pd.DataFrame, level_high: float, level_low: float,
     if prev.close < level_low and last.close < level_low and last.low < prev.low:
         return Breakout(BEARISH, (t_prev, t_last))
     return None
+
+
+class OrbSetup:
+    """Opening-range break state machine fed one completed ORB candle at a time.
+
+    WAITING -> BROKEN (close beyond a level) -> PULLED_BACK (wick touches the level)
+    -> ENTRY, or straight from BROKEN to ENTRY when a candle closes beyond the break
+    close. Any close back through the level resets; after an entry the setup stays
+    DONE until a candle closes back inside the range.
+    """
+
+    WAITING = "WAITING"
+    BROKEN = "BROKEN"
+    PULLED_BACK = "PULLED_BACK"
+    DONE = "DONE"
+
+    def __init__(self, or_high: float, or_low: float):
+        self.or_high = or_high
+        self.or_low = or_low
+        self.state = self.WAITING
+        self.direction: str | None = None
+        self.break_close: float | None = None
+        self.candles_since_break = 0
+
+    def _reset(self) -> None:
+        self.state = self.WAITING
+        self.direction = None
+        self.break_close = None
+        self.candles_since_break = 0
+
+    def _arm(self, direction: str, close: float) -> None:
+        self.state = self.BROKEN
+        self.direction = direction
+        self.break_close = close
+        self.candles_since_break = 0
+
+    def _enter(self) -> str:
+        self.state = self.DONE
+        return self.direction
+
+    def update(self, candle: pd.Series) -> str | None:
+        """Feed one completed candle; returns BULLISH/BEARISH exactly once per entry."""
+        close, open_ = float(candle.close), float(candle.open)
+        if self.state == self.DONE:
+            if self.or_low <= close <= self.or_high:
+                self._reset()
+            return None
+        if self.state == self.WAITING:
+            if close > self.or_high:
+                self._arm(BULLISH, close)
+            elif close < self.or_low:
+                self._arm(BEARISH, close)
+            return None
+        self.candles_since_break += 1
+        if self.candles_since_break > config.ORB_SETUP_TIMEOUT_CANDLES:
+            self._reset()
+            return self.update(candle)
+        # Mirror the bearish case onto the bullish one: positive = beyond the broken level.
+        sign = 1.0 if self.direction == BULLISH else -1.0
+        level = self.or_high if self.direction == BULLISH else self.or_low
+        touch = float(candle.low) if self.direction == BULLISH else float(candle.high)
+        if sign * (close - level) <= 0:
+            self._reset()
+            return self.update(candle)
+        if self.state == self.BROKEN:
+            if sign * (touch - level) <= 0:
+                self.state = self.PULLED_BACK
+            elif sign * (close - self.break_close) > 0:
+                return self._enter()
+            return None
+        if sign * (close - open_) > 0:
+            return self._enter()
+        return None
 
 
 def direction_to_spread(direction: str) -> str:
@@ -128,6 +198,19 @@ def credit_range(width: int) -> tuple[float, float]:
     return config.CREDIT_RANGE_BY_WIDTH[width]
 
 
+def credit_range_b(width: int) -> tuple[float, float]:
+    return config.B_CREDIT_RANGE_BY_WIDTH[width]
+
+
+def exit_levels(strat: str) -> tuple[float, float]:
+    """(profit_target, stop_loss) in spread-price points for strategy A or B."""
+    if strat == "A":
+        return config.PROFIT_TARGET, config.STOP_LOSS
+    if strat == "B":
+        return config.B_PROFIT_TARGET, config.B_STOP_LOSS
+    raise ValueError(f"unknown strategy {strat!r}")
+
+
 def spread_quote(chain_quotes: list[dict], short_strike: float, long_strike: float) -> SpreadQuote | None:
     by_strike = {round(q["strike"], 2): q for q in chain_quotes}
     short, long = by_strike.get(round(short_strike, 2)), by_strike.get(round(long_strike, 2))
@@ -152,6 +235,51 @@ def entry_credit(chain_quotes: list[dict], short_strike: float, long_strike: flo
     if quote.mid > hi:
         return quote, f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f}"
     return quote, None
+
+
+def expected_move(chain_calls: list[dict], chain_puts: list[dict], spot: float) -> float | None:
+    """ATM straddle mid (call + put at the strike nearest spot); None if a side is missing."""
+    strikes = {round(q["strike"], 2) for q in chain_calls} | {round(q["strike"], 2) for q in chain_puts}
+    if not strikes:
+        return None
+    atm = min(strikes, key=lambda k: (abs(k - spot), k))
+    call = next((q for q in chain_calls if round(q["strike"], 2) == atm), None)
+    put = next((q for q in chain_puts if round(q["strike"], 2) == atm), None)
+    if call is None or put is None:
+        return None
+    return round(call["mid"] + put["mid"], 2)
+
+
+def select_strikes_b(spot: float, right: str, width: int, em: float,
+                     chain_rows: list[dict]) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """OTM spread one expected move from spot, walked strike by strike into B's credit range.
+
+    Returns (short, long, quote) or (None, None, reason).
+    """
+    if right == "P":
+        short, toward_spot = float(ceil((spot - em) / 5) * 5), 5.0
+    elif right == "C":
+        short, toward_spot = float(floor((spot + em) / 5) * 5), -5.0
+    else:
+        raise ValueError(f"unknown right {right!r}")
+    lo, hi = credit_range_b(width)
+    for _ in range(20):
+        distance = abs(spot - short)
+        if distance < config.B_MIN_DISTANCE_FROM_SPOT:
+            return None, None, f"B_NO_STRIKE_IN_RANGE short={short:g} within {config.B_MIN_DISTANCE_FROM_SPOT} of spot {spot:.2f}"
+        if distance > 2 * em:
+            return None, None, f"B_NO_STRIKE_IN_RANGE short={short:g} beyond 2x EM {em:.2f} from spot {spot:.2f}"
+        long = short - width if right == "P" else short + width
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            return None, None, f"STRIKES_NOT_IN_CHAIN short={short:g} long={long:g}"
+        if quote.mid < lo:
+            short += toward_spot
+        elif quote.mid > hi:
+            short -= toward_spot
+        else:
+            return short, long, quote
+    return None, None, f"B_NO_STRIKE_IN_RANGE no credit in {lo:.2f}-{hi:.2f} after 20 steps"
 
 
 def _signed_bodies(candles: pd.DataFrame, direction: str) -> pd.Series:
@@ -204,7 +332,3 @@ def setup_allowed(setup: str, d: date) -> bool:
     if mode == "orb_only":
         return setup == "ORB"
     return True
-
-
-def candle_end(start: datetime, interval: str) -> datetime:
-    return start + timedelta(minutes=int(interval.rstrip("m")))

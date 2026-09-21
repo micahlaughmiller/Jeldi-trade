@@ -31,6 +31,15 @@ def test_portfolio_risk_cap():
     assert contracts_for(2_000, 5, 3.00, 900.0) == 0
 
 
+def test_b_sizing_uses_width_minus_credit():
+    # B: width 10, credit 1.50 -> max loss $850/contract; 5% of 10k = 500 -> override to 1
+    assert contracts_for(10_000, 10, 1.50, 0.0) == 1
+    assert contracts_for(20_000, 10, 1.50, 0.0) == 1
+    assert contracts_for(40_000, 10, 1.50, 0.0) == 2
+    # combined cap: A's $400 open risk plus B's $850 would exceed 52% of $2,000
+    assert contracts_for(2_000, 10, 1.50, 400.0) == 0
+
+
 def test_max_contracts_cap():
     assert contracts_for(1_000_000, 5, 3.00, 0.0) == config.MAX_CONTRACTS_PER_TRADE
 
@@ -47,44 +56,63 @@ def test_invalid_spread_returns_zero():
     assert contracts_for(10_000, 5, 5.50, 0.0) == 0
 
 
-def test_consecutive_loss_stop():
+def test_consecutive_loss_stop_is_per_strategy():
     rm = RiskManager(10_000)
-    assert rm.trading_allowed() == (True, "OK")
-    rm.record_trade(-60.0)
-    assert rm.trading_allowed()[0] is True
-    rm.record_trade(-60.0)
-    ok, reason = rm.trading_allowed()
-    assert ok is False and "CONSECUTIVE" in reason
+    assert rm.trading_allowed("A") == (True, "OK")
+    for _ in range(config.MAX_CONSECUTIVE_LOSSES - 1):
+        rm.record_trade("A", -60.0)
+    assert rm.trading_allowed("A")[0] is True
+    rm.record_trade("A", -60.0)
+    ok, reason = rm.trading_allowed("A")
+    assert ok is False and "CONSECUTIVE" in reason and reason.startswith("A:")
+    assert rm.trading_allowed("B") == (True, "OK")
 
 
 def test_win_resets_consecutive_losses():
     rm = RiskManager(10_000)
-    rm.record_trade(-60.0)
-    rm.record_trade(90.0)
-    rm.record_trade(-60.0)
-    assert rm.state.consecutive_losses == 1
-    assert rm.trading_allowed()[0] is True
+    rm.record_trade("A", -60.0)
+    rm.record_trade("A", 90.0)
+    rm.record_trade("A", -60.0)
+    assert rm.state.for_strategy("A").consecutive_losses == 1
+    assert rm.trading_allowed("A")[0] is True
 
 
-def test_max_trades_per_day():
+def test_max_trades_per_day_is_per_strategy():
     rm = RiskManager(10_000)
     for _ in range(config.MAX_TRADES_PER_DAY):
-        rm.record_trade(10.0)
-    ok, reason = rm.trading_allowed()
+        rm.record_trade("B", 10.0)
+    ok, reason = rm.trading_allowed("B")
     assert ok is False and "MAX_TRADES" in reason
+    assert rm.trading_allowed("A")[0] is True
+    assert rm.state.trades_today == config.MAX_TRADES_PER_DAY
 
 
-def test_daily_loss_limit_realized_and_equity():
+def test_daily_loss_limit_is_combined():
     rm = RiskManager(10_000)
-    rm.record_trade(-1_000.0)
-    assert rm.trading_allowed()[0] is False
+    rm.record_trade("A", -600.0)
+    rm.record_trade("B", -400.0)
+    assert rm.state.realized_pnl == pytest.approx(-1_000.0)
+    assert rm.trading_allowed("A")[0] is False
+    assert rm.trading_allowed("B")[0] is False
     rm2 = RiskManager(10_000)
-    assert rm2.trading_allowed(equity=9_000.0)[0] is False
-    assert rm2.trading_allowed(equity=9_500.0)[0] is True
+    assert rm2.trading_allowed("A", equity=9_000.0)[0] is False
+    assert rm2.trading_allowed("B", equity=9_500.0)[0] is True
+
+
+def test_combined_totals_and_pnl_by_strategy():
+    rm = RiskManager(10_000)
+    rm.record_trade("A", 60.0, {"strategy": "A", "pnl": 60.0, "exit_time": "2026-09-17T10:30:00-04:00"})
+    rm.record_trade("B", -20.0, {"strategy": "B", "pnl": -20.0, "exit_time": "2026-09-17T10:20:00-04:00"})
+    assert rm.state.trades_today == 2
+    assert rm.state.realized_pnl == pytest.approx(40.0)
+    assert rm.state.pnl_by_strategy() == {"A": 60.0, "B": -20.0}
+    assert [r["strategy"] for r in rm.state.closed_trades] == ["B", "A"]   # ordered by exit time
 
 
 def test_day_state_roundtrip():
     rm = RiskManager(10_000)
-    rm.record_trade(-50.0, {"pnl": -50.0})
+    rm.record_trade("A", -50.0, {"pnl": -50.0})
+    rm.record_trade("B", 25.0, {"pnl": 25.0})
     restored = DayState.from_dict(rm.state.to_dict())
     assert restored == rm.state
+    assert restored.for_strategy("B").realized_pnl == pytest.approx(25.0)

@@ -1,4 +1,4 @@
-"""Tiering, contract sizing, and daily circuit breakers."""
+"""Tiering, contract sizing, and daily circuit breakers (per strategy plus combined)."""
 
 from dataclasses import asdict, dataclass, field
 from math import floor
@@ -29,44 +29,84 @@ def contracts_for(equity: float, width: int, credit: float, open_risk_dollars: f
     return max(n, 0)
 
 
+def _exit_key(row: dict) -> str:
+    v = row.get("exit_time")
+    return v if isinstance(v, str) else (v.isoformat() if v is not None else "")
+
+
 @dataclass
-class DayState:
-    start_equity: float
+class StrategyState:
     trades_today: int = 0
     consecutive_losses: int = 0
     realized_pnl: float = 0.0
     closed_trades: list[dict] = field(default_factory=list)
+
+    def record(self, pnl: float, row: dict | None) -> None:
+        self.trades_today += 1
+        self.realized_pnl = round(self.realized_pnl + pnl, 2)
+        self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
+        if row is not None:
+            self.closed_trades.append(row)
+
+
+def _fresh_strategies() -> dict[str, StrategyState]:
+    return {s: StrategyState() for s in config.STRATEGIES}
+
+
+@dataclass
+class DayState:
+    start_equity: float
+    strategies: dict[str, StrategyState] = field(default_factory=_fresh_strategies)
+
+    def for_strategy(self, strat: str) -> StrategyState:
+        return self.strategies.setdefault(strat, StrategyState())
+
+    @property
+    def trades_today(self) -> int:
+        return sum(s.trades_today for s in self.strategies.values())
+
+    @property
+    def realized_pnl(self) -> float:
+        return round(sum(s.realized_pnl for s in self.strategies.values()), 2)
+
+    @property
+    def closed_trades(self) -> list[dict]:
+        return sorted((r for s in self.strategies.values() for r in s.closed_trades), key=_exit_key)
+
+    def pnl_by_strategy(self) -> dict[str, float]:
+        return {k: s.realized_pnl for k, s in self.strategies.items()}
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DayState":
-        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
+        strategies = {
+            k: StrategyState(**{f: v[f] for f in StrategyState.__dataclass_fields__ if f in v})
+            for k, v in d.get("strategies", {}).items()
+        }
+        return cls(start_equity=d["start_equity"], strategies=strategies or _fresh_strategies())
 
 
 class RiskManager:
     def __init__(self, start_equity: float, state: DayState | None = None):
         self.state = state or DayState(start_equity=start_equity)
 
-    def record_trade(self, pnl: float, row: dict | None = None) -> None:
-        self.state.trades_today += 1
-        self.state.realized_pnl += pnl
-        self.state.consecutive_losses = self.state.consecutive_losses + 1 if pnl < 0 else 0
-        if row is not None:
-            self.state.closed_trades.append(row)
+    def record_trade(self, strat: str, pnl: float, row: dict | None = None) -> None:
+        self.state.for_strategy(strat).record(pnl, row)
 
     def daily_loss_limit(self) -> float:
         return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
-    def trading_allowed(self, equity: float | None = None) -> tuple[bool, str]:
-        s = self.state
+    def trading_allowed(self, strat: str, equity: float | None = None) -> tuple[bool, str]:
+        s = self.state.for_strategy(strat)
         if s.trades_today >= config.MAX_TRADES_PER_DAY:
-            return False, f"MAX_TRADES_PER_DAY ({s.trades_today})"
+            return False, f"{strat}: MAX_TRADES_PER_DAY ({s.trades_today})"
         if s.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-            return False, f"MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
-        if s.realized_pnl <= self.daily_loss_limit():
-            return False, f"DAILY_LOSS_LIMIT realized={s.realized_pnl:.2f}"
-        if equity is not None and equity - s.start_equity <= self.daily_loss_limit():
-            return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={s.start_equity:.2f}"
+            return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
+        realized = self.state.realized_pnl
+        if realized <= self.daily_loss_limit():
+            return False, f"DAILY_LOSS_LIMIT realized={realized:.2f}"
+        if equity is not None and equity - self.state.start_equity <= self.daily_loss_limit():
+            return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={self.state.start_equity:.2f}"
         return True, "OK"

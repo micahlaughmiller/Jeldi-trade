@@ -84,6 +84,14 @@ MOMENTUM_CANDLES = 3
 MOMENTUM_CONTINUE_RATIO = 0.80
 MOMENTUM_SLOWDOWN_PCT = 0.20
 
+# Lock in an open profit before the target: once the spread has moved PROFIT_LOCK_ARM in our
+# favor, exit if it gives back PROFIT_LOCK_GIVEBACK from its best level, or (optionally) if the
+# last completed SPX candle closes against the trade.
+PROFIT_LOCK_ENABLED = True
+PROFIT_LOCK_ARM = 0.15
+PROFIT_LOCK_GIVEBACK = 0.10
+PROFIT_LOCK_ON_MOMENTUM_FLIP = True
+
 ENTRY_STEP_SEC = 20
 ENTRY_PRICE_STEP = 0.05
 ENTRY_TIMEOUT_SEC = 120

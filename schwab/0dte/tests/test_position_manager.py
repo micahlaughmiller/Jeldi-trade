@@ -202,3 +202,47 @@ def test_state_roundtrip_and_trades_csv(pm, broker, journal):
     text = journal.trades_path.read_text().splitlines()
     assert text[0].startswith("date,entry_time,exit_time,direction")
     assert "PROFIT_TARGET" in text[1] and ",n" in text[1]
+
+
+def falling_last():
+    return make_candles(et(9, 54), [(100, 103, 99, 102), (102, 105, 101, 104), (104, 105, 101, 102)])
+
+
+def test_profit_lock_not_armed_below_arm_level(pm, broker):
+    open_put_spread(pm, broker, qty=1)
+    assert pm.on_tick(et(10, 2), 2.90, rising()) == []      # +0.10 profit: below PROFIT_LOCK_ARM
+    assert pm.on_tick(et(10, 4), 3.00, rising()) == []      # gave it all back, but never armed
+    assert pm.position is not None
+
+
+def test_profit_lock_giveback_exits_once_armed(pm, broker):
+    open_put_spread(pm, broker, qty=2)
+    assert pm.on_tick(et(10, 2), 2.80, rising()) == []      # +0.20 arms the rule, best = 2.80
+    assert pm.on_tick(et(10, 4), 2.89, rising()) == []      # gave back 0.09 < 0.10
+    broker.spread_close_price = 2.90
+    fills = pm.on_tick(et(10, 6), 2.90, rising())           # gave back 0.10 -> lock it in
+    assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK"
+    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(20.0)
+    assert pm.position is None
+
+
+def test_profit_lock_momentum_flip_exits_once_armed(pm, broker):
+    open_put_spread(pm, broker, qty=1)
+    assert pm.on_tick(et(10, 2), 2.80, rising()) == []
+    broker.spread_close_price = 2.82
+    fills = pm.on_tick(et(10, 4), 2.82, falling_last())     # still +0.18 but last candle closed red
+    assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_MOMENTUM"
+    assert fills[0]["pnl"] == pytest.approx(18.0)
+
+
+def test_profit_lock_momentum_flip_ignored_before_arming(pm, broker):
+    open_put_spread(pm, broker, qty=1)
+    assert pm.on_tick(et(10, 2), 2.95, falling_last()) == []
+
+
+def test_profit_lock_disabled(pm, broker, monkeypatch):
+    monkeypatch.setattr(config, "PROFIT_LOCK_ENABLED", False)
+    open_put_spread(pm, broker, qty=1)
+    assert pm.on_tick(et(10, 2), 2.80, rising()) == []
+    assert pm.on_tick(et(10, 4), 2.95, falling_last()) == []
+    assert pm.position is not None

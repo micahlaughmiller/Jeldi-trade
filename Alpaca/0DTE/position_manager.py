@@ -145,6 +145,15 @@ class PositionManager:
                     self.journal.event("RUNNER_START", now, position=p.to_dict())
                 return fills
             return self._close(p.remaining, "PROFIT_TARGET", now, spread_price)
+        if config.PROFIT_LOCK_ENABLED and (p.entry_credit - p.best_price) >= config.PROFIT_LOCK_ARM:
+            profit = p.entry_credit - spread_price
+            if spread_price >= p.best_price + config.PROFIT_LOCK_GIVEBACK:
+                log.info("PROFIT LOCK: best %.2f, now %.2f (gave back %.2f); locking %+.2f",
+                         p.best_price, spread_price, spread_price - p.best_price, profit)
+                return self._close(p.remaining, "PROFIT_LOCK_GIVEBACK", now, spread_price)
+            if config.PROFIT_LOCK_ON_MOMENTUM_FLIP and profit > 0 and strategy.candle_against(candles, p.direction):
+                log.info("PROFIT LOCK: candle closed against the trade with %+.2f open profit", profit)
+                return self._close(p.remaining, "PROFIT_LOCK_MOMENTUM", now, spread_price)
         return []
 
     def _runner_tick(self, now: datetime, spread_price: float, candles: pd.DataFrame) -> list[dict]:

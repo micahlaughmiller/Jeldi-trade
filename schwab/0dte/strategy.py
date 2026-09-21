@@ -177,6 +177,13 @@ def momentum_continuing(candles: pd.DataFrame, direction: str, ratio: float | No
     return last > 0 and last >= ratio * prev
 
 
+def candle_against(candles: pd.DataFrame, direction: str) -> bool:
+    """Last completed candle closed against the trade (red for BULLISH, green for BEARISH)."""
+    if candles is None or candles.empty:
+        return False
+    return float(_signed_bodies(candles.tail(1), direction).iloc[0]) < 0
+
+
 def momentum_slowed(current: float, reference: float, pct: float | None = None) -> bool:
     pct = pct if pct is not None else config.MOMENTUM_SLOWDOWN_PCT
     return current < reference * (1.0 - pct)

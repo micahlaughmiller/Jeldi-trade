@@ -159,17 +159,13 @@ NEWS_DAY_MODE = "half_size"
 # Nine personas firing on the same signal are one experiment run nine times. Give each one a different
 # parameter set here and every session yields nine comparisons. Keys are any UPPERCASE name defined
 # above; the dict for ACTIVE_TRADER is applied on import, everyone else runs the defaults.
-# Suggested matrix (uncomment to run it):
-# PERSONA_OVERRIDES = {
-#     "ASTRA":  {},                                                        # control
-#     "ARIA":   {"STOP_LOSS": 0.45},
-#     "DAVID":  {"STOP_LOSS": 0.70},
-#     "ELENA":  {"PROFIT_TARGET": 0.50},
-#     "JORDAN": {"PROFIT_LOCK_ENABLED": False},                            # trail only
-#     "JAMES":  {"ORB_ENTRY_KINDS_BY_STRATEGY": {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}},
-#     "SARAH":  {"LIMITS_BY_STRATEGY": {"A": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 2, "COOLDOWN_MIN": 60}, "B": {}}},
-#     "MARCUS": {"A_CREDIT_BIAS_BY_WIDTH": {5: 3.00, 10: 6.00}},
-#     "CLAUDE": {"RUNNER_CLOSE_FRACTION_BY_STRATEGY": {"A": 0.5, "B": 0.5}},   # old half-off behaviour
-# }
-PERSONA_OVERRIDES: dict[str, dict] = {}
+# Stop-size experiment from the 2026-09-21 replay: on that trend day every wider stop won (0.55 -> +9.1k,
+# 0.60 -> +13.9k, 0.70 -> +18.8k on Monday's entries), which only proves the stop-outs were noise-sized, not
+# that 0.70 is right. ASTRA and the rest run the committed build as the control.
+PERSONA_OVERRIDES: dict[str, dict] = {
+    "ARIA":   {"STOP_LOSS": 0.60},
+    "DAVID":  {"STOP_LOSS": 0.70},
+    "ELENA":  {"PROFIT_TARGET": 0.50},                                                    # runner starts at 0.50
+    "JORDAN": {"STOP_LOSS": 0.60, "PROFIT_TARGET": 0.50, "PROFIT_LOCK_ENABLED": False},   # best hybrid on the model
+}
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

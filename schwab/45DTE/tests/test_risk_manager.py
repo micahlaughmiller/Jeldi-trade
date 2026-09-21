@@ -100,11 +100,14 @@ def test_breaker_trips_at_three_hits_and_persists_via_callback():
 
 def test_max_loss_hit_definitions(rm):
     # credit 1.50, max loss 3.50 -> hit at price >= 1.50 + 0.9*3.50 = 4.65
-    assert rm.is_max_loss_hit(1.50, 4.65)
-    assert not rm.is_max_loss_hit(1.50, 4.60)
-    assert not rm.is_max_loss_hit(1.50, None)
-    assert rm.is_realized_max_loss(1.50, 4.65)
-    assert not rm.is_realized_max_loss(1.50, 4.00)
+    assert rm.is_max_loss_hit(1.50, 4.65, 5.0)
+    assert not rm.is_max_loss_hit(1.50, 4.60, 5.0)
+    assert not rm.is_max_loss_hit(1.50, None, 5.0)
+    assert rm.is_realized_max_loss(1.50, 4.65, 5.0)
+    assert not rm.is_realized_max_loss(1.50, 4.00, 5.0)
+    # $2.50 wide, credit 0.75, max loss 1.75 -> hit at >= 0.75 + 0.9*1.75 = 2.325
+    assert rm.is_max_loss_hit(0.75, 2.33, 2.5)
+    assert not rm.is_max_loss_hit(0.75, 2.30, 2.5)
 
 
 def test_daily_loss_alert(rm):

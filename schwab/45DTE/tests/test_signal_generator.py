@@ -96,11 +96,53 @@ class TestBuildTrade:
         assert spec["short_strike"] == 100.0 and spec["long_strike"] == 95.0
         assert spec["credit"] == 1.80 and spec["accepted"]
 
-    def test_no_5_wide_pair_skips(self):
+    def test_no_pair_at_any_width_skips(self):
         strikes = {95: (-0.30, 3.60, 3.80), 105: (-0.38, 5.40, 5.60)}
         b = broker_with([days(52)], strikes=strikes)
         spec = sg.build_trade(b, row(), TODAY)
-        assert spec["accepted"] is False and spec["reason"] == "no $5-wide pair"
+        assert spec["accepted"] is False and spec["reason"] == "no $5/$2.5/$1-wide pair"
+
+    def test_falls_back_to_2_50_width_with_scaled_credit_floor(self):
+        strikes = {95: (-0.30, 3.60, 3.80), 92.5: (-0.25, 2.60, 2.80), 105: (-0.50, 7.90, 8.10)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is True
+        assert (spec["short_strike"], spec["long_strike"], spec["width"]) == (95.0, 92.5, 2.5)
+        assert spec["credit"] == 1.00 and spec["min_credit"] == 0.75 and spec["max_loss"] == 1.50
+
+    def test_falls_back_to_1_width_with_scaled_credit_floor(self):
+        strikes = {95: (-0.30, 3.60, 3.80), 94: (-0.27, 3.20, 3.40)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is True
+        assert (spec["short_strike"], spec["long_strike"], spec["width"]) == (95.0, 94.0, 1.0)
+        assert spec["credit"] == 0.40 and spec["min_credit"] == 0.30 and spec["max_loss"] == 0.60
+
+    def test_prefers_5_wide_when_narrower_pairs_also_exist(self):
+        strikes = {95: (-0.30, 3.60, 3.80), 92.5: (-0.25, 2.60, 2.80), 90: (-0.22, 2.10, 2.30)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["width"] == 5.0 and spec["long_strike"] == 90.0
+
+    def test_narrow_width_credit_below_scaled_floor_is_rejected(self):
+        strikes = {95: (-0.30, 3.60, 3.80), 92.5: (-0.25, 3.10, 3.30)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is False and "0.50 < min 0.75 for $2.5 width" in spec["reason"]
+
+    def test_junk_quotes_are_skipped_not_traded(self):
+        # 95's partner 90 has an inflated mid (zero bid, wide ask) -> negative credit; 100/95 is clean.
+        strikes = {90: (-0.22, 0.0, 9.00), 95: (-0.30, 3.60, 3.80), 100: (-0.38, 5.40, 5.60)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is True
+        assert (spec["short_strike"], spec["long_strike"]) == (100.0, 95.0)
+
+    def test_only_junk_pairs_reports_unusable_quotes(self):
+        strikes = {90: (-0.22, 0.0, 9.00), 95: (-0.30, 3.60, 3.80)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is False and "no usable quotes" in spec["reason"]
 
     def test_no_delta_candidates(self):
         strikes = {95: (-0.10, 3.60, 3.80), 90: (-0.05, 2.10, 2.30)}

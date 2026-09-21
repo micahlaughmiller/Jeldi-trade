@@ -27,6 +27,10 @@ def spread_id(symbol: str, expiration: date | str, right: str, short_strike: flo
     return f"{symbol}_{exp}_{right}_{short_strike:g}_{long_strike:g}"
 
 
+def spread_width(position: dict[str, Any]) -> float:
+    return float(position.get("width") or round(abs(position["short_strike"] - position["long_strike"]), 2))
+
+
 def parse_hhmm(value: str) -> time:
     hh, mm = value.split(":")
     return time(int(hh), int(mm))
@@ -130,7 +134,7 @@ class OrderManager:
             "right": spec["right"], "expiration": _exp(spec["expiration"]).isoformat(),
             "short_strike": spec["short_strike"], "long_strike": spec["long_strike"], "qty": qty,
             "limit_credit": spec["credit"], "initial_credit": spec["credit"], "max_loss": spec["max_loss"],
-            "strong": spec["strong"], "floor": cfg.MIN_CREDIT_STRONG if spec["strong"] else cfg.MIN_CREDIT,
+            "width": spec["width"], "strong": spec["strong"], "floor": spec["min_credit"],
             "submitted_at": now.isoformat(), "last_reduction_at": now.isoformat(), "filled_qty": 0,
             "status": order["status"], "dte": spec.get("dte"), "short_delta": spec.get("short_delta"),
             "dte_out_of_range": spec.get("dte_out_of_range", False), "source": "bot",
@@ -182,11 +186,12 @@ class OrderManager:
                 "opened_at": self.now_fn().isoformat(), "strong": entry["strong"], "current_price": None,
                 "unrealized_pl": None, "close_order_id": None, "close_limit": None, "close_status": None,
                 "max_loss_hit": False, "source": "bot", "short_delta": entry.get("short_delta"),
+                "width": entry["width"],
             }
             self.state["positions"][sid] = position
         position["qty"] = filled_qty
         position["entry_credit"] = credit
-        position["max_loss"] = round(self.config.SPREAD_WIDTH - credit, 2)
+        position["max_loss"] = round(spread_width(position) - credit, 2)
         entry["filled_qty"] = filled_qty
         self.log.fill(position, order)
         self._ensure_close_order(position, force_replace=True)
@@ -299,7 +304,7 @@ class OrderManager:
         self.state["closed"].append(record)
         self.state["positions"].pop(position["id"], None)
         self.log.position_closed(position, exit_debit, realized, reason, order_id)
-        if self.risk.is_realized_max_loss(position["entry_credit"], exit_debit):
+        if self.risk.is_realized_max_loss(position["entry_credit"], exit_debit, spread_width(position)):
             self.risk.record_max_loss_hit(position["id"], self.now_fn())
         self.save()
         self._notify()
@@ -334,7 +339,7 @@ class OrderManager:
                 continue
             self._ensure_close_order(position)
             price = self.refresh_price(position)
-            if self.risk.is_max_loss_hit(position["entry_credit"], price):
+            if self.risk.is_max_loss_hit(position["entry_credit"], price, spread_width(position)):
                 if not position.get("max_loss_hit"):
                     position["max_loss_hit"] = True
                     self.risk.record_max_loss_hit(position["id"], self.now_fn())
@@ -424,8 +429,9 @@ class OrderManager:
                     "entry_order_id": None, "opened_at": self.now_fn().isoformat(), "strong": False,
                     "current_price": None, "unrealized_pl": None, "close_order_id": None, "close_limit": None,
                     "close_status": None, "max_loss_hit": False, "source": "adopted", "short_delta": None,
+                    "width": round(abs(short["strike"] - long["strike"]), 2),
                 }
-                position["max_loss"] = round(self.config.SPREAD_WIDTH - position["entry_credit"], 2)
+                position["max_loss"] = round(position["width"] - position["entry_credit"], 2)
                 self.state["positions"][sid] = position
                 adopted += 1
             elif position["qty"] != abs(short["qty"]):
@@ -494,21 +500,23 @@ class OrderManager:
                 s is not None and l is not None and s["root"] in self.universe
                 and sell["symbol"] not in held and buy["symbol"] not in held
                 and s["right"] == l["right"] and s["expiration"] == l["expiration"]
-                and abs(abs(s["strike"] - l["strike"]) - self.config.SPREAD_WIDTH) < 1e-6
+                and any(abs(abs(s["strike"] - l["strike"]) - w) < 1e-6 for w in self.config.SPREAD_WIDTHS)
             )
             if not adoptable:
                 self.log.log_event("UNKNOWN_OPEN_ORDER", f"{order['symbol']}: open order {order['id']} not tracked; left alone",
                                    order_id=order["id"], status=order["status"])
                 continue
-            limit = float(order.get("limit_price") or self.config.MIN_CREDIT)
+            width = round(abs(s["strike"] - l["strike"]), 2)
+            floor = round(self.config.MIN_CREDIT * width / self.config.SPREAD_WIDTH, 2)
+            limit = float(order.get("limit_price") or floor)
             now = self.now_fn().isoformat()
             self.state["working_entries"][order["id"]] = {
                 "order_id": order["id"], "spread_id": spread_id(s["root"], s["expiration"], s["right"], s["strike"], l["strike"]),
                 "symbol": s["root"], "broker_symbol": s["root"], "right": s["right"],
                 "expiration": s["expiration"].isoformat(), "short_strike": s["strike"], "long_strike": l["strike"],
                 "qty": int(order["qty"]), "limit_credit": limit, "initial_credit": limit,
-                "max_loss": round(self.config.SPREAD_WIDTH - limit, 2), "strong": False,
-                "floor": self.config.MIN_CREDIT, "submitted_at": order["submitted_at"].isoformat()
+                "max_loss": round(width - limit, 2), "width": width, "strong": False,
+                "floor": floor, "submitted_at": order["submitted_at"].isoformat()
                 if isinstance(order.get("submitted_at"), datetime) else now, "last_reduction_at": now,
                 "filled_qty": int(order.get("filled_qty") or 0), "status": order["status"], "dte": None,
                 "short_delta": None, "dte_out_of_range": False, "source": "adopted",

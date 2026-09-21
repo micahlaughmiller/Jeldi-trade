@@ -50,22 +50,43 @@ def _find_strike(chain: list[dict[str, Any]], strike: float) -> dict[str, Any] |
     return None
 
 
+def min_credit_for(width: float, strong: bool, config: ModuleType = config_45dte) -> float:
+    """Credit floor scales with width: MIN_CREDIT is quoted per SPREAD_WIDTH ($5)."""
+    base = config.MIN_CREDIT_STRONG if strong else config.MIN_CREDIT
+    return round(base * width / config.SPREAD_WIDTH, 2)
+
+
 def select_strikes(chain: list[dict[str, Any]], right: str,
-                   config: ModuleType = config_45dte) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
-    """Short = |delta| closest to TARGET_DELTA within [DELTA_MIN, DELTA_MAX]; long = $SPREAD_WIDTH further OTM."""
+                   config: ModuleType = config_45dte) -> tuple[dict[str, Any] | None, dict[str, Any] | None, float | None, str]:
+    """Short = |delta| closest to TARGET_DELTA within [DELTA_MIN, DELTA_MAX]; long one width further OTM.
+
+    Widths are tried in SPREAD_WIDTHS order ($5, then $2.50, then $1) and, within a width, the
+    next-best delta strikes, so an illiquid partner strike does not kill the trade. Pairs whose
+    quotes imply a non-positive credit or a zero-bid short leg are skipped as unusable.
+    Returns (short, long, width, reason).
+    """
     candidates = [
         q for q in chain
         if q.get("delta") is not None and config.DELTA_MIN <= abs(q["delta"]) <= config.DELTA_MAX
     ]
     if not candidates:
-        return None, None, f"no strike with |delta| in [{config.DELTA_MIN}, {config.DELTA_MAX}]"
+        return None, None, None, f"no strike with |delta| in [{config.DELTA_MIN}, {config.DELTA_MAX}]"
     candidates.sort(key=lambda q: abs(abs(q["delta"]) - config.TARGET_DELTA))
-    offset = -config.SPREAD_WIDTH if right == "P" else config.SPREAD_WIDTH
-    for short in candidates:
-        long = _find_strike(chain, short["strike"] + offset)
-        if long is not None:
-            return short, long, "ok"
-    return None, None, "no $5-wide pair"
+    saw_pair = False
+    for width in config.SPREAD_WIDTHS:
+        offset = -width if right == "P" else width
+        for short in candidates:
+            long = _find_strike(chain, short["strike"] + offset)
+            if long is None:
+                continue
+            saw_pair = True
+            if short["bid"] <= 0 or short["mid"] - long["mid"] <= 0:
+                continue
+            return short, long, width, "ok"
+    widths = "/".join(f"${w:g}" for w in config.SPREAD_WIDTHS)
+    if saw_pair:
+        return None, None, None, f"no usable quotes for any {widths}-wide pair (zero bid or credit <= 0)"
+    return None, None, None, f"no {widths}-wide pair"
 
 
 def build_trade(broker: Any, row: dict[str, Any], today: date | None = None,
@@ -92,22 +113,23 @@ def build_trade(broker: Any, row: dict[str, Any], today: date | None = None,
     if not chain:
         spec["reason"] = "empty option chain"
         return spec
-    short, long, why = select_strikes(chain, right, config)
-    if short is None or long is None:
+    short, long, width, why = select_strikes(chain, right, config)
+    if short is None or long is None or width is None:
         spec["reason"] = why
         return spec
 
     credit = round_down_to_nickel(short["mid"] - long["mid"])
     bid_side = round(short["bid"] - long["ask"], 2)
-    min_credit = config.MIN_CREDIT_STRONG if strong else config.MIN_CREDIT
+    min_credit = min_credit_for(width, strong, config)
     spec.update({
         "short_strike": short["strike"], "long_strike": long["strike"], "short_symbol": short["symbol"],
         "long_symbol": long["symbol"], "short_delta": short["delta"], "long_delta": long.get("delta"),
         "credit": credit, "bid_side": bid_side, "min_credit": min_credit,
-        "max_loss": round(config.SPREAD_WIDTH - credit, 2), "width": config.SPREAD_WIDTH,
+        "max_loss": round(width - credit, 2), "width": width,
     })
     if credit + 1e-9 < min_credit:
-        spec["reason"] = f"credit {credit:.2f} < min {min_credit:.2f}{' (strong)' if strong else ''}"
+        spec["reason"] = (f"credit {credit:.2f} < min {min_credit:.2f} for ${width:g} width"
+                          f"{' (strong)' if strong else ''}")
         return spec
     spec["accepted"] = True
     spec["reason"] = "ok" if not out_of_range else f"ok ({why})"

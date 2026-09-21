@@ -51,7 +51,8 @@ DTE_SEARCH_MAX = 80
 TARGET_DELTA = 0.30
 DELTA_MIN = 0.20
 DELTA_MAX = 0.40
-SPREAD_WIDTH = 5.0
+SPREAD_WIDTHS = (5.0, 2.5, 1.0)   # tried in this order until a strike pair with live quotes exists
+SPREAD_WIDTH = 5.0                # reference width: MIN_CREDIT* apply per $5 of width and scale down
 MIN_CREDIT = 1.50
 MIN_CREDIT_STRONG = 1.40
 

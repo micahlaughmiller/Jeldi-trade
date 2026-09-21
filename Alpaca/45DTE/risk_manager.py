@@ -106,16 +106,15 @@ class RiskManager:
         details["portfolio_risk_pct_after"] = new_pct
         return RiskDecision(True, qty, f"risk_after={new_pct:.1%} ({note})", details)
 
-    def is_max_loss_hit(self, entry_credit: float, current_price: float | None) -> bool:
+    def is_max_loss_hit(self, entry_credit: float, current_price: float | None, width: float) -> bool:
         if current_price is None:
             return False
-        width = self.config.SPREAD_WIDTH
         return current_price >= entry_credit + self.config.MAX_LOSS_HIT_PCT * (width - entry_credit) - 1e-9
 
-    def is_realized_max_loss(self, entry_credit: float, exit_debit: float | None) -> bool:
+    def is_realized_max_loss(self, entry_credit: float, exit_debit: float | None, width: float) -> bool:
         if exit_debit is None:
             return False
-        max_loss = self.config.SPREAD_WIDTH - entry_credit
+        max_loss = width - entry_credit
         return (exit_debit - entry_credit) >= self.config.MAX_LOSS_HIT_PCT * max_loss - 1e-9
 
     def record_max_loss_hit(self, spread_id: str, now: datetime | None = None) -> bool:

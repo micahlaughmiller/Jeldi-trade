@@ -106,7 +106,8 @@ def test_unfilled_entries_canceled_at_1555(tmp_path, monkeypatch):
     clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 15, 50, tzinfo=ET), monkeypatch)
     scheduler.start_of_day_report()
     om.submit_entry({"symbol": "XYZ", "broker_symbol": "XYZ", "right": "P", "expiration": date(2026, 11, 6),
-                     "short_strike": 95.0, "long_strike": 90.0, "credit": 1.60, "max_loss": 3.40, "strong": False}, 1)
+                     "short_strike": 95.0, "long_strike": 90.0, "credit": 1.60, "max_loss": 3.40, "strong": False,
+                     "width": 5.0, "min_credit": 1.50}, 1)
     scheduler.tick()
     assert len(om.working_entries) == 1
     clock.now = clock.now.replace(minute=55)

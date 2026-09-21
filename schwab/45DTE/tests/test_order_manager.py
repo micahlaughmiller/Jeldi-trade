@@ -28,7 +28,8 @@ def spec(credit=1.60, strong=False, symbol="XYZ"):
     return {
         "symbol": symbol, "broker_symbol": symbol, "right": "P", "expiration": EXP, "short_strike": 95.0,
         "long_strike": 90.0, "credit": credit, "max_loss": round(5 - credit, 2), "strong": strong, "dte": 50,
-        "short_delta": -0.30, "dte_out_of_range": False,
+        "short_delta": -0.30, "dte_out_of_range": False, "width": 5.0,
+        "min_credit": 1.40 if strong else 1.50,
     }
 
 

@@ -90,8 +90,9 @@ class TradingLogger:
 
     def trade_spec(self, spec: dict[str, Any]) -> None:
         if spec.get("accepted"):
-            msg = (f"{spec['symbol']} {spec['right']} {spec['short_strike']}/{spec['long_strike']} exp {spec['expiration']} "
-                   f"dte={spec['dte']} delta={spec['short_delta']:.2f} credit={spec['credit']:.2f} bid_side={spec['bid_side']:.2f}")
+            msg = (f"{spec['symbol']} {spec['right']} {spec['short_strike']}/{spec['long_strike']} (${spec['width']:g} wide) "
+                   f"exp {spec['expiration']} dte={spec['dte']} delta={spec['short_delta']:.2f} "
+                   f"credit={spec['credit']:.2f} (min {spec['min_credit']:.2f}) bid_side={spec['bid_side']:.2f}")
         else:
             msg = f"{spec['symbol']} skipped: {spec['reason']}"
         self.log_event("TRADE_SPEC", msg, **spec)

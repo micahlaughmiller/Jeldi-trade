@@ -277,7 +277,7 @@ class Bot:
         self.acted.add(key)
         log.info("SIGNAL ORB %s (%s) on 5m candle %s vs %.2f/%.2f", direction, kind or "?",
                  candle_time.strftime("%H:%M"), self.orb.high, self.orb.low)
-        self.journal.event("SIGNAL", now, setup="ORB", direction=direction, kind=kind, candles=[candle_time],
+        self.journal.event("SIGNAL", now, setup="ORB", direction=direction, trigger=kind, candles=[candle_time],
                            high=self.orb.high, low=self.orb.low)
         self.enter(now, "ORB", direction, kind)
 

@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -38,6 +38,7 @@ class OpenSpread:
     closed_qty: int = 0
     realized_pnl: float = 0.0
     entry_mid: float | None = None   # quote mid when the entry was placed (fill quality)
+    floor_price: float | None = None  # hard profit-floor exit (spread price), set by the floor/stale rules
 
     @property
     def remaining(self) -> int:
@@ -176,9 +177,33 @@ class PositionManager:
                 fills += self._tick_position(p, now, prices[strat], candles)
         return fills
 
+    def _set_floor(self, p: OpenSpread, now: datetime, profit_floor: float, why: str) -> None:
+        floor_price = round(p.entry_credit - profit_floor, 2)
+        if p.floor_price is not None and p.floor_price <= floor_price:
+            return
+        p.floor_price = floor_price
+        log.info("[%s] PROFIT FLOOR set at %.2f (+%.2f) by %s", p.strategy, floor_price, profit_floor, why)
+        self.journal.event("FLOOR_SET", now, strategy=p.strategy, floor_price=floor_price, profit_floor=profit_floor,
+                           why=why, position=p.to_dict())
+
+    def _update_floor(self, p: OpenSpread, now: datetime, spread_price: float) -> None:
+        profit = p.entry_credit - spread_price
+        best_profit = p.entry_credit - p.best_price
+        steps = strategy.exit_setting(p.strategy, "PROFIT_FLOOR_BY_WIDTH", {}) or {}
+        if p.width in steps:
+            arm, floor = steps[p.width]
+            if best_profit >= arm:
+                self._set_floor(p, now, floor, f"PROFIT_FLOOR arm +{arm:.2f}")
+        timer = strategy.exit_setting(p.strategy, "STALE_TIMER_MIN")
+        if timer and not p.runner and profit > 0 and (now - p.entry_time) >= timedelta(minutes=timer):
+            self._set_floor(p, now, strategy.exit_setting(p.strategy, "STALE_FLOOR", 0.05), f"STALE_TIMER {timer}m")
+
     def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame) -> list[dict]:
         p.current_price = spread_price
         p.best_price = min(p.best_price, spread_price)
+        self._update_floor(p, now, spread_price)
+        if p.floor_price is not None and spread_price >= p.floor_price and spread_price > p.target_price:
+            return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)
         if p.runner:
             return self._runner_tick(p, now, spread_price, candles)
         if spread_price >= p.stop_price:

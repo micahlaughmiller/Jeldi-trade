@@ -474,3 +474,94 @@ def test_profit_lock_disabled(pm, broker, monkeypatch):
     assert tick(pm, et(10, 2), 2.80, rising()) == []
     assert tick(pm, et(10, 4), 2.95, falling_last()) == []
     assert "A" in pm.positions
+
+
+# ------------------------------------------------------------ profit floor and stale timer (A only)
+
+def floor_tuning(monkeypatch, **extra):
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {**config.A_BASE_TUNING, **extra}, "B": {}})
+
+
+def test_profit_floor_arms_and_exits_at_floor(pm, broker, journal, monkeypatch):
+    floor_tuning(monkeypatch, PROFIT_FLOOR_BY_WIDTH={5: (0.10, 0.05)})
+    open_put_spread(pm, broker, qty=2)                       # $5-wide, credit 3.00
+    assert tick(pm, et(10, 2), 2.92, rising()) == []         # +0.08: not armed
+    assert pm.positions["A"].floor_price is None
+    assert tick(pm, et(10, 4), 2.90, rising()) == []         # +0.10 arms -> floor at 2.95
+    assert pm.positions["A"].floor_price == 2.95
+    assert events(journal, "FLOOR_SET")[0]["profit_floor"] == 0.05
+    assert tick(pm, et(10, 6), 2.94, rising()) == []         # above the floor in profit terms
+    broker.spread_close_price = 2.96
+    fills = tick(pm, et(10, 8), 2.95, rising())              # back to the floor -> out with +0.05
+    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["qty"] == 2 and pm.positions == {}
+
+
+def test_profit_floor_keeps_runner_going(pm, broker, monkeypatch):
+    floor_tuning(monkeypatch, PROFIT_FLOOR_BY_WIDTH={5: (0.10, 0.05)})
+    open_put_spread(pm, broker, qty=2)
+    assert tick(pm, et(10, 2), 2.70, rising()) == []         # target -> runner, floor also set (2.95)
+    p = pm.positions["A"]
+    assert p.runner is True and p.floor_price == 2.95
+    assert tick(pm, et(10, 4), 2.40, rising()) == []         # runs on
+    broker.spread_close_price = 2.71
+    fills = tick(pm, et(10, 6), 2.70, rising())              # runner stop at the target level fires first
+    assert fills[0]["exit_reason"] == "RUNNER_STOP"
+
+
+def test_profit_floor_width_10_uses_its_own_step(pm, broker, monkeypatch):
+    floor_tuning(monkeypatch, PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)})
+    broker.set_chain("P", {7515.0: (10.9, 11.1), 7505.0: (4.9, 5.1)})
+    broker.add_spread_position("P", 7515.0, 7505.0, 1, 11.0, 5.0)
+    pm.open(OpenSpread(strategy="A", direction=BULLISH, setup="ORB", right="P", root="SPXW", expiration=TODAY,
+                       short_strike=7515.0, long_strike=7505.0, width=10, qty=1, entry_credit=6.00,
+                       entry_time=et(10, 0), current_price=6.0, best_price=6.0, profit_target=0.30, stop_loss=0.55))
+    assert tick(pm, et(10, 2), 5.85, rising()) == []         # +0.15: below the $10 arm of 0.20
+    assert pm.positions["A"].floor_price is None
+    assert tick(pm, et(10, 4), 5.80, rising()) == []         # +0.20 arms -> floor at 5.85
+    assert pm.positions["A"].floor_price == 5.85
+
+
+def test_stale_timer_sets_breakeven_floor_only_when_in_profit(pm, broker, journal, monkeypatch):
+    floor_tuning(monkeypatch, STALE_TIMER_MIN=5)
+    open_put_spread(pm, broker, qty=1)                       # entered 10:00
+    assert tick(pm, et(10, 4), 2.90, rising()) == []         # 4 min: too early
+    assert pm.positions["A"].floor_price is None
+    assert tick(pm, et(10, 5), 3.05, rising()) == []         # 5 min but under water: no floor
+    assert pm.positions["A"].floor_price is None
+    assert tick(pm, et(10, 6), 2.90, rising()) == []         # 6 min, +0.10 -> floor at +0.05 (2.95), stays in
+    assert pm.positions["A"].floor_price == 2.95
+    assert events(journal, "FLOOR_SET")[0]["why"] == "STALE_TIMER 5m"
+    broker.spread_close_price = 2.96
+    fills = tick(pm, et(10, 8), 2.95, rising())
+    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(4.0)
+
+
+def test_stale_timer_with_tiny_profit_exits_at_once(pm, broker, monkeypatch):
+    # in profit but under the +0.05 floor when the timer fires: the floor is already breached -> take what is there
+    floor_tuning(monkeypatch, STALE_TIMER_MIN=5)
+    open_put_spread(pm, broker, qty=1)
+    broker.spread_close_price = 2.98
+    fills = tick(pm, et(10, 6), 2.97, rising())
+    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(2.0)
+
+
+def test_stale_timer_ignored_once_runner_started(pm, broker, monkeypatch):
+    floor_tuning(monkeypatch, STALE_TIMER_MIN=5)
+    open_put_spread(pm, broker, qty=1)
+    tick(pm, et(10, 2), 2.70, rising())                      # runner
+    assert tick(pm, et(10, 9), 2.60, rising()) == []
+    assert pm.positions["A"].floor_price is None
+
+
+def test_floor_never_set_for_b_by_default(pm, broker):
+    open_b_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 9), 0.85, rising(), strat="B") == []
+    assert pm.positions["B"].floor_price is None
+    assert config.PROFIT_FLOOR_BY_WIDTH == {} and config.STALE_TIMER_MIN is None
+
+
+def test_floor_survives_state_roundtrip(pm, broker, monkeypatch):
+    floor_tuning(monkeypatch, PROFIT_FLOOR_BY_WIDTH={5: (0.10, 0.05)})
+    spread = open_put_spread(pm, broker, qty=1)
+    tick(pm, et(10, 2), 2.90, rising())
+    assert OpenSpread.from_dict(spread.to_dict()).floor_price == 2.95

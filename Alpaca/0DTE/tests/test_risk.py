@@ -59,14 +59,14 @@ def test_invalid_spread_returns_zero():
 
 def test_consecutive_loss_stop_is_per_strategy():
     rm = RiskManager(10_000)
-    assert rm.trading_allowed("A") == (True, "OK")
-    for _ in range(limit("A", "MAX_CONSECUTIVE_LOSSES") - 1):
-        rm.record_trade("A", -60.0)
-    assert rm.trading_allowed("A")[0] is True
-    rm.record_trade("A", -60.0)
-    ok, reason = rm.trading_allowed("A")
-    assert ok is False and "CONSECUTIVE" in reason and reason.startswith("A:")
     assert rm.trading_allowed("B") == (True, "OK")
+    for _ in range(limit("B", "MAX_CONSECUTIVE_LOSSES") - 1):
+        rm.record_trade("B", -60.0)
+    assert rm.trading_allowed("B")[0] is True
+    rm.record_trade("B", -60.0)
+    ok, reason = rm.trading_allowed("B")
+    assert ok is False and "CONSECUTIVE" in reason and reason.startswith("B:")
+    assert rm.trading_allowed("A") == (True, "OK")
 
 
 def test_win_resets_consecutive_losses():
@@ -79,19 +79,19 @@ def test_win_resets_consecutive_losses():
 
 
 def test_a_limits_are_tighter_than_b():
-    assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (3, 2, 30)
+    assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (5, 5, 30)
     assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (20, 5, 0)
     rm = RiskManager(10_000)
-    for _ in range(3):
+    for _ in range(5):
         rm.record_trade("A", 10.0)
         rm.record_trade("B", 10.0)
     ok, reason = rm.trading_allowed("A")
-    assert ok is False and reason == "A: MAX_TRADES_PER_DAY (3)"
+    assert ok is False and reason == "A: MAX_TRADES_PER_DAY (5)"
     assert rm.trading_allowed("B") == (True, "OK")
     rm2 = RiskManager(10_000)
-    rm2.record_trade("A", -10.0)
-    rm2.record_trade("A", -10.0)
-    assert rm2.trading_allowed("A")[0] is False and "CONSECUTIVE" in rm2.trading_allowed("A")[1]
+    for _ in range(5):
+        rm2.record_trade("A", -10.0)
+    assert rm2.trading_allowed("A")[0] is False
 
 
 def test_cooldown_after_exit_applies_to_a_only():

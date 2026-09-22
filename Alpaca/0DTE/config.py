@@ -92,7 +92,7 @@ MAX_CONSECUTIVE_LOSSES = 5
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every
 # five minutes; capping at 3 trades would have cut the day's loss by 84%. B keeps the defaults.
 LIMITS_BY_STRATEGY = {
-    "A": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 2, "COOLDOWN_MIN": 30},
+    "A": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 5, "COOLDOWN_MIN": 30},   # 2026-09-22: 5 trades to test the exit floors
     "B": {},
 }
 DAILY_LOSS_LIMIT_PCT = 0.10
@@ -135,11 +135,17 @@ RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOM
 # runner always starts at the target, and no momentum-slowdown exit. That set turned the day's real entries
 # from -$16.9k to +$13.5k on the model; the shared 0.15/0.10 lock cut every winner at about +0.10. B keeps
 # the shared defaults until it has its own data.
-EXIT_TUNING_BY_STRATEGY = {
-    "A": {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
-          "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False},
-    "B": {},
-}
+# Profit floor: once the trade is `arm` in profit, a hard exit floor sits at `floor` profit while the position
+# (and any runner) keeps going. Keyed by spread width: {width: (arm, floor)}. Empty = off.
+PROFIT_FLOOR_BY_WIDTH: dict = {}
+# Stale timer: STALE_TIMER_MIN minutes after entry, if the target has not been hit and the trade shows any
+# profit, a floor at STALE_FLOOR profit is set (2026-09-22: trades that made +0.20 gave it all back to a loss).
+STALE_TIMER_MIN = None
+STALE_FLOOR = 0.05
+
+A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
+                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False}
+EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": {}}
 
 ENTRY_STEP_SEC = 20
 ENTRY_PRICE_STEP = 0.05
@@ -159,17 +165,23 @@ NEWS_DAY_MODE = "half_size"
 # Nine personas firing on the same signal are one experiment run nine times. Give each one a different
 # parameter set here and every session yields nine comparisons. Keys are any UPPERCASE name defined
 # above; the dict for ACTIVE_TRADER is applied on import, everyone else runs the defaults.
-# Stop-size experiment from the 2026-09-21 replay: on that trend day every wider stop won (0.55 -> +9.1k,
-# 0.60 -> +13.9k, 0.70 -> +18.8k on Monday's entries), which only proves the stop-outs were noise-sized, not
-# that 0.70 is right. ASTRA and the rest run the committed build as the control.
+# 2026-09-22 exit-floor experiment (Strategy A only; B untouched). ASTRA = control.
+#   method 1  bracket at the first step, runner keeps going: $10-wide arms at +0.20 with a +0.15 floor,
+#             $5-wide arms at +0.10 with a +0.05 floor
+#   method 2  break-even lock: arms at +0.10, floor +0.05, both widths
+#   method 3  5-minute stale timer: no target yet but in profit -> floor at +0.05
+def _a(**extra) -> dict:
+    return {"EXIT_TUNING_BY_STRATEGY": {"A": {**A_BASE_TUNING, **extra}, "B": {}}}
+
+
 PERSONA_OVERRIDES: dict[str, dict] = {
-    "ARIA":   {"STOP_LOSS": 0.60},
-    "DAVID":  {"STOP_LOSS": 0.70},
-    "ELENA":  {"PROFIT_TARGET": 0.50},                                                    # runner starts at 0.50
-    # best hybrid on the model; the lock is switched off for A only (B keeps its own lock)
-    "JORDAN": {"STOP_LOSS": 0.60, "PROFIT_TARGET": 0.50,
-               "EXIT_TUNING_BY_STRATEGY": {"A": {"PROFIT_LOCK_ENABLED": False, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
-                                                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False},
-                                           "B": {}}},
+    "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $10-wide
+    "DAVID":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $10-wide
+    "SARAH":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $5-wide
+    "ELENA":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),     # method 2, $10-wide
+    "JAMES":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),     # method 2, $5-wide
+    "JORDAN": _a(STALE_TIMER_MIN=5),                                             # method 3, $10-wide
+    "MARCUS": _a(STALE_TIMER_MIN=5),                                             # method 3, $5-wide
+    "CLAUDE": _a(STALE_TIMER_MIN=5),                                             # method 3, $5-wide
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

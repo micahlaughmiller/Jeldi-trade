@@ -83,7 +83,11 @@ rest with the 20% slowdown exit. A takes both ORB entry kinds (momentum close
 and pullback) but not the overnight setup, at most 3 trades / 2 consecutive
 losses a day, with a 30-minute cool-down after each exit; B keeps the 20 / 5
 defaults and both setups. Per-strategy exit knobs live in
-`EXIT_TUNING_BY_STRATEGY`. Ctrl+C or SIGTERM closes every open spread before the process exits.
+`EXIT_TUNING_BY_STRATEGY`, including an optional profit floor by spread width
+(`PROFIT_FLOOR_BY_WIDTH`: once `arm` in profit, a hard exit floor at `floor`
+profit while the runner keeps going) and a stale timer (`STALE_TIMER_MIN`: in
+profit but no target yet after N minutes sets a `STALE_FLOOR` floor). The nine
+Alpaca personas test these via `PERSONA_OVERRIDES`; ASTRA is the control. Ctrl+C or SIGTERM closes every open spread before the process exits.
 Every trade row records the trigger mid next to the fill (slippage columns).
 Per-persona parameter overrides live in `PERSONA_OVERRIDES` at the bottom of
 the Alpaca config.

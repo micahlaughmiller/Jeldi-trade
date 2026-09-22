@@ -161,7 +161,7 @@ def test_a_skips_the_overnight_setup_b_trades_it(bot, caplog):
     bot.enter(et(9, 40), "OVERNIGHT", BULLISH)
     assert set(bot.pm.positions) == {"B"}
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL OVERNIGHT")][0]
-    assert "A: skip: OVERNIGHT setup disabled for A" in line
+    assert "A: skip: OVERNIGHT setup disabled for A" in line     # A trades the overnight levels via ON_BREAK instead
 
 
 def test_a_cooldown_blocks_reentry_after_its_exit(bot, caplog):
@@ -216,3 +216,64 @@ def test_signal_handlers_route_to_keyboard_interrupt():
     assert signal.getsignal(signal.SIGTERM) is scheduler._raise_interrupt
     with pytest.raises(KeyboardInterrupt):
         scheduler._raise_interrupt(signal.SIGTERM, None)
+
+
+# ------------------------------------------------------------ ON_BREAK: overnight levels through the ORB state machine
+
+def test_on_break_momentum_entry_is_a_only(bot, caplog):
+    from conftest import make_candles
+    from strategy import Levels
+    caplog.set_level("INFO")
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624),      # 09:30 break: closes above 7620
+            (7624, 7630, 7621, 7628)]      # 09:32 holds and closes above the break close -> momentum
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert set(bot.pm.positions) == {"A"}
+    assert bot.pm.positions["A"].setup == "ON_BREAK"
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]
+    assert sig and sig[0]["trigger"] == "MOMENTUM" and sig[0]["direction"] == BULLISH
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK BULLISH at 09:34")][0]
+    assert "B: skip: ON_BREAK setup disabled for B" in line
+    # the same candles again do not re-fire
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert len([r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]) == 1
+
+
+def test_on_break_pullback_entry(bot):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624),      # break
+            (7624, 7625, 7619, 7621),      # wick back to the level, holds
+            (7621, 7623, 7620.5, 7622)]    # green close above -> pullback entry
+    bot.try_on_break_entry(et(9, 36), make_candles(et(9, 30), bars))
+    assert set(bot.pm.positions) == {"A"}
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"][0]
+    assert sig["trigger"] == "PULLBACK"
+
+
+def test_on_break_needs_levels_and_basis(bot):
+    from conftest import make_candles
+    bot.overnight = None
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]))
+    assert bot.pm.positions == {}
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = None                        # ES_TO_SPX source without a basis yet: no signal
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]))
+    assert bot.pm.positions == {}
+
+
+def test_on_break_ignores_premarket_candles_and_wick_only_break(bot):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7630, 7635, 7625, 7632),      # 09:26 pre-market candle above the level: must be ignored
+            (7632, 7634, 7628, 7633),      # 09:28
+            (7615, 7628, 7614, 7619),      # 09:30 wick above, closes below -> not a break
+            (7619, 7621, 7615, 7618)]      # 09:32
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 26), bars))
+    assert bot.pm.positions == {} and bot.on_setup.state == bot.on_setup.WAITING

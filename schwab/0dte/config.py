@@ -116,7 +116,9 @@ MAX_CONCURRENT_POSITIONS = 1   # per strategy
 # Which setups and which ORB entry kinds each strategy trades. 2026-09-21: entries before 10:00 went
 # 1 for 12 and momentum-close entries bought the top of the 5-minute bar, so A takes only the ORB
 # pullback entry (wick to the level, then a close in the breakout direction). B is unchanged.
-SETUPS_BY_STRATEGY = {"A": ("ORB",), "B": ("OVERNIGHT", "ORB")}
+# ON_BREAK: the overnight high/low run through the same break -> pullback/momentum state machine as the
+# ORB, on 2-minute candles during the first 30 minutes. A trades it; B keeps its own OVERNIGHT detector.
+SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("OVERNIGHT", "ORB")}
 # Both entry kinds for A: the 2026-09-21 replay showed a trend day with one momentum break and no pullback.
 ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}
 

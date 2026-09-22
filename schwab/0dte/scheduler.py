@@ -73,6 +73,8 @@ class Bot:
         self.basis: float | None = None
         self.orb: strategy.Levels | None = None
         self.orb_setup: strategy.OrbSetup | None = None
+        self.on_setup: strategy.OrbSetup | None = None       # overnight levels, ORB-style state machine (A)
+        self.last_on_candle: datetime | None = None
         self.last_candle: datetime | None = None
         self.last_orb_candle: datetime | None = None
         self.today: date = now_et().date()
@@ -166,6 +168,7 @@ class Bot:
         if ph in strategy.ENTRY_PHASES:
             if new_candle and ph in strategy.OVERNIGHT_PHASES:
                 self.try_overnight_entry(now, candles)
+                self.try_on_break_entry(now, candles)
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
         self.save_state()
@@ -240,6 +243,40 @@ class Bot:
         self.journal.event("SIGNAL", now, setup="OVERNIGHT", direction=bo.direction,
                            candles=list(bo.candle_times), high=levels.high, low=levels.low)
         self.enter(now, "OVERNIGHT", bo.direction)
+
+    def try_on_break_entry(self, now: datetime, spx_candles: pd.DataFrame) -> None:
+        """Overnight high/low through the ORB state machine (break, then pullback or momentum). A only."""
+        if not strategy.setup_allowed("ON_BREAK", now.date()):
+            return
+        found = self.overnight_levels_for_signal()
+        if found is None:
+            return
+        levels, symbol = found
+        if self.on_setup is None:
+            self.on_setup = strategy.OrbSetup(levels.high, levels.low)
+        candles = spx_candles if symbol == config.SPX_SYMBOL else \
+            market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
+        candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
+        if self.last_on_candle is not None:
+            candles = candles[candles.index > self.last_on_candle]
+        for t, candle in candles.iterrows():
+            fired = self.on_setup.update(candle)
+            self.last_on_candle = t.to_pydatetime()
+            if fired is None:
+                continue
+            if t != candles.index[-1]:
+                log.info("Stale ON_BREAK %s signal on replayed candle %s ignored.", fired, t.strftime("%H:%M"))
+                continue
+            key = f"ON_BREAK:{self.last_on_candle.isoformat()}"
+            if key in self.acted:
+                continue
+            self.acted.add(key)
+            kind = self.on_setup.entry_kind
+            log.info("SIGNAL ON_BREAK %s (%s) on %s candle %s vs overnight %.2f/%.2f", fired, kind,
+                     config.CANDLE_INTERVAL, t.strftime("%H:%M"), levels.high, levels.low)
+            self.journal.event("SIGNAL", now, setup="ON_BREAK", direction=fired, trigger=kind,
+                               candles=[self.last_on_candle], high=levels.high, low=levels.low)
+            self.enter(now, "ON_BREAK", fired, kind)
 
     def orb_signal(self, now: datetime) -> tuple[str, datetime, str | None] | None:
         """Feed new completed ORB candles to the setup; a signal counts only from the newest one.

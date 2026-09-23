@@ -67,10 +67,12 @@ def test_load_universe_dedupes_and_keeps_broker_spelling(tmp_path):
     assert mdh.load_universe(f) == ["AAPL", "BRK.B", "MSFT"]
 
 
-def test_real_universe_file_has_503_unique_names():
+def test_real_universe_file_has_sp500_plus_etfs():
     universe = mdh.load_universe()
-    assert len(universe) == 503
+    assert len(universe) == 503 + 36 and len(set(universe)) == len(universe)
     assert "BRK.B" in universe
+    for etf in ("XLE", "XLK", "GLD", "USO", "SPY", "TLT", "EEM"):
+        assert etf in universe
 
 
 def _synthetic_frame(tickers: list[str], n: int = 60, nan_ticker: str | None = None) -> pd.DataFrame:

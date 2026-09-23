@@ -501,3 +501,45 @@ YUM
 ZBRA
 ZBH
 ZTS
+
+# ---- ETFs added 2026-09-23 (weekly chains; same RSI(14)/RSI(28) credit-spread rules)
+# broad market
+SPY
+QQQ
+IWM
+DIA
+# S&P sector SPDRs
+XLB
+XLC
+XLE
+XLF
+XLI
+XLK
+XLP
+XLRE
+XLU
+XLV
+XLY
+# commodities and miners
+GLD
+SLV
+USO
+UNG
+GDX
+GDXJ
+XOP
+XME
+# industry / thematic (liquid options)
+SMH
+XBI
+KRE
+XHB
+IYR
+# rates / credit
+TLT
+HYG
+# international
+EEM
+EFA
+FXI
+EWZ

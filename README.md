@@ -94,7 +94,8 @@ Every trade row records the trigger mid next to the fill (slippage columns).
 Per-persona parameter overrides live in `PERSONA_OVERRIDES` at the bottom of
 the Alpaca config.
 
-**45DTE** — scans the S&P 500 (`data/sp500_tickers.txt`) every 5 min from
+**45DTE** — scans the S&P 500 plus 36 ETFs (broad, sector SPDRs, commodities,
+rates, international; `data/sp500_tickers.txt`) every 5 min from
 09:30–11:30, every 30 min until 15:00, then every 5 min to the close. Both
 RSI(14) and RSI(28) below 30 → put credit spread; above 70 → call credit
 spread. Short strike at 0.30 delta from the live chain, $5 wide, credit ≥ 1.50

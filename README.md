@@ -84,8 +84,11 @@ and pullback) and, in the first 30 minutes, the overnight high/low run through
 the same break/pullback/momentum state machine on 2-minute candles (`ON_BREAK`);
 B keeps the original overnight detector. at most 3 trades / 2 consecutive
 losses a day, with a 30-minute cool-down after each exit; B keeps the 20 / 5
-defaults and both setups. Per-strategy exit knobs live in
-`EXIT_TUNING_BY_STRATEGY`, including an optional profit floor by spread width
+defaults and both setups. `CLOSE_SLIPPAGE` (escalating-limit close pricing) is $0.03/retry. Per-strategy
+exit knobs live in `EXIT_TUNING_BY_STRATEGY`, including a runner trail that
+tightens from $0.50 to $0.30 once the runner's best profit passes $2.00
+(`RUNNER_TIGHTEN_ENABLED`/`RUNNER_DEEP_PROFIT`/`RUNNER_DEEP_TRAIL`, on for A
+only) and an optional profit floor by spread width
 (`PROFIT_FLOOR_BY_WIDTH`: once `arm` in profit, a hard exit floor at `floor`
 profit while the runner keeps going) and a stale timer (`STALE_TIMER_MIN`: in
 profit but no target yet after N minutes sets a `STALE_FLOOR` floor). The nine

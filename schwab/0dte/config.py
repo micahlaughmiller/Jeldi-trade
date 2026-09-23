@@ -51,7 +51,9 @@ SIM_INDEX_FILL_END = "16:15"
 DRY_RUN = SCHWAB_MODE != "sim" and \
     os.getenv("SCHWAB_LIVE_ORDERS", "false").strip().lower() not in ("1", "true", "yes")
 RISK_FREE_RATE = 0.04
-CLOSE_SLIPPAGE = 0.05
+# 2026-09-23: SPX 0DTE quotes are tight enough to work a closer limit; escalation step now $0.03/retry
+# instead of $0.05 (close_spread_at_market: limit = ask-side + CLOSE_SLIPPAGE * attempt_number).
+CLOSE_SLIPPAGE = 0.03
 CLOSE_RETRY_SEC = 15
 CLOSE_MAX_RETRIES = 6
 LOG_DIR = "logs"
@@ -133,6 +135,13 @@ RUNNER_MIN_CONTRACTS = 2
 # 2026-09-21: +$2,650 from six exits vs +$180 from 34 fixed-target exits); B books half as before.
 RUNNER_CLOSE_FRACTION_BY_STRATEGY = {"A": 0.0, "B": 0.5}
 TRAIL_AMOUNT = 0.50
+# Once a runner's best profit passes RUNNER_DEEP_PROFIT, tighten the trail to RUNNER_DEEP_TRAIL so a
+# pullback is caught closer to +0.30 instead of riding the flat $0.50 trail all the way down (2026-09-23:
+# a runner gave back $0.80 before the wider trail + escalating-limit fill caught it). Off by default;
+# strategy A turns it on via EXIT_TUNING_BY_STRATEGY (RUNNER_TIGHTEN_ENABLED).
+RUNNER_DEEP_PROFIT = 2.00
+RUNNER_DEEP_TRAIL = 0.30
+RUNNER_TIGHTEN_ENABLED = False
 MOMENTUM_CANDLES = 3
 MOMENTUM_CONTINUE_RATIO = 0.80
 MOMENTUM_SLOWDOWN_PCT = 0.20
@@ -161,7 +170,7 @@ STALE_TIMER_MIN = None
 STALE_FLOOR = 0.05
 
 A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
-                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False}
+                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True}
 EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": {}}
 
 ENTRY_STEP_SEC = 20

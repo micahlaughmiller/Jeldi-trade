@@ -241,12 +241,21 @@ class PositionManager:
                 return self._close(p, p.remaining, "PROFIT_LOCK_MOMENTUM", now, spread_price)
         return []
 
+    def _runner_trail(self, p: OpenSpread) -> float:
+        """Trail width in points. Tightens to RUNNER_DEEP_TRAIL once the runner's best profit has
+        passed RUNNER_DEEP_PROFIT, so a deep runner's pullback is caught sooner (per-strategy)."""
+        if strategy.exit_setting(p.strategy, "RUNNER_TIGHTEN_ENABLED", False):
+            deep_profit = strategy.exit_setting(p.strategy, "RUNNER_DEEP_PROFIT", 2.00)
+            if (p.entry_credit - p.runner_best) >= deep_profit:
+                return strategy.exit_setting(p.strategy, "RUNNER_DEEP_TRAIL", 0.30)
+        return config.TRAIL_AMOUNT
+
     def _runner_tick(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame) -> list[dict]:
         p.runner_best = min(p.runner_best, spread_price)
         reason = None
         if spread_price >= p.target_price:
             reason = "RUNNER_STOP"
-        elif spread_price >= p.runner_best + config.TRAIL_AMOUNT:
+        elif spread_price >= p.runner_best + self._runner_trail(p):
             reason = "RUNNER_TRAIL"
         elif strategy.exit_setting(p.strategy, "RUNNER_SLOWDOWN_EXIT", True) \
                 and p.momentum_at_target is not None and p.momentum_at_target > 0 \

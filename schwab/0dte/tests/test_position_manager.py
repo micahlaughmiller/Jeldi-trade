@@ -565,3 +565,44 @@ def test_floor_survives_state_roundtrip(pm, broker, monkeypatch):
     spread = open_put_spread(pm, broker, qty=1)
     tick(pm, et(10, 2), 2.90, rising())
     assert OpenSpread.from_dict(spread.to_dict()).floor_price == 2.95
+
+
+# ------------------------------------------------------------ deep-runner trail tightening (A only)
+
+def test_a_runner_trail_tightens_past_2_deep_profit(pm, broker):
+    open_put_spread(pm, broker, qty=2, credit=6.00)   # $5-wide fixture chain caps width at 5 but credit/target math is independent
+    assert tick(pm, et(10, 2), 5.70, rising()) == []              # target -> runner starts, best 5.70
+    p = pm.positions["A"]
+    assert p.runner is True and p.runner_best == 5.70
+    assert tick(pm, et(10, 4), 4.50, rising()) == []               # best now 4.50: profit 1.50, still below the $2 deep threshold
+    assert p.runner_best == 4.50
+    broker.spread_close_price = 4.90
+    assert tick(pm, et(10, 6), 4.79, rising()) == []               # +0.29 giveback: below the still-wide 0.50 trail
+    assert tick(pm, et(10, 8), 3.95, rising()) == []               # best 3.95: profit 2.05, past the $2 deep threshold now
+    broker.spread_close_price = 4.30
+    fills = tick(pm, et(10, 10), 4.26, rising())                   # +0.31 giveback from 3.95: trips the tightened 0.30 trail
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and pm.positions == {}
+
+
+def test_a_runner_trail_stays_050_before_deep_profit(pm, broker):
+    open_put_spread(pm, broker, qty=2, credit=6.00)
+    assert tick(pm, et(10, 2), 5.70, rising()) == []
+    p = pm.positions["A"]
+    assert tick(pm, et(10, 4), 5.00, rising()) == []               # profit 1.00: below the $2 threshold, trail is 0.50
+    assert tick(pm, et(10, 6), 5.29, rising()) == []               # +0.29 giveback: not enough for the wide trail
+    broker.spread_close_price = 5.51
+    fills = tick(pm, et(10, 8), 5.50, rising())                    # +0.50 giveback trips the untightened trail
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL"
+
+
+def test_b_runner_trail_never_tightens(pm, broker):
+    open_b_put_spread(pm, broker, qty=4, credit=3.00)
+    fills = tick(pm, et(10, 2), 2.70, rising(), strat="B")         # B books half at target (fraction 0.5)
+    assert fills and fills[0]["exit_reason"] == "TARGET_HALF" and fills[0]["qty"] == 2
+    p = pm.positions["B"]
+    assert p.runner is True and p.remaining == 2
+    assert tick(pm, et(10, 4), 0.80, rising(), strat="B") == []    # best 0.80: profit 3.00-0.80=2.20, past $2, but B never tightens
+    broker.spread_close_price = 1.31
+    assert tick(pm, et(10, 6), 1.29, rising(), strat="B") == []    # +0.49 giveback: still under B's flat 0.50 trail
+    fills = tick(pm, et(10, 8), 1.30, rising(), strat="B")         # +0.50 giveback trips it
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["strategy"] == "B"

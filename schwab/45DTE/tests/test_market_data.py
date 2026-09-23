@@ -69,7 +69,7 @@ def test_load_universe_dedupes_and_keeps_broker_spelling(tmp_path):
 
 def test_real_universe_file_has_sp500_plus_etfs():
     universe = mdh.load_universe()
-    assert len(universe) == 503 + 36 and len(set(universe)) == len(universe)
+    assert len(universe) == 503 + 34 and len(set(universe)) == len(universe)
     assert "BRK.B" in universe
     for etf in ("XLE", "XLK", "GLD", "USO", "SPY", "TLT", "EEM"):
         assert etf in universe

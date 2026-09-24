@@ -139,6 +139,52 @@ def test_manage_prices_both_positions_from_one_chain_and_records_per_strategy(bo
 
 # ------------------------------------------------------------ strategy A entry policy
 
+def test_day_gate_blocks_a_when_session_reads_choppy(bot, caplog, monkeypatch):
+    from conftest import make_candles
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {**config.A_BASE_TUNING, "DAY_GATE_ENABLED": True,
+                                                               "DAY_GATE_MIN_ER": 0.5, "DAY_GATE_MIN_CANDLES": 2},
+                                                             "B": {}})
+    choppy = [(7600, 7601, 7599, 7600.2), (7600.2, 7601, 7599, 7599.8), (7599.8, 7601, 7599, 7600.2),
+              (7600.2, 7601, 7599, 7599.8), (7599.8, 7601, 7599, 7600.1)]
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: make_candles(et(9, 30), choppy, minutes=2))
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"B"}   # B is unaffected by A's gate
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ORB BULLISH at 10:15")][0]
+    assert "A: skip: DAY_GATE ER=" in line and "(choppy)" in line and "B: sell 7565P" in line
+
+
+def test_day_gate_allows_a_when_session_reads_trending(bot, monkeypatch):
+    from conftest import make_candles
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {**config.A_BASE_TUNING, "DAY_GATE_ENABLED": True,
+                                                               "DAY_GATE_MIN_ER": 0.5, "DAY_GATE_MIN_CANDLES": 2},
+                                                             "B": {}})
+    trending = [(7600, 7601, 7599.9, 7600.5), (7600.5, 7601.5, 7600.4, 7601.0),
+                (7601.0, 7602.0, 7600.9, 7601.5), (7601.5, 7602.5, 7601.4, 7602.0)]
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: make_candles(et(9, 30), trending, minutes=2))
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}
+
+
+def test_day_gate_blocks_a_before_enough_candles_exist(bot, caplog, monkeypatch):
+    from conftest import make_candles
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "EXIT_TUNING_BY_STRATEGY", {"A": {**config.A_BASE_TUNING, "DAY_GATE_ENABLED": True,
+                                                               "DAY_GATE_MIN_ER": 0.1, "DAY_GATE_MIN_CANDLES": 5},
+                                                             "B": {}})
+    trending = [(7600, 7601, 7599.9, 7600.5), (7600.5, 7601.5, 7600.4, 7601.0)]   # only 2 candles, needs 5
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: make_candles(et(9, 30), trending, minutes=2))
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"B"}
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ORB BULLISH at 10:15")][0]
+    assert "A: skip: DAY_GATE not enough session data yet (2 candle(s))" in line
+
+
+def test_day_gate_off_by_default_for_both_strategies(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}   # no monkeypatch: DAY_GATE_ENABLED defaults False everywhere
+
+
 def test_a_takes_both_orb_entry_kinds(bot):
     bot.enter(et(10, 15), "ORB", BULLISH, kind="MOMENTUM")
     assert set(bot.pm.positions) == {"A", "B"}

@@ -460,6 +460,11 @@ class Bot:
         width = strategy.width_for_tier(tier(equity))
         right = strategy.direction_to_spread(direction)
         em = self.expected_move(spot)
+        day_er, day_er_n = None, 0
+        if any(strategy.exit_setting(s, "DAY_GATE_ENABLED", False) for s in (strategies or config.STRATEGIES)):
+            session_candles = market_data.get_candles(config.SPX_SYMBOL, "2m", config.CANDLE_LOOKBACK_MIN, now)
+            session_candles = session_candles[session_candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
+            day_er, day_er_n = strategy.efficiency_ratio(session_candles)
         short_a, long_a = strategy.select_strikes(spot, right, width)
         lo, hi = min(short_a, long_a), max(short_a, long_a)
         # A may walk up to A_MAX_STRIKE_WALK strikes toward spot.
@@ -474,7 +479,7 @@ class Bot:
         for strat in strategies:
             try:
                 summaries[strat], added = self.enter_leg(strat, now, setup, direction, equity, spot, width,
-                                                         right, chain, em, open_risk, kind)
+                                                         right, chain, em, open_risk, kind, day_er, day_er_n)
             except BrokerError as e:
                 log.error("[%s] broker error during entry: %s", strat, e)
                 self.journal.event("BROKER_ERROR", now, strategy=strat, error=str(e))
@@ -495,8 +500,8 @@ class Bot:
         return em
 
     def enter_leg(self, strat: str, now: datetime, setup: str, direction: str, equity: float, spot: float,
-                  width: int, right: str, chain: list[dict], em: float | None,
-                  open_risk: float, kind: str | None = None) -> tuple[str, float]:
+                  width: int, right: str, chain: list[dict], em: float | None, open_risk: float,
+                  kind: str | None = None, day_er: float | None = None, day_er_n: int = 0) -> tuple[str, float]:
         """Place one strategy's spread. Returns (operator summary, risk dollars added)."""
         if strat in self.pm.positions:
             return "skip: position open", 0.0
@@ -505,6 +510,13 @@ class Bot:
         # Any kind-tagged setup (ORB or ON_BREAK -- OVERNIGHT never sets a kind) is gated the same way.
         if kind is not None and kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
             return f"skip: {setup} {kind} entry disabled for {strat}", 0.0
+        if strategy.exit_setting(strat, "DAY_GATE_ENABLED", False):
+            min_candles = strategy.exit_setting(strat, "DAY_GATE_MIN_CANDLES", 5)
+            if day_er_n < min_candles:
+                return f"skip: DAY_GATE not enough session data yet ({day_er_n} candle(s))", 0.0
+            min_er = strategy.exit_setting(strat, "DAY_GATE_MIN_ER", 0.15)
+            if day_er is None or day_er < min_er:
+                return f"skip: DAY_GATE ER={0.0 if day_er is None else day_er:.2f} < {min_er:.2f} (choppy)", 0.0
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup)
         if not allowed:
             return f"skip: {reason}", 0.0

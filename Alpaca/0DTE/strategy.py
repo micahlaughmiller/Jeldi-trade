@@ -351,6 +351,22 @@ def momentum(candles: pd.DataFrame, direction: str, n: int | None = None) -> flo
     return float(_signed_bodies(candles.tail(n), direction).mean())
 
 
+def efficiency_ratio(candles: pd.DataFrame) -> tuple[float | None, int]:
+    """Kaufman efficiency ratio over completed candles: |net move| / total path length, in [0, 1] --
+    near 1 means price traveled in a straight line (trending/efficient), near 0 means it churned back
+    and forth to cover the same net distance (choppy). Returns (ratio, candle_count); ratio is None
+    with fewer than 2 candles or a completely flat path (no movement to measure efficiency over)."""
+    n = 0 if candles is None else len(candles)
+    if candles is None or n < 2:
+        return None, n
+    closes = candles["close"]
+    net = abs(float(closes.iloc[-1]) - float(closes.iloc[0]))
+    path = float(closes.diff().abs().sum())
+    if path <= 0:
+        return None, n
+    return net / path, n
+
+
 def momentum_continuing(candles: pd.DataFrame, direction: str, ratio: float | None = None) -> bool:
     """Last candle body is in the trade direction and at least `ratio` of the previous body."""
     ratio = ratio if ratio is not None else config.MOMENTUM_CONTINUE_RATIO

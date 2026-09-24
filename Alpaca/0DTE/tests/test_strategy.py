@@ -85,6 +85,33 @@ def test_inside_range_is_no_signal():
 ORH, ORL = 7620.0, 7590.0
 
 
+def test_efficiency_ratio_trending_reads_near_1():
+    c = make_candles(et(9, 30), [(100, 101, 99.9, 100.5), (100.5, 101.5, 100.4, 101.0),
+                                 (101.0, 102.0, 100.9, 101.5), (101.5, 102.5, 101.4, 102.0)])
+    er, n = strategy.efficiency_ratio(c)
+    assert n == 4 and er == pytest.approx(1.0)   # each candle a clean 0.5 step in the same direction
+
+
+def test_efficiency_ratio_choppy_reads_low():
+    # closes 100 -> 101 -> 100 -> 101: net move back to the last close's near-start level is small,
+    # while the back-and-forth path covers 3x that distance.
+    c = make_candles(et(9, 30), [(100, 101, 99, 101.0), (101.0, 101.5, 99.5, 100.0),
+                                 (100.0, 101.0, 99, 101.0), (101.0, 101.5, 99.5, 101.0)])
+    er, n = strategy.efficiency_ratio(c)
+    assert n == 4 and er == pytest.approx(0.0)   # last close (101) == first close (101): zero net move
+
+
+def test_efficiency_ratio_needs_at_least_2_candles():
+    assert strategy.efficiency_ratio(make_candles(et(9, 30), [(100, 101, 99, 100.5)])) == (None, 1)
+    assert strategy.efficiency_ratio(make_candles(et(9, 30), [])) == (None, 0)
+    assert strategy.efficiency_ratio(None) == (None, 0)
+
+
+def test_efficiency_ratio_flat_path_is_none():
+    c = make_candles(et(9, 30), [(100, 100, 100, 100), (100, 100, 100, 100)])
+    assert strategy.efficiency_ratio(c) == (None, 2)
+
+
 def feed(setup: OrbSetup, bars: list[tuple[float, float, float, float]]) -> list[str | None]:
     candles = make_candles(et(10, 0), bars, minutes=5)
     return [setup.update(candles.iloc[i]) for i in range(len(candles))]

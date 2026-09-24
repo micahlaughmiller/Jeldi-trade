@@ -162,6 +162,18 @@ MOMENTUM_CONFIRM_TIMEOUT_MIN = 5
 # re-enters on a fixed cadence and only while price is still actually confirming continuation.
 REENTRY_ON_CONTINUATION_ENABLED = False
 REENTRY_PAUSE_MIN = 5
+
+# Day-type/regime gate: before a strategy with DAY_GATE_ENABLED takes ANY entry, the session's own
+# Kaufman efficiency ratio (net move / total path length on 2-min SPX candles since 09:30, recomputed
+# fresh at every entry attempt, not just once at the open) must clear DAY_GATE_MIN_ER, with at least
+# DAY_GATE_MIN_CANDLES of session data to trust the reading yet. A choppy/inefficient reading skips
+# that entry entirely -- it never touches the stop, target or any other exit parameter, deliberately:
+# a live regime read feeding into stop width would break the assumption every other strategy relies on
+# that exit_levels(strat) is a fixed pair for the day. Off by default for both strategies; a persona
+# override turns it on for a live test.
+DAY_GATE_ENABLED = False
+DAY_GATE_MIN_ER = 0.15
+DAY_GATE_MIN_CANDLES = 5
 MOMENTUM_CANDLES = 3
 MOMENTUM_CONTINUE_RATIO = 0.80
 MOMENTUM_SLOWDOWN_PCT = 0.20

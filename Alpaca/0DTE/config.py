@@ -194,18 +194,26 @@ NEWS_DAY_MODE = "half_size"
 #             $5-wide arms at +0.10 with a +0.05 floor
 #   method 2  break-even lock: arms at +0.10, floor +0.05, both widths
 #   method 3  5-minute stale timer: no target yet but in profit -> floor at +0.05
-def _a(**extra) -> dict:
-    return {"EXIT_TUNING_BY_STRATEGY": {"A": {**A_BASE_TUNING, **extra}, "B": {}}}
+def _a(momentum_only=False, **extra) -> dict:
+    out = {"EXIT_TUNING_BY_STRATEGY": {"A": {**A_BASE_TUNING, **extra}, "B": {}}}
+    if momentum_only:
+        # 2026-09-24: A's day-type analysis flagged PULLBACK entries as the weaker of the two ORB/
+        # ON_BREAK entry kinds (the one confirmed 2026-09-23 ORB loss was PULLBACK-tagged). Half the
+        # personas drop PULLBACK for strategy A to test that live; B is untouched either way.
+        out["ORB_ENTRY_KINDS_BY_STRATEGY"] = {"A": ("MOMENTUM",), "B": ("MOMENTUM", "PULLBACK")}
+    return out
 
 
 PERSONA_OVERRIDES: dict[str, dict] = {
-    "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $10-wide
+    # momentum-only for A (one persona from each existing floor/timer method, both width tiers)
+    "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
+    "ELENA":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}, momentum_only=True),   # method 2, $10-wide
+    "MARCUS": _a(STALE_TIMER_MIN=5, momentum_only=True),                                          # method 3, $5-wide
+    "SARAH":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $5-wide
+    # both entry kinds for A, unchanged (ASTRA is the pure control: base tuning, both kinds, no floor/timer)
     "DAVID":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $10-wide
-    "SARAH":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $5-wide
-    "ELENA":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),     # method 2, $10-wide
     "JAMES":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),     # method 2, $5-wide
     "JORDAN": _a(STALE_TIMER_MIN=5),                                             # method 3, $10-wide
-    "MARCUS": _a(STALE_TIMER_MIN=5),                                             # method 3, $5-wide
     "CLAUDE": _a(STALE_TIMER_MIN=5),                                             # method 3, $5-wide
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

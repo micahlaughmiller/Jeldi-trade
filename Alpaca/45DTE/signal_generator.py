@@ -56,13 +56,23 @@ def min_credit_for(width: float, strong: bool, config: ModuleType = config_45dte
     return round(base * width / config.SPREAD_WIDTH, 2)
 
 
-def select_strikes(chain: list[dict[str, Any]], right: str,
+def select_strikes(chain: list[dict[str, Any]], right: str, strong: bool = False,
                    config: ModuleType = config_45dte) -> tuple[dict[str, Any] | None, dict[str, Any] | None, float | None, str]:
     """Short = |delta| closest to TARGET_DELTA within [DELTA_MIN, DELTA_MAX]; long one width further OTM.
 
     Widths are tried in SPREAD_WIDTHS order ($5, then $2.50, then $1) and, within a width, the
-    next-best delta strikes, so an illiquid partner strike does not kill the trade. Pairs whose
-    quotes imply a non-positive credit or a zero-bid short leg are skipped as unusable.
+    next-best delta strikes, so an illiquid partner strike does not kill the trade. A width is only
+    accepted once its own scaled credit floor (min_credit_for) is cleared: a pair with real but too-
+    thin credit at a wider width falls through to a narrower one (whose floor scales down with it)
+    instead of stopping there -- 2026-09-24: with the "no pair" case mostly fixed by the width
+    fallback itself, "pair exists but $5-wide credit is below floor" became the dominant rejection
+    (94% of one real session) and this is the case that fix never actually reached, since the old
+    code stopped at the first width with any positive credit before the floor was ever checked.
+    Pairs whose quotes imply a non-positive credit or a zero-bid short leg are always skipped as
+    unusable. If every width's best pair still misses its own floor, the richest such pair is
+    returned anyway (short/long/width all set) so the caller can report full diagnostics on the
+    rejection; `reason` is a placeholder in that case -- the caller re-derives and overwrites it
+    from the returned width's own credit and floor.
     Returns (short, long, width, reason).
     """
     candidates = [
@@ -73,8 +83,14 @@ def select_strikes(chain: list[dict[str, Any]], right: str,
         return None, None, None, f"no strike with |delta| in [{config.DELTA_MIN}, {config.DELTA_MAX}]"
     candidates.sort(key=lambda q: abs(abs(q["delta"]) - config.TARGET_DELTA))
     saw_pair = False
+    fallback: tuple[dict[str, Any], dict[str, Any], float] | None = None   # richest below-floor pair seen
     for width in config.SPREAD_WIDTHS:
         offset = -width if right == "P" else width
+        floor = min_credit_for(width, strong, config)
+        # Next-best delta is only for a missing or junk partner at this width (old behavior,
+        # unchanged) -- once a real pair is found for this width, it is this width's answer; a floor
+        # miss moves to the next (narrower) width, it does not go hunting for a richer delta here.
+        chosen = None
         for short in candidates:
             long = _find_strike(chain, short["strike"] + offset)
             if long is None:
@@ -82,8 +98,20 @@ def select_strikes(chain: list[dict[str, Any]], right: str,
             saw_pair = True
             if short["bid"] <= 0 or short["mid"] - long["mid"] <= 0:
                 continue
+            chosen = (short, long)
+            break
+        if chosen is None:
+            continue
+        short, long = chosen
+        credit = round_down_to_nickel(short["mid"] - long["mid"])
+        if credit + 1e-9 >= floor:
             return short, long, width, "ok"
+        if fallback is None or credit > round_down_to_nickel(fallback[0]["mid"] - fallback[1]["mid"]):
+            fallback = (short, long, width)
     widths = "/".join(f"${w:g}" for w in config.SPREAD_WIDTHS)
+    if fallback is not None:
+        short, long, width = fallback
+        return short, long, width, f"best of {widths} still below its own width's credit floor"
     if saw_pair:
         return None, None, None, f"no usable quotes for any {widths}-wide pair (zero bid or credit <= 0)"
     return None, None, None, f"no {widths}-wide pair"
@@ -113,7 +141,7 @@ def build_trade(broker: Any, row: dict[str, Any], today: date | None = None,
     if not chain:
         spec["reason"] = "empty option chain"
         return spec
-    short, long, width, why = select_strikes(chain, right, config)
+    short, long, width, why = select_strikes(chain, right, strong, config)
     if short is None or long is None or width is None:
         spec["reason"] = why
         return spec

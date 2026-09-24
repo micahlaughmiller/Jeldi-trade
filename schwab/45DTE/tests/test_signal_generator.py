@@ -110,6 +110,27 @@ class TestBuildTrade:
         assert (spec["short_strike"], spec["long_strike"], spec["width"]) == (95.0, 92.5, 2.5)
         assert spec["credit"] == 1.00 and spec["min_credit"] == 0.75 and spec["max_loss"] == 1.50
 
+    def test_falls_back_to_narrower_width_when_wider_credit_is_real_but_too_thin(self):
+        # 2026-09-24 fix: the $5-wide pair (95/90) is real and positive (credit 1.20) but misses its
+        # own $1.50 floor -- unlike the "no pair at $5" tests above, this used to stop right here and
+        # reject, even though the $2.5-wide pair (95/92.5, credit 0.80) clears ITS smaller ($0.75)
+        # floor. On a real session this was 94% of one day's rejections.
+        strikes = {95: (-0.30, 3.60, 3.80), 92.5: (-0.25, 2.80, 3.00), 90: (-0.22, 2.40, 2.60)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is True
+        assert (spec["short_strike"], spec["long_strike"], spec["width"]) == (95.0, 92.5, 2.5)
+        assert spec["credit"] == 0.80 and spec["min_credit"] == 0.75 and spec["max_loss"] == 1.70
+
+    def test_walks_all_the_way_to_1_wide_when_both_wider_credits_are_too_thin(self):
+        strikes = {95: (-0.30, 3.60, 3.80), 94: (-0.27, 3.30, 3.50), 92.5: (-0.25, 3.10, 3.30),
+                  90: (-0.22, 2.90, 3.10)}
+        b = broker_with([days(52)], strikes=strikes)
+        spec = sg.build_trade(b, row(), TODAY)
+        assert spec["accepted"] is True
+        assert (spec["short_strike"], spec["long_strike"], spec["width"]) == (95.0, 94.0, 1.0)
+        assert spec["credit"] == 0.30 and spec["min_credit"] == 0.30
+
     def test_falls_back_to_1_width_with_scaled_credit_floor(self):
         strikes = {95: (-0.30, 3.60, 3.80), 94: (-0.27, 3.20, 3.40)}
         b = broker_with([days(52)], strikes=strikes)

@@ -247,9 +247,16 @@ PERSONA_OVERRIDES: dict[str, dict] = {
     "MARCUS": _a(STALE_TIMER_MIN=5, momentum_only=True),                                          # method 3, $5-wide
     "SARAH":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $5-wide
     # both entry kinds for A, unchanged (ASTRA is the pure control: base tuning, both kinds, no floor/timer)
-    "DAVID":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}),     # method 1, $10-wide
     "JAMES":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),     # method 2, $5-wide
-    "JORDAN": _a(STALE_TIMER_MIN=5),                                             # method 3, $10-wide
     "CLAUDE": _a(STALE_TIMER_MIN=5),                                             # method 3, $5-wide
+    # 2026-09-24: 4-day factorial backtest sweep (144 combos) found the day-type gate (Kaufman ER >=
+    # 0.15, entry-only) was the single differentiator in every net-positive result -- it would have
+    # blocked exactly one A entry (09/24 12:25, ER read 0.13 vs 0.46 at the day's first signal) and
+    # that one skip is the entire swing from the committed build's backtested loss to a backtested
+    # gain. Testing it live on two personas, layered on top of their existing floor/timer method
+    # rather than isolated, since floor/timer is already a validated axis and the gate only touches
+    # entry (never exit), so the two effects can't interact.
+    "DAVID":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, DAY_GATE_ENABLED=True),  # method 1, $10-wide + day-gate
+    "JORDAN": _a(STALE_TIMER_MIN=5, DAY_GATE_ENABLED=True),                                          # method 3, $10-wide + day-gate
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

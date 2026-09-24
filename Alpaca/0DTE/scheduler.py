@@ -208,13 +208,13 @@ class Bot:
 
     # --------------------------------------------------------------- signals
 
-    def entry_possible(self, equity: float) -> bool:
+    def entry_possible(self, equity: float, setup: str | None = None) -> bool:
         reasons = []
         for strat in config.STRATEGIES:
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
                 continue
-            allowed, reason = self.risk.trading_allowed(strat, equity, now_et())
+            allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup)
             if allowed:
                 return True
             reasons.append(reason)
@@ -322,7 +322,7 @@ class Bot:
 
     def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None) -> None:
         equity = self.broker.get_account()["equity"]
-        if not self.entry_possible(equity):
+        if not self.entry_possible(equity, setup):
             return
         if self.today not in self.broker.get_expirations(config.UNDERLYING, 0, 1):
             log.warning("No SPXW expiration for today %s: no trade.", self.today)
@@ -374,7 +374,7 @@ class Bot:
             return f"skip: {setup} setup disabled for {strat}", 0.0
         if setup == "ORB" and kind is not None and kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
             return f"skip: ORB {kind} entry disabled for {strat}", 0.0
-        allowed, reason = self.risk.trading_allowed(strat, equity, now)
+        allowed, reason = self.risk.trading_allowed(strat, equity, now, setup)
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":

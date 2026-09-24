@@ -39,6 +39,7 @@ class OpenSpread:
     realized_pnl: float = 0.0
     entry_mid: float | None = None   # quote mid when the entry was placed (fill quality)
     floor_price: float | None = None  # hard profit-floor exit (spread price), set by the floor/stale rules
+    stop_streak: int = 0              # consecutive ticks at/above the stop (STOP_CONFIRM_TICKS)
 
     @property
     def remaining(self) -> int:
@@ -206,8 +207,15 @@ class PositionManager:
             return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)
         if p.runner:
             return self._runner_tick(p, now, spread_price, candles)
+        confirm = strategy.exit_setting(p.strategy, "STOP_CONFIRM_TICKS", 1)
         if spread_price >= p.stop_price:
-            return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+            p.stop_streak += 1
+            if p.stop_streak >= confirm:
+                return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+            log.info("[%s] STOP_LOSS candidate tick %d/%d at %.2f (stop %.2f): holding for confirmation",
+                     p.strategy, p.stop_streak, confirm, spread_price, p.stop_price)
+            return []
+        p.stop_streak = 0
         if spread_price <= p.target_price:
             fraction = config.RUNNER_CLOSE_FRACTION_BY_STRATEGY.get(p.strategy, 0.5)
             book = int(p.remaining * fraction)

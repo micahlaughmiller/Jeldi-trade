@@ -125,7 +125,12 @@ SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("OVERNIGHT", "ORB")}
 ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}
 
 PROFIT_TARGET = 0.30
-STOP_LOSS = 0.55
+STOP_LOSS = 0.60
+# Ticks the spread price must sit at/above the stop before it actually closes (default 1 = immediate,
+# today's behavior everywhere). 2026-09-23: five personas hit an identical ON_BREAK entry; two were
+# stopped out within the same minute by what looks like a single noisy print, while the other three
+# rode the same move to a runner win. A requires 2 consecutive ticks (~30s) to confirm a stop.
+STOP_CONFIRM_TICKS = 1
 B_PROFIT_TARGET = 0.30
 B_STOP_LOSS = 0.50
 RUNNER_ENABLED = True
@@ -139,7 +144,10 @@ TRAIL_AMOUNT = 0.50
 # pullback is caught closer to +0.30 instead of riding the flat $0.50 trail all the way down (2026-09-23:
 # a runner gave back $0.80 before the wider trail + escalating-limit fill caught it). Off by default;
 # strategy A turns it on via EXIT_TUNING_BY_STRATEGY (RUNNER_TIGHTEN_ENABLED).
-RUNNER_DEEP_PROFIT = 2.00
+# 2026-09-23: today's A runners peaked between $1.35 and $2.05 before pulling back -- all below the old
+# $2.00 threshold, so the flat $0.50 trail (plus close-order slippage) gave back up to $0.67. Lowered to
+# $1.00 so the tighter trail engages on runners like today's instead of only on very deep ones.
+RUNNER_DEEP_PROFIT = 1.00
 RUNNER_DEEP_TRAIL = 0.30
 RUNNER_TIGHTEN_ENABLED = False
 MOMENTUM_CANDLES = 3
@@ -170,7 +178,8 @@ STALE_TIMER_MIN = None
 STALE_FLOOR = 0.05
 
 A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
-                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True}
+                 "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True,
+                 "STOP_CONFIRM_TICKS": 2}
 EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": {}}
 
 ENTRY_STEP_SEC = 20

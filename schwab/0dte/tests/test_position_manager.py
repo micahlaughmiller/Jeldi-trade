@@ -67,11 +67,13 @@ def tick(pm: PositionManager, when, price: float, candles, strat: str = "A") -> 
 
 def test_stop_hit_closes_all(pm, broker, journal):
     open_put_spread(pm, broker, qty=2)
-    broker.spread_close_price = 3.60
-    assert tick(pm, et(10, 2), 3.54, rising()) == []
-    fills = tick(pm, et(10, 4), 3.55, rising())
+    assert tick(pm, et(10, 2), 3.50, rising()) == []          # below the 0.60 stop
+    assert tick(pm, et(10, 4), 3.60, rising()) == []          # 1st confirming print at the stop: held
+    assert pm.positions["A"].stop_streak == 1
+    broker.spread_close_price = 3.65
+    fills = tick(pm, et(10, 6), 3.62, rising())               # 2nd confirming print: closes
     assert len(fills) == 1 and fills[0]["exit_reason"] == "STOP_LOSS"
-    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-120.0)
+    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-130.0)
     assert fills[0]["position_closed"] is True and fills[0]["strategy"] == "A"
     assert pm.positions == {}
     assert spxw_legs(broker.get_positions()) == []
@@ -166,10 +168,11 @@ def test_b_keeps_shared_lock_gate_and_slowdown(pm, broker):
 def test_exit_row_records_trigger_and_slippage(pm, broker):
     spread = open_put_spread(pm, broker, qty=1)
     spread.entry_mid = 3.05
-    broker.spread_close_price = 3.60
-    fills = tick(pm, et(10, 2), 3.56, rising())
+    assert tick(pm, et(10, 2), 3.60, rising()) == []       # 1st confirming print at the stop: held
+    broker.spread_close_price = 3.65
+    fills = tick(pm, et(10, 4), 3.61, rising())            # 2nd confirming print: closes
     row = fills[0]
-    assert row["trigger_price"] == 3.56 and row["exit_price"] == 3.60
+    assert row["trigger_price"] == 3.61 and row["exit_price"] == 3.65
     assert row["exit_slippage"] == pytest.approx(0.04)
     assert row["entry_mid"] == 3.05 and row["entry_slippage"] == pytest.approx(0.05)
 
@@ -199,14 +202,15 @@ def test_target_with_momentum_enters_runner_then_trails_out(pm, broker, journal,
     runner_events = events(journal, "RUNNER_START")
     assert len(runner_events) == 1 and runner_events[0]["strategy"] == "A"
 
-    assert tick(pm, et(10, 4), 2.00, rising()) == []
-    assert p.runner_best == 2.00
-    assert tick(pm, et(10, 6), 2.45, rising()) == []
-    broker.spread_close_price = 2.50
-    fills = tick(pm, et(10, 8), 2.50, rising())
+    # kept above the $1.00 deep-profit line (runner_best 2.10 -> profit 0.90) so the flat $0.50 trail applies
+    assert tick(pm, et(10, 4), 2.10, rising()) == []
+    assert p.runner_best == 2.10
+    assert tick(pm, et(10, 6), 2.55, rising()) == []
+    broker.spread_close_price = 2.60
+    fills = tick(pm, et(10, 8), 2.60, rising())
     assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["qty"] == 2
-    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(100.0)
-    assert fills[0]["position_pnl"] == pytest.approx(130.0)
+    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(80.0)
+    assert fills[0]["position_pnl"] == pytest.approx(110.0)
     assert pm.positions == {} and broker.get_positions() == []
 
 
@@ -250,9 +254,10 @@ def test_runner_disabled_closes_all(pm, broker, monkeypatch):
 
 def test_close_retries_after_broker_error(pm, broker, journal):
     open_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 3.60, rising()) == []       # 1st confirming print: held
     broker.close_failures = 1
-    broker.spread_close_price = 3.60
-    fills = tick(pm, et(10, 2), 3.56, rising())
+    broker.spread_close_price = 3.65
+    fills = tick(pm, et(10, 4), 3.61, rising())            # 2nd confirming print: closes (after 1 retry)
     assert len(fills) == 1 and pm.positions == {}
     assert len(broker.close_calls) == 2
     failed = events(journal, "CLOSE_FAILED")
@@ -262,8 +267,9 @@ def test_close_retries_after_broker_error(pm, broker, journal):
 def test_close_gives_up_after_max_retries(pm, broker, journal, monkeypatch):
     monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 2)
     open_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 3.60, rising()) == []       # 1st confirming print: held
     broker.close_failures = 5
-    fills = tick(pm, et(10, 2), 3.56, rising())
+    fills = tick(pm, et(10, 4), 3.61, rising())            # 2nd confirming print: attempts close, exhausts retries
     assert fills == [] and "A" in pm.positions
     assert len(broker.close_calls) == 2
     assert len(events(journal, "CLOSE_FAILED")) == 2
@@ -281,12 +287,13 @@ def test_force_close(pm, broker):
 # -------------------------------------------------------- two strategies at once
 
 def test_a_stops_out_while_b_keeps_running(pm, broker):
-    open_put_spread(pm, broker, qty=2)          # A: entry 3.00, stop 3.55
+    open_put_spread(pm, broker, qty=2)          # A: entry 3.00, stop 3.60 (2 confirming ticks)
     open_b_put_spread(pm, broker, qty=1)        # B: entry 1.00, stop 1.50
     assert set(pm.positions) == {"A", "B"}
     assert pm.total_open_risk() == pytest.approx(2 * 200.0 + 400.0)
-    broker.spread_close_price = 3.60
-    fills = pm.on_tick(et(10, 4), {"A": 3.56, "B": 1.20}, rising())
+    assert pm.on_tick(et(10, 2), {"A": 3.60, "B": 1.20}, rising()) == []   # A's 1st confirming print
+    broker.spread_close_price = 3.65
+    fills = pm.on_tick(et(10, 4), {"A": 3.61, "B": 1.20}, rising())        # A's 2nd confirming print
     assert [f["strategy"] for f in fills] == ["A"] and fills[0]["exit_reason"] == "STOP_LOSS"
     assert set(pm.positions) == {"B"}
     b = pm.positions["B"]
@@ -297,7 +304,7 @@ def test_a_stops_out_while_b_keeps_running(pm, broker):
 def test_b_hits_its_own_wider_stop_a_unaffected(pm, broker):
     open_put_spread(pm, broker, qty=1)
     open_b_put_spread(pm, broker, qty=1)
-    # B stops at +0.50 (1.50) while A, at +0.10, is nowhere near its 0.55 stop
+    # B stops at +0.50 (1.50) while A, at +0.10, is nowhere near its 0.60 stop
     assert pm.on_tick(et(10, 2), {"A": 3.10, "B": 1.45}, rising()) == []
     broker.spread_close_price = 1.55
     fills = pm.on_tick(et(10, 4), {"A": 3.10, "B": 1.50}, rising())
@@ -316,8 +323,9 @@ def test_b_target_uses_its_own_profit_target(pm, broker):
 def test_missing_price_skips_that_position_only(pm, broker):
     open_put_spread(pm, broker, qty=1)
     open_b_put_spread(pm, broker, qty=1)
-    broker.spread_close_price = 3.60
-    fills = pm.on_tick(et(10, 2), {"A": 3.56}, rising())
+    assert pm.on_tick(et(10, 2), {"A": 3.60}, rising()) == []   # A's 1st confirming print
+    broker.spread_close_price = 3.65
+    fills = pm.on_tick(et(10, 4), {"A": 3.61}, rising())        # A's 2nd confirming print: closes
     assert [f["strategy"] for f in fills] == ["A"]
     assert pm.positions["B"].current_price == 1.00
 
@@ -514,7 +522,7 @@ def test_profit_floor_width_10_uses_its_own_step(pm, broker, monkeypatch):
     broker.add_spread_position("P", 7515.0, 7505.0, 1, 11.0, 5.0)
     pm.open(OpenSpread(strategy="A", direction=BULLISH, setup="ORB", right="P", root="SPXW", expiration=TODAY,
                        short_strike=7515.0, long_strike=7505.0, width=10, qty=1, entry_credit=6.00,
-                       entry_time=et(10, 0), current_price=6.0, best_price=6.0, profit_target=0.30, stop_loss=0.55))
+                       entry_time=et(10, 0), current_price=6.0, best_price=6.0, profit_target=0.30, stop_loss=0.60))
     assert tick(pm, et(10, 2), 5.85, rising()) == []         # +0.15: below the $10 arm of 0.20
     assert pm.positions["A"].floor_price is None
     assert tick(pm, et(10, 4), 5.80, rising()) == []         # +0.20 arms -> floor at 5.85
@@ -606,3 +614,46 @@ def test_b_runner_trail_never_tightens(pm, broker):
     assert tick(pm, et(10, 6), 1.29, rising(), strat="B") == []    # +0.49 giveback: still under B's flat 0.50 trail
     fills = tick(pm, et(10, 8), 1.30, rising(), strat="B")         # +0.50 giveback trips it
     assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["strategy"] == "B"
+
+
+# ------------------------------------------------------------ stop confirmation (A: 2 ticks; B: 1, unchanged)
+
+def test_a_stop_needs_two_confirming_ticks(pm, broker, journal):
+    open_put_spread(pm, broker, qty=2, credit=6.00)          # A stop at 6.60 (config.STOP_LOSS = 0.60)
+    assert tick(pm, et(10, 2), 6.60, rising()) == []         # 1st print at the stop: held, not confirmed
+    assert pm.positions["A"].stop_streak == 1
+    broker.spread_close_price = 6.65
+    fills = tick(pm, et(10, 4), 6.62, rising())              # 2nd consecutive print: confirmed, closes
+    assert fills[0]["exit_reason"] == "STOP_LOSS" and pm.positions == {}
+    assert events(journal, "EXIT")[0]["qty"] == 2
+
+
+def test_a_stop_streak_resets_if_price_recovers(pm, broker):
+    open_put_spread(pm, broker, qty=2, credit=6.00)
+    assert tick(pm, et(10, 2), 6.60, rising()) == []         # 1st print at the stop
+    assert pm.positions["A"].stop_streak == 1
+    assert tick(pm, et(10, 4), 6.40, rising()) == []         # pulls back below the stop: streak resets
+    assert pm.positions["A"].stop_streak == 0
+    assert tick(pm, et(10, 6), 6.60, rising()) == []         # back at the stop: this is a fresh 1st print
+    assert pm.positions["A"].stop_streak == 1
+    assert "A" in pm.positions
+
+
+def test_b_stop_is_still_immediate(pm, broker):
+    open_b_put_spread(pm, broker, qty=2, credit=1.00)        # B stop at 1.50
+    broker.spread_close_price = 1.52
+    fills = tick(pm, et(10, 2), 1.50, rising(), strat="B")   # single print: B has no confirm-ticks override
+    assert fills[0]["exit_reason"] == "STOP_LOSS" and fills[0]["strategy"] == "B"
+
+
+# ------------------------------------------------------------ tighter deep-runner trail (threshold lowered to $1.00)
+
+def test_a_runner_trail_tightens_past_1_deep_profit(pm, broker):
+    open_put_spread(pm, broker, qty=2, credit=6.00)
+    assert tick(pm, et(10, 2), 5.70, rising()) == []          # target -> runner, best 5.70
+    assert tick(pm, et(10, 4), 4.90, rising()) == []          # best 4.90: profit 1.10, past the new $1.00 threshold
+    p = pm.positions["A"]
+    assert p.runner_best == 4.90
+    broker.spread_close_price = 5.21
+    fills = tick(pm, et(10, 6), 5.20, rising())               # +0.30 giveback trips the now-active tight trail
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and pm.positions == {}

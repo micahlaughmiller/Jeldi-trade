@@ -48,6 +48,7 @@ class StrategyState:
     realized_pnl: float = 0.0
     closed_trades: list[dict] = field(default_factory=list)
     last_exit: str | None = None
+    last_exit_setup: str | None = None
 
     def record(self, pnl: float, row: dict | None) -> None:
         self.trades_today += 1
@@ -57,6 +58,7 @@ class StrategyState:
             self.closed_trades.append(row)
             if row.get("exit_time") is not None:
                 self.last_exit = _exit_key(row)
+                self.last_exit_setup = row.get("setup")
 
 
 def _fresh_strategies() -> dict[str, StrategyState]:
@@ -109,14 +111,19 @@ class RiskManager:
         return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
     def trading_allowed(self, strat: str, equity: float | None = None,
-                        now: datetime | None = None) -> tuple[bool, str]:
+                        now: datetime | None = None, setup: str | None = None) -> tuple[bool, str]:
+        """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
+        the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
+        different ORB signal that represented the morning's move continuing into the day) -- if either the
+        candidate setup or the last exit's setup is unknown, the cool-down still applies (conservative)."""
         s = self.state.for_strategy(strat)
         if s.trades_today >= limit(strat, "MAX_TRADES_PER_DAY"):
             return False, f"{strat}: MAX_TRADES_PER_DAY ({s.trades_today})"
         if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
         cooldown = limit(strat, "COOLDOWN_MIN", 0)
-        if cooldown and now is not None and s.last_exit:
+        same_setup = setup is None or s.last_exit_setup is None or setup == s.last_exit_setup
+        if cooldown and now is not None and s.last_exit and same_setup:
             until = datetime.fromisoformat(s.last_exit) + timedelta(minutes=cooldown)
             if now < until:
                 return False, f"{strat}: COOLDOWN until {until.astimezone(config.ET).strftime('%H:%M')}"

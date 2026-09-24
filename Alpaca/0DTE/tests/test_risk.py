@@ -80,6 +80,8 @@ def test_win_resets_consecutive_losses():
 
 def test_a_limits_are_tighter_than_b():
     assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (5, 5, 30)
+    from strategy import exit_setting
+    assert exit_setting("A", "STOP_CONFIRM_TICKS", 1) == 2 and exit_setting("B", "STOP_CONFIRM_TICKS", 1) == 1
     assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (20, 5, 0)
     rm = RiskManager(10_000)
     for _ in range(5):
@@ -149,3 +151,24 @@ def test_day_state_roundtrip():
     restored = DayState.from_dict(rm.state.to_dict())
     assert restored == rm.state
     assert restored.for_strategy("B").realized_pnl == pytest.approx(25.0)
+
+
+def test_cooldown_skips_when_the_setup_differs():
+    rm = RiskManager(10_000)
+    rm.record_trade("A", -50.0, {"strategy": "A", "pnl": -50.0, "exit_time": et(10, 30), "setup": "ON_BREAK"})
+    # a different setup within the cool-down window is allowed
+    assert rm.trading_allowed("A", now=et(10, 45), setup="ORB") == (True, "OK")
+    # the SAME setup is still blocked
+    ok, reason = rm.trading_allowed("A", now=et(10, 45), setup="ON_BREAK")
+    assert ok is False and reason == "A: COOLDOWN until 11:00"
+    # unknown setup on either side stays conservative (cool-down still applies)
+    assert rm.trading_allowed("A", now=et(10, 45))[0] is False
+    ok, reason = rm.trading_allowed("A", now=et(10, 45), setup=None)
+    assert ok is False
+
+
+def test_cooldown_setup_survives_state_roundtrip():
+    rm = RiskManager(10_000)
+    rm.record_trade("A", -50.0, {"strategy": "A", "pnl": -50.0, "exit_time": et(10, 30), "setup": "ON_BREAK"})
+    restored = DayState.from_dict(rm.state.to_dict())
+    assert restored.for_strategy("A").last_exit_setup == "ON_BREAK"

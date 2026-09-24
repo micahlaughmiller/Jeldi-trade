@@ -67,7 +67,7 @@ def test_signal_opens_a_then_b(bot, caplog):
     bot.enter(et(10, 15), "ORB", BULLISH)
     a, b = bot.pm.positions["A"], bot.pm.positions["B"]
     assert (a.short_strike, a.long_strike, a.qty, a.entry_credit) == (7610.0, 7605.0, 2, 3.00)
-    assert (a.profit_target, a.stop_loss) == (0.30, 0.55)
+    assert (a.profit_target, a.stop_loss) == (0.30, 0.60)
     assert (b.short_strike, b.long_strike, b.entry_credit) == (7565.0, 7560.0, 0.90)
     assert (b.profit_target, b.stop_loss) == (0.30, 0.50)
     # B sized against A's just-placed risk: A = 2 x $200 = $400 open; B max loss $410 -> 5% of 10k -> 1
@@ -126,8 +126,9 @@ def test_manage_prices_both_positions_from_one_chain_and_records_per_strategy(bo
     calls_before = len(bot.broker.close_calls)
     prices = bot.spread_prices()
     assert prices == {"A": 3.00, "B": 0.90}
-    bot.broker.spread_close_price = 3.60
-    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.60, "B": 0.95}, None))
+    assert bot.pm.on_tick(et(10, 20), {"A": 3.60, "B": 0.95}, None) == []   # A's 1st confirming print
+    bot.broker.spread_close_price = 3.65
+    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.61, "B": 0.95}, None))
     assert set(bot.pm.positions) == {"B"}
     assert len(bot.broker.close_calls) == calls_before + 1
     s = bot.risk.state
@@ -167,8 +168,9 @@ def test_a_skips_the_overnight_setup_b_trades_it(bot, caplog):
 def test_a_cooldown_blocks_reentry_after_its_exit(bot, caplog):
     caplog.set_level("INFO")
     bot.enter(et(10, 15), "ORB", BULLISH)
-    bot.broker.spread_close_price = 3.60
-    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.60}, None))       # A stopped out at 10:30
+    bot.pm.on_tick(et(10, 28), {"A": 3.60}, None)                          # A's 1st confirming print
+    bot.broker.spread_close_price = 3.65
+    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.61}, None))       # A stopped out at 10:30
     assert set(bot.pm.positions) == {"B"}
     bot.pm.positions.pop("B")
     bot.enter(et(10, 45), "ORB", BULLISH)
@@ -178,6 +180,20 @@ def test_a_cooldown_blocks_reentry_after_its_exit(bot, caplog):
     bot.pm.positions.pop("B")
     bot.enter(et(11, 5), "ORB", BULLISH)
     assert set(bot.pm.positions) == {"A", "B"}
+
+
+def test_a_cooldown_does_not_block_a_different_setup(bot, caplog):
+    caplog.set_level("INFO")
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.pm.on_tick(et(10, 28), {"A": 3.60}, None)                        # A's 1st confirming print
+    bot.broker.spread_close_price = 3.65
+    bot.record_fills(bot.pm.on_tick(et(10, 30), {"A": 3.61}, None))     # A stopped out of an ORB position at 10:30
+    assert set(bot.pm.positions) == {"B"}
+    bot.pm.positions.pop("B")
+    bot.enter(et(10, 45), "ON_BREAK", BULLISH)                          # a DIFFERENT setup, still inside the cool-down
+    assert set(bot.pm.positions) == {"A"}      # B doesn't trade ON_BREAK at all; A is the one being tested here
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK")]
+    assert line and "A: sell" in line[0] and "COOLDOWN" not in line[0]
 
 
 def test_entry_records_quote_mid_for_fill_quality(bot):

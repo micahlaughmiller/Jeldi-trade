@@ -211,7 +211,7 @@ def test_width_and_credit_range():
 
 
 def test_exit_levels_per_strategy():
-    assert strategy.exit_levels("A") == (0.30, 0.55)
+    assert strategy.exit_levels("A") == (0.30, 0.60)
     assert strategy.exit_levels("B") == (0.30, 0.50)
 
 

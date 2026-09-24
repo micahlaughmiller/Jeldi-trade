@@ -1,7 +1,7 @@
 """Entry flow of the Bot with a FakeBroker: one signal opens A and B independently."""
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -237,7 +237,9 @@ def test_signal_handlers_route_to_keyboard_interrupt():
 
 # ------------------------------------------------------------ ON_BREAK: overnight levels through the ORB state machine
 
-def test_on_break_momentum_entry_trades_both_strategies(bot, caplog):
+def test_on_break_momentum_entry_delays_a_enters_b_immediately(bot, caplog):
+    # 2026-09-24: A has MOMENTUM_CONFIRM_ENABLED by default (B does not) -- B trades the signal right
+    # away, A waits for 1-minute follow-through instead of entering on the bare break-close margin.
     from conftest import make_candles
     from strategy import Levels
     caplog.set_level("INFO")
@@ -246,15 +248,83 @@ def test_on_break_momentum_entry_trades_both_strategies(bot, caplog):
     bars = [(7615, 7625, 7614, 7624),      # 09:30 break: closes above 7620
             (7624, 7630, 7621, 7628)]      # 09:32 holds and closes above the break close -> momentum
     bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
-    assert set(bot.pm.positions) == {"A", "B"}
-    assert bot.pm.positions["A"].setup == "ON_BREAK" and bot.pm.positions["B"].setup == "ON_BREAK"
+    assert set(bot.pm.positions) == {"B"}
+    assert bot.pm.positions["B"].setup == "ON_BREAK"
     sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]
     assert sig and sig[0]["trigger"] == "MOMENTUM" and sig[0]["direction"] == BULLISH
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK BULLISH at 09:34")][0]
-    assert "A: sell" in line and "B: sell 7565P" in line
-    # the same candles again do not re-fire
+    assert "B: sell 7565P" in line
+    assert "ON_BREAK" in bot.pending_momentum
+    p = bot.pending_momentum["ON_BREAK"]
+    assert (p.direction, p.strategies, p.break_close) == (BULLISH, ("A",), 7624.0)
+    pend = events(bot, "MOMENTUM_PENDING")
+    assert pend and pend[0]["strategies"] == ["A"] and pend[0]["break_close"] == 7624.0
+    # the same candles again do not re-fire the underlying ORB state machine
     bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
     assert len([r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]) == 1
+
+
+def test_momentum_confirmation_succeeds_after_two_beating_1m_candles(bot, caplog, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    caplog.set_level("INFO")
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert "A" not in bot.pm.positions
+    m1 = make_candles(et(9, 35), [(7628, 7629, 7627.5, 7628.6), (7628.6, 7630, 7628, 7629.2)], minutes=1)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
+    bot.check_pending_momentum(et(9, 37), scheduler.Phase.OVERNIGHT_ONLY)
+    assert "ON_BREAK" not in bot.pending_momentum
+    assert "A" in bot.pm.positions and bot.pm.positions["A"].setup == "ON_BREAK"
+    assert events(bot, "MOMENTUM_CONFIRMED")[0]["strategies"] == ["A"]
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ON_BREAK] MOMENTUM confirmed")]
+    assert line
+
+
+def test_momentum_confirmation_aborts_on_a_reversing_candle(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    m1 = make_candles(et(9, 34), [(7628, 7629, 7627.5, 7628.6), (7628.6, 7627, 7620, 7621.0)], minutes=1)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
+    bot.check_pending_momentum(et(9, 36), scheduler.Phase.OVERNIGHT_ONLY)
+    assert "ON_BREAK" not in bot.pending_momentum
+    assert "A" not in bot.pm.positions
+    aborted = events(bot, "MOMENTUM_ABORTED")
+    assert aborted and aborted[0]["reason"] == "reversed"
+
+
+def test_momentum_confirmation_times_out(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: make_candles(et(9, 34), [], minutes=1))
+    bot.check_pending_momentum(et(9, 34) + timedelta(minutes=config.MOMENTUM_CONFIRM_TIMEOUT_MIN + 1),
+                               scheduler.Phase.OVERNIGHT_ONLY)
+    assert "ON_BREAK" not in bot.pending_momentum and "A" not in bot.pm.positions
+    assert events(bot, "MOMENTUM_ABORTED")[0]["reason"] == "timeout"
+
+
+def test_momentum_confirmation_skipped_if_entry_window_closed_by_the_time_it_resolves(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    m1 = make_candles(et(9, 35), [(7628, 7629, 7627.5, 7628.6), (7628.6, 7630, 7628, 7629.2)], minutes=1)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
+    bot.check_pending_momentum(et(9, 37), scheduler.Phase.CLOSED)
+    assert "ON_BREAK" not in bot.pending_momentum and "A" not in bot.pm.positions
+    assert events(bot, "MOMENTUM_ABORTED")[0]["reason"] == "entry window closed"
 
 
 def test_on_break_entry_kind_gate_applies_to_on_break_too(bot, caplog, monkeypatch):

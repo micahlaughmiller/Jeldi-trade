@@ -139,6 +139,20 @@ TRAIL_AMOUNT = 0.50
 RUNNER_DEEP_PROFIT = 1.00
 RUNNER_DEEP_TRAIL = 0.30
 RUNNER_TIGHTEN_ENABLED = False
+
+# Once a MOMENTUM entry_kind signal fires, a strategy with MOMENTUM_CONFIRM_ENABLED does not enter
+# immediately -- it waits for MOMENTUM_CONFIRM_CANDLES consecutive completed 1-minute SPX candles,
+# each closing at least MOMENTUM_CONFIRM_MARGIN points beyond the break level in the trade direction,
+# before actually entering (a fresh spot/chain is fetched at that later time, same as any entry).
+# A candle that fails the margin aborts the pending entry; MOMENTUM_CONFIRM_TIMEOUT_MIN gives up if
+# confirmation never resolves either way. PULLBACK entries are unaffected -- their own wick-then-
+# reconfirm pattern already requires this kind of follow-through. Pending state is in-memory only
+# and does not survive a restart. 2026-09-24: a 0.18-point margin was enough to trigger MOMENTUM and
+# enter right at the exhaustion of the morning's move.
+MOMENTUM_CONFIRM_ENABLED = False
+MOMENTUM_CONFIRM_MARGIN = 0.50
+MOMENTUM_CONFIRM_CANDLES = 2
+MOMENTUM_CONFIRM_TIMEOUT_MIN = 5
 MOMENTUM_CANDLES = 3
 MOMENTUM_CONTINUE_RATIO = 0.80
 MOMENTUM_SLOWDOWN_PCT = 0.20
@@ -168,7 +182,7 @@ STALE_FLOOR = 0.05
 
 A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
                  "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True,
-                 "STOP_CONFIRM_TICKS": 2}
+                 "STOP_CONFIRM_TICKS": 2, "MOMENTUM_CONFIRM_ENABLED": True}
 EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": {}}
 
 ENTRY_STEP_SEC = 20

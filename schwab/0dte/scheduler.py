@@ -13,6 +13,7 @@ import logging
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,20 @@ from journal import Journal, format_close_card, format_day_table, format_entry_c
 from position_manager import OpenSpread, PositionManager, spxw_legs
 from risk_manager import DayState, RiskManager, contracts_for, tier
 from strategy import Phase
+
+@dataclass
+class PendingMomentum:
+    """A MOMENTUM signal awaiting 1-minute follow-through before the listed strategies enter.
+    In-memory only -- lost on restart, matching the entry it is guarding: a missed confirmation
+    just means that signal was never traded, not a broken position."""
+    setup: str
+    direction: str
+    break_close: float
+    strategies: tuple[str, ...]
+    signal_time: datetime
+    confirmed: int = 0
+    last_candle: datetime | None = None
+
 
 HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / config.LOG_DIR
@@ -77,6 +92,7 @@ class Bot:
         self.last_on_candle: datetime | None = None
         self.last_candle: datetime | None = None
         self.last_orb_candle: datetime | None = None
+        self.pending_momentum: dict[str, PendingMomentum] = {}
         self.today: date = now_et().date()
 
     # ------------------------------------------------------------ lifecycle
@@ -165,6 +181,8 @@ class Bot:
         orb_signal = self.orb_signal(now) if ph in strategy.ORB_PHASES else None
         if self.pm.positions:
             self.manage(now, candles)
+        if self.pending_momentum:
+            self.check_pending_momentum(now, ph)
         if ph in strategy.ENTRY_PHASES:
             if new_candle and ph in strategy.OVERNIGHT_PHASES:
                 self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
@@ -207,9 +225,10 @@ class Bot:
 
     # --------------------------------------------------------------- signals
 
-    def entry_possible(self, equity: float, setup: str | None = None) -> bool:
+    def entry_possible(self, equity: float, setup: str | None = None,
+                       strategies: tuple[str, ...] | None = None) -> bool:
         reasons = []
-        for strat in config.STRATEGIES:
+        for strat in (strategies or config.STRATEGIES):
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
                 continue
@@ -275,7 +294,7 @@ class Bot:
                      config.CANDLE_INTERVAL, t.strftime("%H:%M"), levels.high, levels.low)
             self.journal.event("SIGNAL", now, setup="ON_BREAK", direction=fired, trigger=kind,
                                candles=[self.last_on_candle], high=levels.high, low=levels.low)
-            self.enter(now, "ON_BREAK", fired, kind)
+            self.dispatch_entry(now, "ON_BREAK", fired, kind, self.on_setup.break_close)
 
     def orb_signal(self, now: datetime) -> tuple[str, datetime, str | None] | None:
         """Feed new completed ORB candles to the setup; a signal counts only from the newest one.
@@ -315,13 +334,89 @@ class Bot:
                  candle_time.strftime("%H:%M"), self.orb.high, self.orb.low)
         self.journal.event("SIGNAL", now, setup="ORB", direction=direction, trigger=kind, candles=[candle_time],
                            high=self.orb.high, low=self.orb.low)
-        self.enter(now, "ORB", direction, kind)
+        self.dispatch_entry(now, "ORB", direction, kind, self.orb_setup.break_close)
 
     # ----------------------------------------------------------------- entry
 
-    def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None) -> None:
+    def dispatch_entry(self, now: datetime, setup: str, direction: str, kind: str | None,
+                       break_close: float) -> None:
+        """Route a fired signal to enter() now, except a MOMENTUM signal is split per strategy: any
+        strategy with MOMENTUM_CONFIRM_ENABLED waits for 1-minute follow-through (see PendingMomentum)
+        while the rest enter immediately, exactly as before."""
+        if kind != "MOMENTUM":
+            self.enter(now, setup, direction, kind)
+            return
+
+        def wants_confirmation(strat: str) -> bool:
+            # A strategy that isn't even eligible for this setup or this entry kind goes through the
+            # immediate path instead, so enter_leg's existing gate rejects it right away (with its usual
+            # log line) instead of parking a candidate that was always going to be rejected later anyway.
+            if setup not in config.SETUPS_BY_STRATEGY.get(strat, (setup,)):
+                return False
+            if kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
+                return False
+            return strategy.exit_setting(strat, "MOMENTUM_CONFIRM_ENABLED", False)
+
+        confirm = tuple(s for s in config.STRATEGIES if wants_confirmation(s))
+        immediate = tuple(s for s in config.STRATEGIES if s not in confirm)
+        if immediate:
+            self.enter(now, setup, direction, kind, strategies=immediate)
+        if confirm:
+            log.info("[%s] MOMENTUM confirmation pending for %s: need %d candle(s) beating %.2f by %.2f (%s)",
+                     "/".join(confirm), direction, config.MOMENTUM_CONFIRM_CANDLES, break_close,
+                     config.MOMENTUM_CONFIRM_MARGIN, setup)
+            self.journal.event("MOMENTUM_PENDING", now, setup=setup, direction=direction,
+                               break_close=break_close, strategies=list(confirm))
+            self.pending_momentum[setup] = PendingMomentum(
+                setup=setup, direction=direction, break_close=break_close, strategies=confirm, signal_time=now)
+
+    def check_pending_momentum(self, now: datetime, ph: Phase) -> None:
+        m1 = market_data.get_candles(config.SPX_SYMBOL, "1m", config.CANDLE_LOOKBACK_MIN, now)
+        for setup, p in list(self.pending_momentum.items()):
+            sign = 1.0 if p.direction == strategy.BULLISH else -1.0
+            new_bars = m1[m1.index > (p.last_candle or p.signal_time)] if not m1.empty else m1
+            done = False
+            for t, bar in new_bars.iterrows():
+                t = t.to_pydatetime()
+                p.last_candle = t
+                beat = sign * (float(bar.close) - p.break_close)
+                if beat < config.MOMENTUM_CONFIRM_MARGIN:
+                    log.info("[%s] MOMENTUM confirmation FAILED at %s (close %.2f, break %.2f, beat %+.2f): "
+                             "entry abandoned", setup, t.strftime("%H:%M"), bar.close, p.break_close, beat)
+                    self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
+                                       at=t, close=float(bar.close), break_close=p.break_close, reason="reversed")
+                    del self.pending_momentum[setup]
+                    done = True
+                    break
+                p.confirmed += 1
+                if p.confirmed >= config.MOMENTUM_CONFIRM_CANDLES:
+                    del self.pending_momentum[setup]
+                    if ph not in strategy.ENTRY_PHASES:
+                        log.info("[%s] MOMENTUM confirmed for %s but the entry window is closed: skipped",
+                                 setup, p.direction)
+                        self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
+                                           break_close=p.break_close, reason="entry window closed")
+                    else:
+                        log.info("[%s] MOMENTUM confirmed for %s (%s): entering now", setup, p.direction,
+                                 "/".join(p.strategies))
+                        self.journal.event("MOMENTUM_CONFIRMED", now, setup=setup, direction=p.direction,
+                                           break_close=p.break_close, strategies=list(p.strategies))
+                        self.enter(now, setup, p.direction, "MOMENTUM", strategies=p.strategies)
+                    done = True
+                    break
+            if done:
+                continue
+            if now - p.signal_time > timedelta(minutes=config.MOMENTUM_CONFIRM_TIMEOUT_MIN):
+                log.info("[%s] MOMENTUM confirmation TIMED OUT for %s after %d min: entry abandoned",
+                         setup, p.direction, config.MOMENTUM_CONFIRM_TIMEOUT_MIN)
+                self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
+                                   break_close=p.break_close, reason="timeout")
+                del self.pending_momentum[setup]
+
+    def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None,
+             strategies: tuple[str, ...] | None = None) -> None:
         equity = self.broker.get_account()["equity"]
-        if not self.entry_possible(equity, setup):
+        if not self.entry_possible(equity, setup, strategies):
             return
         if self.today not in self.broker.get_expirations(config.UNDERLYING, 0, 1):
             log.warning("No SPXW expiration for today %s: no trade.", self.today)
@@ -338,9 +433,10 @@ class Bot:
             # One chain wide enough for A and for B's whole strike walk (spot +/- 2 EM + width).
             lo, hi = min(lo, spot - 2 * em - width), max(hi, spot + 2 * em + width)
         chain = self.broker.get_option_chain(config.UNDERLYING, self.today, right, lo - 1, hi + 1, spot=spot)
+        strategies = strategies or config.STRATEGIES
         summaries: dict[str, str] = {}
         open_risk = self.pm.total_open_risk()
-        for strat in config.STRATEGIES:
+        for strat in strategies:
             try:
                 summaries[strat], added = self.enter_leg(strat, now, setup, direction, equity, spot, width,
                                                          right, chain, em, open_risk, kind)
@@ -350,7 +446,7 @@ class Bot:
                 summaries[strat], added = f"broker error {e}", 0.0
             open_risk += added
         log.warning("SIGNAL %s %s at %s -- %s", setup, direction, now.strftime("%H:%M:%S"),
-                    " | ".join(f"{s}: {summaries[s]}" for s in config.STRATEGIES))
+                    " | ".join(f"{s}: {summaries[s]}" for s in strategies))
         self.save_state()
 
     def expected_move(self, spot: float) -> float | None:

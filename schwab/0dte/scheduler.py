@@ -93,6 +93,7 @@ class Bot:
         self.last_candle: datetime | None = None
         self.last_orb_candle: datetime | None = None
         self.pending_momentum: dict[str, PendingMomentum] = {}
+        self.last_continuation_check: dict[str, datetime] = {}
         self.today: date = now_et().date()
 
     # ------------------------------------------------------------ lifecycle
@@ -188,6 +189,7 @@ class Bot:
                 self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
+            self.check_continuation_reentry(now, ph)
         self.save_state()
 
     # ---------------------------------------------------------------- levels
@@ -343,6 +345,7 @@ class Bot:
         """Route a fired signal to enter() now, except a MOMENTUM signal is split per strategy: any
         strategy with MOMENTUM_CONFIRM_ENABLED waits for 1-minute follow-through (see PendingMomentum)
         while the rest enter immediately, exactly as before."""
+        self.last_continuation_check[setup] = now   # paces from the signal itself, not just from a later check
         if kind != "MOMENTUM":
             self.enter(now, setup, direction, kind)
             return
@@ -412,6 +415,38 @@ class Bot:
                 self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
                                    break_close=p.break_close, reason="timeout")
                 del self.pending_momentum[setup]
+
+    def check_continuation_reentry(self, now: datetime, ph: Phase) -> None:
+        """For a strategy with REENTRY_ON_CONTINUATION_ENABLED (B, by default): once a setup's own
+        OrbSetup has gone DONE without resetting (the original breakout thesis is still intact) and
+        that strategy is flat, try it again every REENTRY_PAUSE_MIN minutes for as long as spot keeps
+        beating the break level by MOMENTUM_CONFIRM_MARGIN in the trade direction. A stalled or
+        reversed move (beat below the margin) skips this round without resetting the pause timer."""
+        for setup, setup_obj in (("ORB", self.orb_setup), ("ON_BREAK", self.on_setup)):
+            if setup_obj is None or setup_obj.state != strategy.OrbSetup.DONE:
+                continue
+            eligible = tuple(s for s in config.STRATEGIES
+                             if strategy.exit_setting(s, "REENTRY_ON_CONTINUATION_ENABLED", False)
+                             and setup in config.SETUPS_BY_STRATEGY.get(s, (setup,))
+                             and s not in self.pm.positions)
+            if not eligible:
+                continue
+            last = self.last_continuation_check.get(setup)
+            if last is not None and now - last < timedelta(minutes=config.REENTRY_PAUSE_MIN):
+                continue
+            self.last_continuation_check[setup] = now
+            spot = self.broker.get_spot(config.UNDERLYING)
+            sign = 1.0 if setup_obj.direction == strategy.BULLISH else -1.0
+            beat = sign * (spot - setup_obj.break_close)
+            if beat < config.MOMENTUM_CONFIRM_MARGIN:
+                log.debug("[%s] continuation check: spot %.2f vs break %.2f (%+.2f) -- move has stalled, no re-entry",
+                          setup, spot, setup_obj.break_close, beat)
+                continue
+            log.info("[%s] CONTINUATION re-entry for %s (%s): spot %.2f beats %.2f by %+.2f",
+                     setup, setup_obj.direction, "/".join(eligible), spot, setup_obj.break_close, beat)
+            self.journal.event("CONTINUATION_REENTRY", now, setup=setup, direction=setup_obj.direction,
+                               break_close=setup_obj.break_close, spot=spot, strategies=list(eligible))
+            self.enter(now, setup, setup_obj.direction, "MOMENTUM", strategies=eligible)
 
     def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None,
              strategies: tuple[str, ...] | None = None) -> None:

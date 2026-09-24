@@ -153,6 +153,15 @@ MOMENTUM_CONFIRM_ENABLED = False
 MOMENTUM_CONFIRM_MARGIN = 0.50
 MOMENTUM_CONFIRM_CANDLES = 2
 MOMENTUM_CONFIRM_TIMEOUT_MIN = 5
+
+# Once a setup's breakout has gone DONE (fired, hasn't reset) and a strategy with
+# REENTRY_ON_CONTINUATION_ENABLED is flat, it tries a fresh entry every REENTRY_PAUSE_MIN minutes for
+# as long as spot keeps confirming the move (still beats the break level by MOMENTUM_CONFIRM_MARGIN)
+# -- unlike the old OVERNIGHT detector (retired 2026-09-24), which re-fired on every completed candle
+# regardless of whether the move had stalled (32 entries off one signal on 2026-09-23), this only
+# re-enters on a fixed cadence and only while price is still actually confirming continuation.
+REENTRY_ON_CONTINUATION_ENABLED = False
+REENTRY_PAUSE_MIN = 5
 MOMENTUM_CANDLES = 3
 MOMENTUM_CONTINUE_RATIO = 0.80
 MOMENTUM_SLOWDOWN_PCT = 0.20
@@ -183,7 +192,8 @@ STALE_FLOOR = 0.05
 A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
                  "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True,
                  "STOP_CONFIRM_TICKS": 2, "MOMENTUM_CONFIRM_ENABLED": True}
-EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": {}}
+B_BASE_TUNING = {"REENTRY_ON_CONTINUATION_ENABLED": True}
+EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": dict(B_BASE_TUNING)}
 
 ENTRY_STEP_SEC = 20
 ENTRY_PRICE_STEP = 0.05

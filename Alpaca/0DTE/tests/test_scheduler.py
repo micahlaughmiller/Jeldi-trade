@@ -313,6 +313,98 @@ def test_momentum_confirmation_times_out(bot, monkeypatch):
     assert events(bot, "MOMENTUM_ABORTED")[0]["reason"] == "timeout"
 
 
+# -------------------------------------------------------- B continuation re-entry
+
+def _done_on_break(bot):
+    """Fire the standard ON_BREAK MOMENTUM signal, leave on_setup in DONE, and simulate B having
+    already closed the position it took on that first entry (flat, ready for a re-entry check)."""
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert bot.on_setup.state == bot.on_setup.DONE and bot.on_setup.break_close == 7624.0
+    bot.pm.positions.pop("B", None)   # B took the first entry and has since exited
+
+
+def _spy_enter(bot, monkeypatch):
+    """The fake broker's option chain only covers strikes near its fixture spot; a synthetic spot
+    chosen just to clear the continuation margin has no real chain around it. Spy on enter() instead
+    of requiring the full strike-selection/sizing pipeline to resolve for an arbitrary test spot."""
+    calls = []
+    monkeypatch.setattr(bot, "enter", lambda *a, **k: calls.append((a, k)))
+    return calls
+
+
+def test_continuation_reentry_fires_for_b_when_spot_still_confirms(bot, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0   # beats 7624.0 break by 5.0, well past the 0.5 margin
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[1:4] == ("ON_BREAK", BULLISH, "MOMENTUM") and kwargs["strategies"] == ("B",)
+    ev = events(bot, "CONTINUATION_REENTRY")
+    assert ev and ev[0]["strategies"] == ["B"] and ev[0]["spot"] == 7629.0
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ON_BREAK] CONTINUATION")]
+    assert line
+
+
+def test_continuation_reentry_skips_when_move_has_stalled(bot, monkeypatch):
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7624.2   # only beats by 0.2, under the 0.5 margin
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == [] and events(bot, "CONTINUATION_REENTRY") == []
+
+
+def test_continuation_reentry_respects_the_pause(bot, monkeypatch):
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0
+    bot.check_continuation_reentry(et(9, 35), scheduler.Phase.OVERNIGHT_ONLY)   # 1 min after the signal: too soon
+    assert len(calls) == 0
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)   # 5 min after the signal: fires
+    assert len(calls) == 1
+    bot.broker.spot = 7635.0
+    bot.check_continuation_reentry(et(9, 41), scheduler.Phase.OVERNIGHT_ONLY)   # 2 min later: still paced, no re-fire
+    assert len(calls) == 1
+    bot.check_continuation_reentry(et(9, 44), scheduler.Phase.OVERNIGHT_ONLY)   # 5 min after THAT fire: fires again
+    assert len(calls) == 2
+
+
+def test_continuation_reentry_stops_once_the_setup_resets(bot, monkeypatch):
+    from conftest import make_candles
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.on_setup.update(make_candles(et(9, 40), [(7624, 7625, 7615, 7618)], minutes=2).iloc[0])   # closes back inside
+    assert bot.on_setup.state == bot.on_setup.WAITING
+    bot.broker.spot = 7629.0
+    bot.check_continuation_reentry(et(9, 44), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == [] and events(bot, "CONTINUATION_REENTRY") == []
+
+
+def test_continuation_reentry_does_not_apply_to_a_by_default(bot, monkeypatch):
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls[0][1]["strategies"] == ("B",)   # A never included: MOMENTUM_CONFIRM is on for A, REENTRY is not
+    ev = events(bot, "CONTINUATION_REENTRY")
+    assert ev and ev[0]["strategies"] == ["B"]
+
+
+def test_continuation_reentry_skipped_if_b_already_has_a_position(bot, monkeypatch):
+    _done_on_break(bot)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.pm.positions["B"] = object()   # any occupant of the "B" slot marks the strategy as not flat
+    bot.broker.spot = 7629.0
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == [] and events(bot, "CONTINUATION_REENTRY") == []
+
+
 def test_momentum_confirmation_skipped_if_entry_window_closed_by_the_time_it_resolves(bot, monkeypatch):
     from conftest import make_candles
     from strategy import Levels

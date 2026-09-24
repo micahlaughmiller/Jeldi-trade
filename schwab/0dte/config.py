@@ -120,7 +120,11 @@ MAX_CONCURRENT_POSITIONS = 1   # per strategy
 # pullback entry (wick to the level, then a close in the breakout direction). B is unchanged.
 # ON_BREAK: the overnight high/low run through the same break -> pullback/momentum state machine as the
 # ORB, on 2-minute candles during the first 30 minutes. A trades it; B keeps its own OVERNIGHT detector.
-SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("OVERNIGHT", "ORB")}
+# 2026-09-24: B now trades ON_BREAK (the same single-shot break/pullback/momentum state machine A
+# uses) instead of the old OVERNIGHT detector, which had no re-arm gate and could re-fire on every
+# candle of a continuing move (32 B entries off one signal on 2026-09-23). OVERNIGHT is retired for
+# both strategies; the detector function itself (strategy.detect_breakout) is left in place, unused.
+SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB")}
 # Both entry kinds for A: the 2026-09-21 replay showed a trend day with one momentum break and no pullback.
 ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}
 

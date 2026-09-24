@@ -81,8 +81,11 @@ slowdown exit). Strategy B: lock arms at +$0.15 / $0.10 giveback with the
 candle-against exit, books half at target when momentum continues and runs the
 rest with the 20% slowdown exit. A takes both ORB entry kinds (momentum close
 and pullback) and, in the first 30 minutes, the overnight high/low run through
-the same break/pullback/momentum state machine on 2-minute candles (`ON_BREAK`);
-B keeps the original overnight detector. at most 3 trades / 2 consecutive
+the same break/pullback/momentum state machine on 2-minute candles (`ON_BREAK`).
+B trades that same ON_BREAK setup instead of a separate overnight detector (the
+old OVERNIGHT detector had no re-arm gate and could re-fire repeatedly on one
+continuing move); the entry-kind gate (`ORB_ENTRY_KINDS_BY_STRATEGY`) applies to
+both ORB and ON_BREAK signals for either strategy. at most 3 trades / 2 consecutive
 losses a day, with a 30-minute cool-down after each exit; B keeps the 20 / 5
 defaults and both setups. `CLOSE_SLIPPAGE` (escalating-limit close pricing) is $0.03/retry. Per-strategy
 exit knobs live in `EXIT_TUNING_BY_STRATEGY`, including a runner trail that

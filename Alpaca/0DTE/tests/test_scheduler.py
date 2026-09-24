@@ -157,12 +157,13 @@ def test_entry_kind_policy_can_restrict_a(bot, caplog, monkeypatch):
     assert "A: skip: ORB MOMENTUM entry disabled for A" in line and "B: sell 7565P" in line
 
 
-def test_a_skips_the_overnight_setup_b_trades_it(bot, caplog):
+def test_overnight_setup_is_retired_for_both_strategies(bot, caplog):
     caplog.set_level("INFO")
     bot.enter(et(9, 40), "OVERNIGHT", BULLISH)
-    assert set(bot.pm.positions) == {"B"}
+    assert bot.pm.positions == {}
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL OVERNIGHT")][0]
-    assert "A: skip: OVERNIGHT setup disabled for A" in line     # A trades the overnight levels via ON_BREAK instead
+    assert "A: skip: OVERNIGHT setup disabled for A" in line
+    assert "B: skip: OVERNIGHT setup disabled for B" in line   # both now trade the overnight levels via ON_BREAK
 
 
 def test_a_cooldown_blocks_reentry_after_its_exit(bot, caplog):
@@ -191,7 +192,7 @@ def test_a_cooldown_does_not_block_a_different_setup(bot, caplog):
     assert set(bot.pm.positions) == {"B"}
     bot.pm.positions.pop("B")
     bot.enter(et(10, 45), "ON_BREAK", BULLISH)                          # a DIFFERENT setup, still inside the cool-down
-    assert set(bot.pm.positions) == {"A"}      # B doesn't trade ON_BREAK at all; A is the one being tested here
+    assert set(bot.pm.positions) == {"A", "B"}   # A's cool-down is what's being tested here; B trades ON_BREAK too
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK")]
     assert line and "A: sell" in line[0] and "COOLDOWN" not in line[0]
 
@@ -236,7 +237,7 @@ def test_signal_handlers_route_to_keyboard_interrupt():
 
 # ------------------------------------------------------------ ON_BREAK: overnight levels through the ORB state machine
 
-def test_on_break_momentum_entry_is_a_only(bot, caplog):
+def test_on_break_momentum_entry_trades_both_strategies(bot, caplog):
     from conftest import make_candles
     from strategy import Levels
     caplog.set_level("INFO")
@@ -245,15 +246,31 @@ def test_on_break_momentum_entry_is_a_only(bot, caplog):
     bars = [(7615, 7625, 7614, 7624),      # 09:30 break: closes above 7620
             (7624, 7630, 7621, 7628)]      # 09:32 holds and closes above the break close -> momentum
     bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
-    assert set(bot.pm.positions) == {"A"}
-    assert bot.pm.positions["A"].setup == "ON_BREAK"
+    assert set(bot.pm.positions) == {"A", "B"}
+    assert bot.pm.positions["A"].setup == "ON_BREAK" and bot.pm.positions["B"].setup == "ON_BREAK"
     sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]
     assert sig and sig[0]["trigger"] == "MOMENTUM" and sig[0]["direction"] == BULLISH
     line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK BULLISH at 09:34")][0]
-    assert "B: skip: ON_BREAK setup disabled for B" in line
+    assert "A: sell" in line and "B: sell 7565P" in line
     # the same candles again do not re-fire
     bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
     assert len([r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"]) == 1
+
+
+def test_on_break_entry_kind_gate_applies_to_on_break_too(bot, caplog, monkeypatch):
+    # Regression test for the 2026-09-24 fix: the gate used to be hardcoded to setup=="ORB" and
+    # silently did not apply to ON_BREAK signals at all.
+    from conftest import make_candles
+    from strategy import Levels
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "ORB_ENTRY_KINDS_BY_STRATEGY", {"A": ("PULLBACK",), "B": ("MOMENTUM", "PULLBACK")})
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]   # momentum entry_kind
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert set(bot.pm.positions) == {"B"}
+    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SIGNAL ON_BREAK BULLISH at 09:34")][0]
+    assert "A: skip: ON_BREAK MOMENTUM entry disabled for A" in line and "B: sell 7565P" in line
 
 
 def test_on_break_pullback_entry(bot):
@@ -265,7 +282,7 @@ def test_on_break_pullback_entry(bot):
             (7624, 7625, 7619, 7621),      # wick back to the level, holds
             (7621, 7623, 7620.5, 7622)]    # green close above -> pullback entry
     bot.try_on_break_entry(et(9, 36), make_candles(et(9, 30), bars))
-    assert set(bot.pm.positions) == {"A"}
+    assert set(bot.pm.positions) == {"A", "B"}
     sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ON_BREAK"][0]
     assert sig["trigger"] == "PULLBACK"
 

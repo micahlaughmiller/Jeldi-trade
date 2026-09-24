@@ -167,8 +167,7 @@ class Bot:
             self.manage(now, candles)
         if ph in strategy.ENTRY_PHASES:
             if new_candle and ph in strategy.OVERNIGHT_PHASES:
-                self.try_overnight_entry(now, candles)
-                self.try_on_break_entry(now, candles)
+                self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
         self.save_state()
@@ -372,8 +371,9 @@ class Bot:
             return "skip: position open", 0.0
         if setup not in config.SETUPS_BY_STRATEGY.get(strat, (setup,)):
             return f"skip: {setup} setup disabled for {strat}", 0.0
-        if setup == "ORB" and kind is not None and kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
-            return f"skip: ORB {kind} entry disabled for {strat}", 0.0
+        # Any kind-tagged setup (ORB or ON_BREAK -- OVERNIGHT never sets a kind) is gated the same way.
+        if kind is not None and kind not in config.ORB_ENTRY_KINDS_BY_STRATEGY.get(strat, (kind,)):
+            return f"skip: {setup} {kind} entry disabled for {strat}", 0.0
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup)
         if not allowed:
             return f"skip: {reason}", 0.0

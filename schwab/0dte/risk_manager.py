@@ -21,7 +21,9 @@ def tier(equity: float) -> int:
 
 
 def contracts_for(equity: float, width: int, credit: float, open_risk_dollars: float,
-                  news_day: bool = False) -> int:
+                  news_day: bool = False, half_size: bool = False) -> int:
+    """`half_size` is Strategy D (always) and Strategy E (its choppy-day variant) trading at half
+    the testing-phase contract cap, per the user's own instruction -- see config.TESTING_MODE."""
     max_loss = (width - credit) * 100.0
     if max_loss <= 0 or equity <= 0:
         return 0
@@ -30,7 +32,11 @@ def contracts_for(equity: float, width: int, credit: float, open_risk_dollars: f
             and (open_risk_dollars + max_loss) / equity <= config.MAX_PORTFOLIO_RISK_PCT:
         n = 1
     portfolio_cap = floor((config.MAX_PORTFOLIO_RISK_PCT * equity - open_risk_dollars) / max_loss)
-    n = min(n, max(portfolio_cap, 0), config.MAX_CONTRACTS_PER_TRADE)
+    if config.TESTING_MODE:
+        contract_cap = config.TESTING_HALF_SIZE_MAX_CONTRACTS if half_size else config.TESTING_MAX_CONTRACTS
+    else:
+        contract_cap = config.MAX_CONTRACTS_PER_TRADE
+    n = min(n, max(portfolio_cap, 0), contract_cap)
     if news_day and config.NEWS_DAY_MODE == "half_size" and n >= 1:
         n = max(1, n // 2)
     return max(n, 0)

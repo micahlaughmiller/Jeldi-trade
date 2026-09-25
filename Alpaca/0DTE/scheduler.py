@@ -53,6 +53,15 @@ def now_et() -> datetime:
     return datetime.now(config.ET)
 
 
+def _keep_or_important(record: logging.LogRecord) -> bool:
+    """2026-09-25: only entry data, exit data, and a best-price-hit line need to be recorded at all
+    right now -- per-tick position status, candle debug chatter, signal/skip-reason noise, etc. are
+    not needed at TICK_SECONDS=1's volume. A record passes if it's tagged keep=True (entry/exit cards,
+    BEST PRICE, start/end-of-day reports, interrupt/shutdown messages) or is a genuine failure
+    (ERROR/CRITICAL) that should never be silently dropped."""
+    return record.levelno >= logging.ERROR or getattr(record, "keep", False)
+
+
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
@@ -61,11 +70,10 @@ def setup_logging() -> None:
     root.setLevel(logging.DEBUG)
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
-    # Raw broker payload dumps and per-request chatter go to the file only.
-    console.addFilter(lambda r: not (r.getMessage().startswith("[broker]") and ": {" in r.getMessage()))
-    console.addFilter(lambda r: not r.name.startswith(("httpx", "urllib3", "yfinance", "peewee")))
+    console.addFilter(_keep_or_important)
     file_handler = logging.FileHandler(LOG_DIR / f"0dte_{config.TRADER_NAME.lower()}.log", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
+    file_handler.addFilter(_keep_or_important)
     for handler in (console, file_handler):
         handler.setFormatter(fmt)
         root.addHandler(handler)
@@ -95,6 +103,10 @@ class Bot:
         self.pending_momentum: dict[str, PendingMomentum] = {}
         self.last_continuation_check: dict[str, datetime] = {}
         self.today: date = now_et().date()
+        self.es_setup: strategy.TwoCandleBreak | None = None   # Strategy C, ES-sourced overnight levels
+        self.last_es_candle: datetime | None = None
+        self.last_de_candle: datetime | None = None             # Strategies D/E, MA/Bollinger reversion
+        self.news_blackout_was_active: bool = False
 
     # ------------------------------------------------------------ lifecycle
 
@@ -169,6 +181,13 @@ class Bot:
             self.end_of_day(now)
             self.done = True
             return
+        blackout_now = self.news_blackout_active(now)
+        if self.news_blackout_was_active and not blackout_now:
+            log.info("NEWS_BLACKOUT cleared: resetting breakout state machines for a fresh post-news read.")
+            for setup_obj in (self.orb_setup, self.on_setup, self.es_setup):
+                if setup_obj is not None:
+                    setup_obj._reset()
+        self.news_blackout_was_active = blackout_now
         self.refresh_levels(now)
         candles = market_data.get_candles(config.SPX_SYMBOL, config.CANDLE_INTERVAL,
                                           config.CANDLE_LOOKBACK_MIN, now)
@@ -187,9 +206,11 @@ class Bot:
         if ph in strategy.ENTRY_PHASES:
             if new_candle and ph in strategy.OVERNIGHT_PHASES:
                 self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
+                self.try_es_break_entry(now, candles)   # Strategy C
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
             self.check_continuation_reentry(now, ph)
+            self.check_mean_reversion_entry(now, ph)    # Strategies D/E
         self.save_state()
 
     # ---------------------------------------------------------------- levels
@@ -219,7 +240,16 @@ class Bot:
     def overnight_levels_for_signal(self) -> tuple[strategy.Levels, str] | None:
         if self.overnight is None:
             return None
-        if config.BREAKOUT_LEVEL_SOURCE == "ES":
+        source = config.BREAKOUT_LEVEL_SOURCE
+        # 2026-09-25: once a live ES source is configured (market_data.live_es_available -- Schwab
+        # cross-auth in this folder's .env), the whole reason for the ES_TO_SPX proxy (yfinance's
+        # ES=F being ~10 min delayed) no longer applies -- confirm directly on ES's own candles
+        # instead, which is what actually captures the ES-leads-SPX lead-time edge. An explicit
+        # BREAKOUT_LEVEL_SOURCE="ES" override still forces raw-ES confirmation even without a live
+        # source (e.g. for testing), and this adaptive switch only kicks in for the default "ES_TO_SPX".
+        if source == "ES_TO_SPX" and market_data.live_es_available():
+            source = "ES"
+        if source == "ES":
             return self.overnight, config.ES_SYMBOL
         if self.basis is None:
             return None
@@ -297,6 +327,42 @@ class Bot:
             self.journal.event("SIGNAL", now, setup="ON_BREAK", direction=fired, trigger=kind,
                                candles=[self.last_on_candle], high=levels.high, low=levels.low)
             self.dispatch_entry(now, "ON_BREAK", fired, kind, self.on_setup.break_close)
+
+    def try_es_break_entry(self, now: datetime, spx_candles: pd.DataFrame) -> None:
+        """Strategy C: the same overnight level as ON_BREAK, through strategy.TwoCandleBreak instead
+        of OrbSetup -- a deliberately simpler close-only break+confirm (no wick/pullback path)."""
+        if "C" not in config.STRATEGIES or "C" in self.pm.positions:
+            return
+        if not strategy.setup_allowed("ES_BREAK", now.date()):
+            return
+        found = self.overnight_levels_for_signal()
+        if found is None:
+            return
+        levels, symbol = found
+        if self.es_setup is None:
+            self.es_setup = strategy.TwoCandleBreak(levels.high, levels.low)
+        candles = spx_candles if symbol == config.SPX_SYMBOL else \
+            market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
+        candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
+        if self.last_es_candle is not None:
+            candles = candles[candles.index > self.last_es_candle]
+        for t, candle in candles.iterrows():
+            fired = self.es_setup.update(candle)
+            self.last_es_candle = t.to_pydatetime()
+            if fired is None:
+                continue
+            if t != candles.index[-1]:
+                log.info("Stale ES_BREAK %s signal on replayed candle %s ignored.", fired, t.strftime("%H:%M"))
+                continue
+            key = f"ES_BREAK:{self.last_es_candle.isoformat()}"
+            if key in self.acted:
+                continue
+            self.acted.add(key)
+            log.info("SIGNAL ES_BREAK %s on %s candle %s vs overnight %.2f/%.2f", fired,
+                     config.CANDLE_INTERVAL, t.strftime("%H:%M"), levels.high, levels.low)
+            self.journal.event("SIGNAL", now, setup="ES_BREAK", direction=fired,
+                               candles=[self.last_es_candle], high=levels.high, low=levels.low)
+            self.enter(now, "ES_BREAK", fired, strategies=("C",))
 
     def orb_signal(self, now: datetime) -> tuple[str, datetime, str | None] | None:
         """Feed new completed ORB candles to the setup; a signal counts only from the newest one.
@@ -448,8 +514,62 @@ class Bot:
                                break_close=setup_obj.break_close, spot=spot, strategies=list(eligible))
             self.enter(now, setup, setup_obj.direction, "MOMENTUM", strategies=eligible)
 
+    def check_mean_reversion_entry(self, now: datetime, ph: Phase) -> None:
+        """Strategies D (trend-gated MA/Bollinger reversion) and E (D + a 5-min two-candle confirm):
+        not setup-driven like ORB/ON_BREAK/ES_BREAK -- checked fresh on every new D_E_CANDLE_INTERVAL
+        candle rather than off a fired breakout signal, since a reversion trade's whole premise is the
+        ABSENCE of a breakout."""
+        eligible = tuple(s for s in ("D", "E") if s in config.STRATEGIES and s not in self.pm.positions)
+        if not eligible:
+            return
+        candles = market_data.get_candles(config.SPX_SYMBOL, config.D_E_CANDLE_INTERVAL,
+                                          config.CANDLE_LOOKBACK_MIN, now)
+        if candles.empty:
+            return
+        if self.last_de_candle is not None and candles.index[-1] <= self.last_de_candle:
+            return
+        self.last_de_candle = candles.index[-1].to_pydatetime()
+        if len(candles) < config.D_E_MIN_CANDLES:
+            return
+        closes = candles["close"]
+        ema9 = strategy.ema(closes, config.D_EMA_FAST_SPAN)
+        ema30 = strategy.ema(closes, config.D_EMA_SLOW_SPAN)
+        _, upper, lower = strategy.bollinger(closes, config.D_BB_PERIOD, config.D_BB_STD, basis=ema30)
+        spot, ma = float(closes.iloc[-1]), float(ema30.iloc[-1])
+        pct_b = strategy.percent_b(spot, float(upper.iloc[-1]), float(lower.iloc[-1]))
+        trend = strategy.ema_trend(float(ema9.iloc[-1]), ma, config.D_EMA_CHOP_THRESHOLD_PTS)
+        direction = strategy.mean_reversion_signal(spot, ma, pct_b, trend, config.D_BAND_TOUCH_PCT_B)
+        if direction is None:
+            return
+        for strat in eligible:
+            if strat == "E" and not strategy.two_candle_confirm(candles, direction, config.E_CONFIRM_CANDLES):
+                continue
+            setup = "MA_BB_CHOP" if strat == "E" else "MA_BB"
+            if not strategy.setup_allowed(setup, now.date()):
+                continue
+            key = f"{setup}:{self.last_de_candle.isoformat()}"
+            if key in self.acted:
+                continue
+            self.acted.add(key)
+            log.info("SIGNAL %s %s trend=%s pct_b=%s ma=%.2f spot=%.2f", setup, direction, trend,
+                     f"{pct_b:.2f}" if pct_b is not None else "n/a", ma, spot)
+            self.journal.event("SIGNAL", now, setup=setup, direction=direction, trend=trend,
+                               pct_b=pct_b, ma=ma, spot=spot)
+            self.enter(now, setup, direction, strategies=(strat,))
+
+    def news_blackout_active(self, now: datetime) -> bool:
+        """Bot-wide: no new entries (any strategy) within NEWS_BLACKOUT_BEFORE/AFTER_MIN of a time
+        listed for today in config.NEWS_EVENTS. Does not pause the underlying setup state machines --
+        a signal that fires during the blackout is simply not traded, same as any other rejected entry."""
+        events = config.NEWS_EVENTS.get(now.date().isoformat(), [])
+        return bool(events) and strategy.in_news_blackout(
+            now, events, config.NEWS_BLACKOUT_BEFORE_MIN, config.NEWS_BLACKOUT_AFTER_MIN)
+
     def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None,
              strategies: tuple[str, ...] | None = None) -> None:
+        if self.news_blackout_active(now):
+            log.info("No new entries: NEWS_BLACKOUT active at %s", now.strftime("%H:%M:%S"))
+            return
         equity = self.broker.get_account()["equity"]
         if not self.entry_possible(equity, setup, strategies):
             return
@@ -539,7 +659,8 @@ class Bot:
             self.journal.event("ENTRY_REJECTED", now, strategy=strat, setup=setup, direction=direction,
                                right=right, short=short_strike, long=long_strike, reason=reject, quote=quote)
             return f"skip: {reject}{detail}", 0.0
-        qty = contracts_for(equity, width, quote.mid, open_risk, strategy.is_news_day(self.today))
+        qty = contracts_for(equity, width, quote.mid, open_risk, strategy.is_news_day(self.today),
+                           half_size=(strat in ("D", "E")))
         if qty == 0:
             log.info("%s_SKIPPED sizing: 0 contracts (equity %.2f width %d credit %.2f open risk %.2f)",
                      strat, equity, width, quote.mid, open_risk)
@@ -567,7 +688,7 @@ class Bot:
             best_price=credit, profit_target=target, stop_loss=stop, entry_mid=quote.mid)
         self.pm.open(spread)
         card = format_entry_card(spread, self.risk.state.for_strategy(strat).trades_today + 1)
-        log.info("\n%s", card)
+        log.info("\n%s", card, extra={"keep": True})
         self.journal.card(card, now)
         return f"sell {short_strike:g}{right} buy {long_strike:g}{right} x{filled_qty} @ {credit:.2f}{detail}", spread.open_risk
 
@@ -635,7 +756,7 @@ class Bot:
                 day_pnl = s.pnl_by_strategy()
                 day_pnl[strat] = round(day_pnl.get(strat, 0.0) + row["position_pnl"], 2)
             card = format_close_card(row, trade_no, day_pnl, s.trades_today, remaining)
-            log.info("\n%s", card)
+            log.info("\n%s", card, extra={"keep": True})
             self.journal.card(card, now_et())
         if fills:
             self.save_state()
@@ -691,7 +812,7 @@ class Bot:
             "=" * 72,
         ]
         for line in lines:
-            log.info(line)
+            log.info(line, extra={"keep": True})
         self.journal.event("START", now, account=acct, pnl=pnl, positions=positions, orders=orders, tier=t)
 
     def report_end(self, now: datetime) -> None:
@@ -718,8 +839,8 @@ class Bot:
         lines.extend(f"   !! {m}" for m in mismatches)
         lines.append("=" * 72)
         for line in lines:
-            (log.critical if mismatches else log.info)(line)
-        log.info("\n%s", table)
+            (log.critical if mismatches else log.info)(line, extra={"keep": True})
+        log.info("\n%s", table, extra={"keep": True})
         self.journal.event("END", now, account=acct, day=s.to_dict(), mismatches=mismatches)
 
     # ----------------------------------------------------------------- state
@@ -734,29 +855,31 @@ class Bot:
         })
 
     def on_interrupt(self) -> None:
+        keep = {"extra": {"keep": True}}
         if self.risk is not None:
             self.save_state()
         if not self.pm.positions:
-            log.warning("Interrupted by user. No open position.")
+            log.warning("Interrupted by user. No open position.", **keep)
             return
         if config.CLOSE_ON_INTERRUPT and self.risk is not None:
-            log.warning("Interrupted by user with %d open position(s): closing them now.", len(self.pm.positions))
+            log.warning("Interrupted by user with %d open position(s): closing them now.",
+                       len(self.pm.positions), **keep)
             try:
                 self.record_fills(self.pm.force_close(now_et(), self.spread_prices(), reason="INTERRUPT_CLOSE"))
             except BrokerError as e:
                 log.error("Close on interrupt failed: %s", e)
             self.save_state()
             if not self.pm.positions:
-                log.warning("All positions closed; flat.")
+                log.warning("All positions closed; flat.", **keep)
                 return
-        log.warning("Nothing (more) was closed automatically.")
+        log.warning("Nothing (more) was closed automatically.", **keep)
         for strat, p in self.pm.positions.items():
             log.warning("OPEN POSITION [%s]: %s sell %s%s / buy %s%s x%d, entry credit %.2f, last %.2f, exp %s",
                         strat, p.direction, p.short_strike, p.right, p.long_strike, p.right, p.remaining,
-                        p.entry_credit, p.current_price, p.expiration)
+                        p.entry_credit, p.current_price, p.expiration, **keep)
         log.warning("To close: restart `python scheduler.py` (it re-adopts and manages the spreads), "
                     "or run `python alpaca-reset.py` to liquidate ALL positions, "
-                    "or close the SPXW legs in the Alpaca dashboard.")
+                    "or close the SPXW legs in the Alpaca dashboard.", **keep)
 
 
 def _raise_interrupt(signum, frame) -> None:

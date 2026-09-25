@@ -518,3 +518,170 @@ def test_on_break_ignores_premarket_candles_and_wick_only_break(bot):
             (7619, 7621, 7615, 7618)]      # 09:32
     bot.try_on_break_entry(et(9, 34), make_candles(et(9, 26), bars))
     assert bot.pm.positions == {} and bot.on_setup.state == bot.on_setup.WAITING
+
+
+# ------------------------------------------------------ adaptive ES confirmation source (Phase 5)
+
+def test_overnight_levels_uses_spx_proxy_when_live_es_unavailable(bot, monkeypatch):
+    from strategy import Levels
+    monkeypatch.setattr(config, "BREAKOUT_LEVEL_SOURCE", "ES_TO_SPX")
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: False)
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 5.0
+    levels, symbol = bot.overnight_levels_for_signal()
+    assert symbol == config.SPX_SYMBOL and levels.high == 7625.0
+
+
+def test_overnight_levels_switches_to_raw_es_when_live_available(bot, monkeypatch):
+    from strategy import Levels
+    monkeypatch.setattr(config, "BREAKOUT_LEVEL_SOURCE", "ES_TO_SPX")
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 5.0
+    levels, symbol = bot.overnight_levels_for_signal()
+    assert symbol == config.ES_SYMBOL and levels.high == 7620.0   # unshifted -- raw ES level
+
+
+def test_overnight_levels_explicit_es_override_ignores_live_availability(bot, monkeypatch):
+    from strategy import Levels
+    monkeypatch.setattr(config, "BREAKOUT_LEVEL_SOURCE", "ES")
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: False)
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    levels, symbol = bot.overnight_levels_for_signal()
+    assert symbol == config.ES_SYMBOL
+
+
+# ---------------------------------------------------------------------- Strategy C: ES_BREAK
+
+def test_es_break_fires_on_close_only_confirmation(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    # break candle wicks well below the level but still CLOSES above it -- TwoCandleBreak ignores
+    # the wick entirely (unlike ON_BREAK's OrbSetup, which would read that wick as a pullback).
+    bars = [(7615, 7625, 7500, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_es_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert set(bot.pm.positions) == {"C"}
+    c = bot.pm.positions["C"]
+    assert (c.short_strike, c.long_strike, c.entry_credit) == (7565.0, 7560.0, 0.90)
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ES_BREAK"][0]
+    assert sig["direction"] == "BULLISH"
+
+
+def test_es_break_not_checked_when_c_not_in_strategies(bot):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_es_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert bot.pm.positions == {} and bot.es_setup is None
+
+
+def test_es_break_resets_on_close_back_inside_no_wick_pullback_path(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624),      # break
+            (7624, 7625, 7619, 7619)]      # closes back inside -> reset, no PULLBACK state to salvage it
+    bot.try_es_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert bot.pm.positions == {} and bot.es_setup.state == bot.es_setup.WAITING
+
+
+# ------------------------------------------------------------ Strategies D/E: MA/Bollinger reversion
+
+def _de_candles(n=30):
+    from conftest import make_candles
+    bars = [(7600.0, 7601.0, 7599.0, 7600.0)] * n
+    return make_candles(et(11, 0), bars, minutes=5)
+
+
+def test_mean_reversion_entry_opens_d_on_bullish_signal(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert set(bot.pm.positions) == {"D"}
+    d = bot.pm.positions["D"]
+    assert (d.short_strike, d.long_strike) == (7565.0, 7560.0)
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "MA_BB"][0]
+    assert sig["direction"] == "BULLISH"
+
+
+def test_mean_reversion_entry_none_when_signal_is_none(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: None)
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert bot.pm.positions == {}
+
+
+def test_mean_reversion_entry_skips_e_without_two_candle_confirm(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    monkeypatch.setattr(scheduler.strategy, "two_candle_confirm", lambda *a, **k: False)
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    # D still fires (no confirm requirement); E is skipped
+    assert set(bot.pm.positions) == {"D"}
+
+
+def test_mean_reversion_entry_enters_e_with_confirm_and_half_size(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("E",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    monkeypatch.setattr(scheduler.strategy, "two_candle_confirm", lambda *a, **k: True)
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert set(bot.pm.positions) == {"E"}
+    assert bot.pm.positions["E"].qty <= config.TESTING_HALF_SIZE_MAX_CONTRACTS
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "MA_BB_CHOP"][0]
+    assert sig["direction"] == "BULLISH"
+
+
+def test_mean_reversion_entry_skips_when_not_enough_candles(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles(n=10))
+    called = []
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: called.append(1) or "BULLISH")
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert bot.pm.positions == {} and called == []
+
+
+def test_mean_reversion_entry_skipped_when_d_and_e_already_positioned(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
+    bot.pm.positions["D"] = object()
+    bot.pm.positions["E"] = object()
+    called = []
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: called.append(1) or _de_candles())
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert called == []   # short-circuited before even fetching candles
+
+
+# --------------------------------------------------------------------------------- news blackout
+
+def test_news_blackout_blocks_entry_and_clears_after(bot, monkeypatch):
+    from datetime import time as dtime
+    monkeypatch.setattr(config, "NEWS_EVENTS", {TODAY.isoformat(): [dtime(9, 30)]})
+    bot.enter(et(9, 32), "ORB", BULLISH)
+    assert bot.pm.positions == {}
+    bot.enter(et(9, 40), "ORB", BULLISH)   # outside the +/-5 min window: allowed
+    assert set(bot.pm.positions) == {"A", "B"}
+
+
+def test_news_blackout_boundary_resets_breakout_state_machines(bot, monkeypatch):
+    from datetime import time as dtime
+    import pandas as pd
+    from strategy import OrbSetup
+    monkeypatch.setattr(config, "NEWS_EVENTS", {TODAY.isoformat(): [dtime(9, 30)]})
+    bot.orb_setup = OrbSetup(7620.0, 7560.0)
+    bot.orb_setup.state = OrbSetup.BROKEN
+    bot.orb_setup.direction = BULLISH
+    bot.news_blackout_was_active = True
+    bot.refresh_levels = lambda now: None   # avoid network calls; not under test here
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: pd.DataFrame())
+    bot.tick(et(9, 40))   # blackout window has just cleared
+    assert bot.orb_setup.state == OrbSetup.WAITING

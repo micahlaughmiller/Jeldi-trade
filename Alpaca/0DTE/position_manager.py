@@ -201,7 +201,12 @@ class PositionManager:
 
     def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame) -> list[dict]:
         p.current_price = spread_price
-        p.best_price = min(p.best_price, spread_price)
+        if spread_price < p.best_price:
+            p.best_price = spread_price
+            log.info("[%s] BEST PRICE %.2f (entry %.2f, +%.2f)", p.strategy, spread_price,
+                     p.entry_credit, p.entry_credit - spread_price, extra={"keep": True})
+            self.journal.event("BEST_PRICE", now, strategy=p.strategy, best_price=spread_price,
+                               entry_credit=p.entry_credit)
         self._update_floor(p, now, spread_price)
         if p.floor_price is not None and spread_price >= p.floor_price and spread_price > p.target_price:
             return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)

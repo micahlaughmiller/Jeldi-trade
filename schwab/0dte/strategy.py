@@ -14,7 +14,7 @@ Breakout level source (config.BREAKOUT_LEVEL_SOURCE):
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from enum import StrEnum
 from math import ceil, floor
 
@@ -213,13 +213,25 @@ def exit_setting(strat: str, name: str, default=None):
     return v if v is not None else getattr(config, name, default)
 
 
+EXIT_LEVELS_BY_STRATEGY = {
+    "A": ("PROFIT_TARGET", "STOP_LOSS"),
+    "B": ("B_PROFIT_TARGET", "B_STOP_LOSS"),
+    # C, D, E all use Strategy B's width/strike selection (user's own instruction) and, absent any
+    # strategy-specific target/stop of their own, B's target/stop too -- each has its own config name
+    # so it can be tuned independently later without touching B.
+    "C": ("C_PROFIT_TARGET", "C_STOP_LOSS"),
+    "D": ("D_PROFIT_TARGET", "D_STOP_LOSS"),
+    "E": ("E_PROFIT_TARGET", "E_STOP_LOSS"),
+}
+
+
 def exit_levels(strat: str) -> tuple[float, float]:
-    """(profit_target, stop_loss) in spread-price points for strategy A or B."""
-    if strat == "A":
-        return config.PROFIT_TARGET, config.STOP_LOSS
-    if strat == "B":
-        return config.B_PROFIT_TARGET, config.B_STOP_LOSS
-    raise ValueError(f"unknown strategy {strat!r}")
+    """(profit_target, stop_loss) in spread-price points for the given strategy."""
+    names = EXIT_LEVELS_BY_STRATEGY.get(strat)
+    if names is None:
+        raise ValueError(f"unknown strategy {strat!r}")
+    target_name, stop_name = names
+    return getattr(config, target_name), getattr(config, stop_name)
 
 
 def spread_quote(chain_quotes: list[dict], short_strike: float, long_strike: float) -> SpreadQuote | None:
@@ -404,3 +416,128 @@ def setup_allowed(setup: str, d: date) -> bool:
     if mode == "orb_only":
         return setup == "ORB"
     return True
+
+
+def in_news_blackout(now: datetime, events: list[time], before_min: int, after_min: int) -> bool:
+    """True when `now` falls within `before_min` minutes before or `after_min` minutes after any
+    scheduled news time on today's calendar (config.NEWS_TIMES). Applies bot-wide (all strategies)."""
+    for t in events:
+        event_dt = at_time(now, t)
+        if event_dt - timedelta(minutes=before_min) <= now <= event_dt + timedelta(minutes=after_min):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- Strategy C: ES-sourced break
+
+class TwoCandleBreak:
+    """Close-only break/confirm state machine for Strategy C's ES-overnight-session signal.
+
+    Deliberately simpler than OrbSetup (no wick/pullback path -- the user's own spec: "no wicks
+    count"). Candle N closes beyond the level = armed; the very next candle must ALSO close beyond
+    the SAME level to confirm and fire. A close back inside the level at any point resets to WAITING
+    -- there is no partial-credit pullback/reconfirm state like the ORB/ON_BREAK machine has.
+    """
+
+    WAITING = "WAITING"
+    ARMED = "ARMED"
+    DONE = "DONE"
+
+    def __init__(self, level_high: float, level_low: float):
+        self.level_high = level_high
+        self.level_low = level_low
+        self.state = self.WAITING
+        self.direction: str | None = None
+
+    def _reset(self) -> None:
+        self.state = self.WAITING
+        self.direction = None
+
+    def update(self, candle: pd.Series) -> str | None:
+        """Feed one completed candle; returns BULLISH/BEARISH exactly once per confirmed entry."""
+        close = float(candle.close)
+        if self.state == self.DONE:
+            if self.level_low <= close <= self.level_high:
+                self._reset()
+            return None
+        if self.state == self.WAITING:
+            if close > self.level_high:
+                self.state, self.direction = self.ARMED, BULLISH
+            elif close < self.level_low:
+                self.state, self.direction = self.ARMED, BEARISH
+            return None
+        # ARMED: this candle is the confirmation candle.
+        sign = 1.0 if self.direction == BULLISH else -1.0
+        level = self.level_high if self.direction == BULLISH else self.level_low
+        if sign * (close - level) <= 0:
+            self._reset()
+            return self.update(candle)
+        direction = self.direction
+        self.state = self.DONE
+        return direction
+
+
+# ------------------------------------------------------------- Strategies D/E: MA/Bollinger reversion
+
+def ema(values: pd.Series, span: int) -> pd.Series:
+    return values.ewm(span=span, adjust=False).mean()
+
+
+def bollinger(values: pd.Series, period: int, num_std: float,
+             basis: pd.Series | None = None) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """(basis, upper, lower). `basis` defaults to a rolling SMA; pass the strategy's own EMA
+    (e.g. the 30 EMA that config.D_EMA_SLOW_SPAN also matches to) to use that as the band's
+    center line instead, matching the user's "match the BB and moving average" instruction."""
+    center = basis if basis is not None else values.rolling(period).mean()
+    std = values.rolling(period).std(ddof=0)
+    return center, center + num_std * std, center - num_std * std
+
+
+def percent_b(price: float, upper: float, lower: float) -> float | None:
+    """0.0 = at/below the lower band, 1.0 = at/above the upper band, 0.5 = at the basis line."""
+    width = upper - lower
+    if width <= 0:
+        return None
+    return (price - lower) / width
+
+
+def ema_trend(ema_fast: float, ema_slow: float, chop_threshold: float) -> str:
+    """RISING/FALLING/CHOP from the fast-vs-slow EMA relationship. CHOP when the two are within
+    chop_threshold of each other (a proxy for "crossing" -- exact equality is a zero-measure event
+    on real price data, so this is read as a tight-spread/converging band around the cross)."""
+    if abs(ema_fast - ema_slow) < chop_threshold:
+        return "CHOP"
+    return "RISING" if ema_fast > ema_slow else "FALLING"
+
+
+def mean_reversion_signal(spot: float, ma: float, pct_b: float | None, trend: str,
+                          band_touch: float) -> str | None:
+    """Strategy D/E entry direction, or None if no valid setup right now.
+
+    Trend gates direction (rising -> only the bull-side reversion, falling -> only bear-side, chop
+    -> sit out entirely). Within whichever side the trend allows, price must also be on the correct
+    side of the MA AND within band_touch of the matching Bollinger extreme (>= band_touch reading as
+    %B for the upper touch, <= 1 - band_touch for the lower touch) -- both conditions from the
+    dictated rule ("above MA and near/touching BB is a bear credit spread, below MA near/touching BB
+    is bull credit spread"), i.e. a bull-side reversion needs price below the MA and pct_b <= 1-band_touch.
+    """
+    if trend == "CHOP" or pct_b is None:
+        return None
+    if trend == "RISING":
+        if spot < ma and pct_b <= (1.0 - band_touch):
+            return BULLISH
+        return None
+    if trend == "FALLING":
+        if spot > ma and pct_b >= band_touch:
+            return BEARISH
+        return None
+    raise ValueError(f"unknown trend {trend!r}")
+
+
+def two_candle_confirm(candles: pd.DataFrame, direction: str, n: int = 2) -> bool:
+    """Strategy E's chop-day rule: the last n completed candles all closed in `direction`
+    (green/green for bullish, red/red for bearish)."""
+    if candles is None or len(candles) < n:
+        return False
+    bodies = _signed_bodies(candles.tail(n), direction)
+    return bool((bodies > 0).all())

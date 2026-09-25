@@ -5,6 +5,7 @@ cached for config.DATA_CACHE_SEC to avoid hammering Yahoo on a 15 s tick.
 """
 
 import logging
+import os
 import time as _time
 from datetime import datetime, timedelta
 
@@ -18,6 +19,80 @@ log = logging.getLogger(__name__)
 
 _CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
 _COLUMNS = ["open", "high", "low", "close", "volume"]
+
+# 2026-09-25: optional real-time ES via a Schwab account with futures data entitlement, reusing the
+# same schwab-py client the Schwab broker folder already authenticates with (cross-broker DATA-only
+# credentials in THIS folder's .env, mirroring the existing reverse pattern where the Schwab folder
+# borrows Alpaca's indicative SPX quotes). yfinance's ES=F is ~10 minutes delayed -- fine for the
+# overnight LEVEL (a static number established once, well before the open), but not fast enough for
+# a genuine live ES-leads-SPX confirmation. Every function below fails soft: any missing credential,
+# import error, or API error just returns None, and the caller falls back to the existing yfinance
+# path -- this must never be able to crash the bot over an optional speed upgrade.
+_SCHWAB_CLIENT = None   # None = not yet tried, False = tried and failed (don't retry every tick)
+
+
+def _schwab_client():
+    global _SCHWAB_CLIENT
+    if _SCHWAB_CLIENT is not None:
+        return _SCHWAB_CLIENT or None
+    app_key = os.getenv("SCHWAB_APP_KEY", "").strip()
+    app_secret = os.getenv("SCHWAB_APP_SECRET", "").strip()
+    token_path = os.getenv("SCHWAB_TOKEN_PATH", "").strip()
+    if not (app_key and app_secret and token_path):
+        _SCHWAB_CLIENT = False
+        return None
+    try:
+        from schwab.auth import client_from_token_file
+        _SCHWAB_CLIENT = client_from_token_file(token_path, app_key, app_secret)
+    except Exception as e:
+        log.warning("Schwab client unavailable for live ES data (falling back to delayed yfinance "
+                    "ES=F): %s", e)
+        _SCHWAB_CLIENT = False
+        return None
+    return _SCHWAB_CLIENT
+
+
+def live_es_available() -> bool:
+    """True once this folder's Schwab cross-auth is configured and working -- lets callers switch
+    from the ES_TO_SPX proxy (confirm on live SPX candles against a basis-shifted ES level) to
+    confirming directly on ES's own (now genuinely live) candles for the real lead-time edge."""
+    return _schwab_client() is not None
+
+
+def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
+    """Real ES futures candles via Schwab (config.ES_SCHWAB_SYMBOL, e.g. "/ES"), resampled to
+    interval_min. Returns None -- never raises -- if Schwab cross-auth isn't configured in this
+    folder's .env or the call fails for any reason; get_candles() falls back to yfinance in that case."""
+    client = _schwab_client()
+    if client is None:
+        return None
+    now = _now(now)
+    # Cached like _download's yfinance calls: at TICK_SECONDS=1 (fast-as-Alpaca-allows polling) an
+    # uncached call here would hit Schwab's API every single tick across every running persona --
+    # this keeps it to at most one real request per DATA_CACHE_SEC regardless of tick rate.
+    cache_key = ("es_live", config.ES_SCHWAB_SYMBOL)
+    hit = _CACHE.get(cache_key)
+    if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
+        candles = hit[1]
+    else:
+        try:
+            resp = client.get_price_history_every_minute(config.ES_SCHWAB_SYMBOL, need_extended_hours_data=True)
+            data = resp.json()
+        except Exception as e:
+            log.warning("Schwab ES price history failed (falling back to delayed yfinance ES=F): %s", e)
+            return None
+        candles = data.get("candles") or []
+        _CACHE[cache_key] = (_time.monotonic(), candles)
+    if not candles:
+        return None
+    df = pd.DataFrame(candles)
+    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(config.ET)
+    df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]].sort_index()
+    if interval_min > 1:
+        df = df.resample(f"{interval_min}min").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    df = df[(df.index >= now - timedelta(minutes=lookback_min)) & (df.index + timedelta(minutes=interval_min) <= now)]
+    return df
 
 
 def _now(now: datetime | None) -> datetime:
@@ -89,6 +164,10 @@ def get_spx_es_basis(now: datetime | None = None) -> float | None:
 def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
                 now: datetime | None = None) -> pd.DataFrame:
     now = _now(now)
+    if symbol == config.ES_SYMBOL:
+        live = get_es_candles_live(int(interval.rstrip("m")), lookback_min, now)
+        if live is not None and not live.empty:
+            return live
     df = _download(symbol, "2d", interval, symbol == config.ES_SYMBOL)
     if df.empty:
         return df

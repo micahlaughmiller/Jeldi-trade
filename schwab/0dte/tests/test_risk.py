@@ -41,8 +41,15 @@ def test_b_sizing_uses_width_minus_credit():
     assert contracts_for(2_000, 10, 1.50, 400.0) == 0
 
 
-def test_max_contracts_cap():
+def test_max_contracts_cap_legacy(monkeypatch):
+    monkeypatch.setattr(config, "TESTING_MODE", False)
     assert contracts_for(1_000_000, 5, 3.00, 0.0) == config.MAX_CONTRACTS_PER_TRADE
+
+
+def test_max_contracts_cap_testing_mode():
+    # TESTING_MODE is on by default right now: caps well below MAX_CONTRACTS_PER_TRADE regardless of equity.
+    assert contracts_for(1_000_000, 5, 3.00, 0.0) == config.TESTING_MAX_CONTRACTS
+    assert contracts_for(1_000_000, 5, 3.00, 0.0, half_size=True) == config.TESTING_HALF_SIZE_MAX_CONTRACTS
 
 
 def test_news_day_half_size(monkeypatch):

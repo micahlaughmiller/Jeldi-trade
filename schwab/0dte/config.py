@@ -62,6 +62,10 @@ UNDERLYING = "SPX"
 OPTION_ROOT = "SPXW"
 SPX_SYMBOL = "^GSPC"
 ES_SYMBOL = "ES=F"
+# 2026-09-25: Schwab's own futures quote symbol for the same instrument -- this folder already
+# authenticates to Schwab, so live ES via market_data.get_es_candles_live works here directly (no
+# cross-broker credentials needed, unlike the Alpaca folder's copy of this same mechanism).
+ES_SCHWAB_SYMBOL = "/ES"
 
 MARKET_OPEN = time(9, 30)
 OVERNIGHT_SESSION_START = time(18, 0)
@@ -70,21 +74,34 @@ OVERNIGHT_ENTRY_END_MIN = 30
 LAST_ENTRY_TIME = time(15, 0)     # 2:00 pm CST: last new entry
 FORCE_CLOSE_TIME = time(15, 30)   # 2:30 pm CST: everything closed
 
-TICK_SECONDS = 15
+# 2026-09-25: "as fast as Alpaca will let them" -- tightened from 15s. Watch for rate limiting
+# across concurrent processes (options-chain calls in manage() are the heaviest; yfinance/Schwab
+# candle calls are cache-protected at DATA_CACHE_SEC regardless of tick rate). Back this off if
+# rate limiting shows up in the logs.
+TICK_SECONDS = 1
 CANDLE_INTERVAL = "2m"
 ORB_CANDLE_INTERVAL = "5m"
 ORB_SETUP_TIMEOUT_CANDLES = 6
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
 
-# ES_TO_SPX: ES overnight levels + (SPX - ES) basis, compared against live SPX candles.
-# ES: compare ES candles directly against ES levels (Yahoo ES is ~10 min delayed).
+# ES_TO_SPX: ES overnight levels + (SPX - ES) basis, compared against live SPX candles -- or, once
+# market_data.live_es_available() is true (this folder's own Schwab auth already covers it), ES's
+# own candles directly for the real lead-time edge (scheduler.overnight_levels_for_signal).
+# ES: compare ES candles directly against ES levels (Yahoo ES is ~10 min delayed) unconditionally.
 BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 
 # Every signal opens two independent spreads: A sells the ITM spread, B sells an OTM spread
 # whose short strike sits one expected move (ATM straddle) away from spot.
+# 2026-09-25: STRATEGIES stays the default two (A/B); ALL_STRATEGIES is the full catalog.
 STRATEGIES = ("A", "B")
-STRATEGY_LABELS = {"A": "A - ITM", "B": "B - OTM (expected move)"}
+ALL_STRATEGIES = ("A", "B", "C", "D", "E")
+STRATEGY_LABELS = {
+    "A": "A - ITM", "B": "B - OTM (expected move)",
+    "C": "C - ES overnight-break (OTM, same as B)",
+    "D": "D - MA/Bollinger reversion, trend-gated",
+    "E": "E - MA/Bollinger reversion, 5-min chop confirm",
+}
 
 WIDTH_BY_TIER = {1: 5, 2: 5, 3: 10, 4: 10}
 CREDIT_RANGE_BY_WIDTH = {5: (2.75, 3.50), 10: (5.50, 7.00)}
@@ -111,6 +128,11 @@ MAX_CONSECUTIVE_LOSSES = 5
 LIMITS_BY_STRATEGY = {
     "A": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 5, "COOLDOWN_MIN": 30},   # 2026-09-22: 5 trades to test the exit floors
     "B": {},
+    # 2026-09-25: 5 trades/day per strategy for the new multi-strategy personas (each active
+    # strategy independently gets its own 5/day allowance, not a combined cap).
+    "C": {"MAX_TRADES_PER_DAY": 5},
+    "D": {"MAX_TRADES_PER_DAY": 5},
+    "E": {"MAX_TRADES_PER_DAY": 5},
 }
 DAILY_LOSS_LIMIT_PCT = 0.10
 MAX_CONCURRENT_POSITIONS = 1   # per strategy
@@ -124,7 +146,11 @@ MAX_CONCURRENT_POSITIONS = 1   # per strategy
 # uses) instead of the old OVERNIGHT detector, which had no re-arm gate and could re-fire on every
 # candle of a continuing move (32 B entries off one signal on 2026-09-23). OVERNIGHT is retired for
 # both strategies; the detector function itself (strategy.detect_breakout) is left in place, unused.
-SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB")}
+# ES_BREAK (2026-09-25, Strategy C): the SAME overnight level run through strategy.TwoCandleBreak
+# instead of OrbSetup -- a deliberately simpler close-only break+confirm ("no wicks count") rather
+# than ON_BREAK's wick-aware break/pullback/momentum machine. D and E are NOT setup-driven: their
+# signal comes from check_mean_reversion_entry each tick, not from a fired breakout.
+SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB"), "C": ("ES_BREAK",)}
 # Both entry kinds for A: the 2026-09-21 replay showed a trend day with one momentum break and no pullback.
 ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}
 
@@ -137,6 +163,14 @@ STOP_LOSS = 0.60
 STOP_CONFIRM_TICKS = 1
 B_PROFIT_TARGET = 0.30
 B_STOP_LOSS = 0.50
+# C, D: same target/stop as B by default. E: 5-cent target for the choppy-day variant; its stop
+# defaults to B's pending real tuning.
+C_PROFIT_TARGET = B_PROFIT_TARGET
+C_STOP_LOSS = B_STOP_LOSS
+D_PROFIT_TARGET = B_PROFIT_TARGET
+D_STOP_LOSS = B_STOP_LOSS
+E_PROFIT_TARGET = 0.05
+E_STOP_LOSS = B_STOP_LOSS
 RUNNER_ENABLED = True
 RUNNER_MIN_CONTRACTS = 2
 # Fraction of the position booked at the target when momentum continues; the rest runs with the stop at
@@ -220,7 +254,13 @@ A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_
                  "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True,
                  "STOP_CONFIRM_TICKS": 2, "MOMENTUM_CONFIRM_ENABLED": True}
 B_BASE_TUNING = {"REENTRY_ON_CONTINUATION_ENABLED": True}
-EXIT_TUNING_BY_STRATEGY = {"A": dict(A_BASE_TUNING), "B": dict(B_BASE_TUNING)}
+C_BASE_TUNING: dict = {}
+D_BASE_TUNING: dict = {}
+E_BASE_TUNING: dict = {}
+EXIT_TUNING_BY_STRATEGY = {
+    "A": dict(A_BASE_TUNING), "B": dict(B_BASE_TUNING),
+    "C": dict(C_BASE_TUNING), "D": dict(D_BASE_TUNING), "E": dict(E_BASE_TUNING),
+}
 
 ENTRY_STEP_SEC = 20
 ENTRY_PRICE_STEP = 0.05
@@ -242,3 +282,41 @@ NEWS_DAYS = [
     "2026-12-09",
 ]
 NEWS_DAY_MODE = "half_size"
+
+# 2026-09-25: bot-wide news blackout (all strategies) -- no new entries from NEWS_BLACKOUT_BEFORE_MIN
+# before to NEWS_BLACKOUT_AFTER_MIN after any time listed for today in NEWS_EVENTS, sourced from
+# MarketWatch/Yahoo Finance calendars. Keyed by ISO date since real calendar events move month to
+# month. Common recurring ET slots for reference (NOT pre-populated):
+#   08:30  many BLS/Census releases (CPI, PPI, jobs report, jobless claims, retail sales)
+#   10:00  ISM, consumer confidence/sentiment
+#   14:00  FOMC statement
+NEWS_EVENTS: dict[str, list[time]] = {}
+NEWS_BLACKOUT_BEFORE_MIN = 5
+NEWS_BLACKOUT_AFTER_MIN = 5
+
+# ------------------------------------------------------------ Strategies D/E: MA/Bollinger reversion
+# Intraday adaptation of the dictated EMA(9)/EMA(30)+Bollinger(20,2) secondary strategy, using the
+# indicators as taught in https://youtu.be/3uqr_tf8fr8 (Invest with Henry): a single 30-period line
+# for trend/timing plus a Bollinger Band matched to that SAME period, per the user's explicit "match
+# the BB and moving average to 30 days" instruction. The 9 EMA classifies the day rising/falling/choppy.
+D_EMA_FAST_SPAN = 9
+D_EMA_SLOW_SPAN = 30          # also the Bollinger basis
+D_BB_PERIOD = 30
+D_BB_STD = 2.0
+# "Crossing" (9 EMA vs 30 EMA within this many SPX points) reads as flat/choppy -- sit out entirely.
+# Not given an exact number by the user -- a starting assumption pending real tuning.
+D_EMA_CHOP_THRESHOLD_PTS = 2.0
+# "90% away from middle" on the standard 0-1 %B scale: >= 0.95 (upper) or <= 0.05 (lower).
+D_BAND_TOUCH_PCT_B = 0.95
+# Candle interval D/E compute their EMA/Bollinger read on, and E's two-candle chop confirmation uses.
+D_E_CANDLE_INTERVAL = "5m"
+D_E_MIN_CANDLES = 30           # need a full period before the EMA(30)/Bollinger(30) read is trustworthy
+E_CONFIRM_CANDLES = 2
+
+# ---------------------------------------------------------------- testing-phase contract sizing
+# 2026-09-25: while C/D/E are being live-tested, contract size is capped well below the normal
+# tier-based sizing -- half that cap again for Strategy D (always) and Strategy E (choppy-day
+# variant). Supersedes MAX_CONTRACTS_PER_TRADE while TESTING_MODE is True; revert once testing ends.
+TESTING_MODE = True
+TESTING_MAX_CONTRACTS = 6
+TESTING_HALF_SIZE_MAX_CONTRACTS = 3

@@ -2,6 +2,7 @@
 
 import pytest
 
+import config
 import market_data
 
 
@@ -15,9 +16,11 @@ def _clear_es_cache():
 
 
 def test_schwab_client_none_without_credentials(monkeypatch):
-    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
-    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
-    monkeypatch.delenv("SCHWAB_TOKEN_PATH", raising=False)
+    # _schwab_client reads through config (which itself has a hardcoded SCHWAB_TOKEN_PATH default),
+    # not a raw os.getenv -- blank out all three explicitly rather than relying on env absence.
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
+    monkeypatch.setattr(config, "SCHWAB_APP_SECRET", "")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", "")
     market_data._SCHWAB_CLIENT = None
     assert market_data._schwab_client() is None
     # cached as False (tried once, not retried) rather than None (untried) on the second call

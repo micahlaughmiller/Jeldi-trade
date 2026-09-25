@@ -51,9 +51,17 @@ OPTION_ROOT = "SPXW"
 SPX_SYMBOL = "^GSPC"
 ES_SYMBOL = "ES=F"
 # 2026-09-25: Schwab's own futures quote symbol for the same instrument, used only if this folder's
-# .env has SCHWAB_APP_KEY/SCHWAB_APP_SECRET/SCHWAB_TOKEN_PATH set (see market_data.get_es_candles_live)
-# -- optional, real-time ES via a Schwab account with futures data entitlement.
+# .env has SCHWAB_APP_KEY/SCHWAB_APP_SECRET set (see market_data.get_es_candles_live) -- optional,
+# real-time ES via a Schwab account with futures data entitlement.
 ES_SCHWAB_SYMBOL = "/ES"
+# Cross-broker, READ-ONLY market data credentials -- this folder never places a Schwab order.
+# SCHWAB_APP_KEY/SECRET must come from .env (never hardcode a real secret in this file, which is a
+# public repo). SCHWAB_TOKEN_PATH's hardcoded default points at the Schwab bot's OWN token file
+# (same account, same OAuth session) so every persona process and the Schwab bot share ONE file --
+# Schwab's refresh token rotates on each use, so separate copies would invalidate each other.
+SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
+SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
 
 MARKET_OPEN = time(9, 30)
 OVERNIGHT_SESSION_START = time(18, 0)

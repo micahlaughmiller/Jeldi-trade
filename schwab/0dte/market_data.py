@@ -5,7 +5,6 @@ cached for config.DATA_CACHE_SEC to avoid hammering Yahoo on a 15 s tick.
 """
 
 import logging
-import os
 import time as _time
 from datetime import datetime, timedelta
 
@@ -35,9 +34,13 @@ def _schwab_client():
     global _SCHWAB_CLIENT
     if _SCHWAB_CLIENT is not None:
         return _SCHWAB_CLIENT or None
-    app_key = os.getenv("SCHWAB_APP_KEY", "").strip()
-    app_secret = os.getenv("SCHWAB_APP_SECRET", "").strip()
-    token_path = os.getenv("SCHWAB_TOKEN_PATH", "").strip()
+    # Reads through config (not a raw os.getenv) so this picks up the SAME SCHWAB_APP_KEY/SECRET/
+    # TOKEN_PATH resolution config.py already does (including its own sensible per-folder default
+    # for TOKEN_PATH) -- a direct os.getenv here would silently miss credentials that are only set
+    # via config.py's fallback, not literally present as an environment variable.
+    app_key = getattr(config, "SCHWAB_APP_KEY", "").strip()
+    app_secret = getattr(config, "SCHWAB_APP_SECRET", "").strip()
+    token_path = getattr(config, "SCHWAB_TOKEN_PATH", "").strip()
     if not (app_key and app_secret and token_path):
         _SCHWAB_CLIENT = False
         return None

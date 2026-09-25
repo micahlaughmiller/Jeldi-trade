@@ -171,7 +171,11 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
         live = get_es_candles_live(int(interval.rstrip("m")), lookback_min, now)
         if live is not None and not live.empty:
             return live
-    df = _download(symbol, "2d", interval, symbol == config.ES_SYMBOL)
+    # 2026-09-25: "5d" (not "2d") so a large lookback_min (D/E's multi-session EMA/Bollinger window)
+    # can actually reach back far enough on a Monday morning -- yfinance's period is CALENDAR days,
+    # so "2d" on a Monday only reaches Saturday and misses Friday's session entirely. The extra data
+    # is free: every caller still filters down to its own lookback_min afterward.
+    df = _download(symbol, "5d", interval, symbol == config.ES_SYMBOL)
     if df.empty:
         return df
     minutes = int(interval.rstrip("m"))

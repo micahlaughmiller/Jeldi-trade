@@ -523,7 +523,7 @@ class Bot:
         if not eligible:
             return
         candles = market_data.get_candles(config.SPX_SYMBOL, config.D_E_CANDLE_INTERVAL,
-                                          config.CANDLE_LOOKBACK_MIN, now)
+                                          config.D_E_LOOKBACK_MIN, now)
         if candles.empty:
             return
         if self.last_de_candle is not None and candles.index[-1] <= self.last_de_candle:
@@ -541,8 +541,12 @@ class Bot:
         direction = strategy.mean_reversion_signal(spot, ma, pct_b, trend, config.D_BAND_TOUCH_PCT_B)
         if direction is None:
             return
+        # E's 2-candle confirmation is same-session-only: "consecutive" has to mean consecutive
+        # trading activity, not the prior day's last candle glued to today's first one (the EMA/
+        # Bollinger read above is deliberately the opposite -- a rolling multi-day window).
+        today_candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
         for strat in eligible:
-            if strat == "E" and not strategy.two_candle_confirm(candles, direction, config.E_CONFIRM_CANDLES):
+            if strat == "E" and not strategy.two_candle_confirm(today_candles, direction, config.E_CONFIRM_CANDLES):
                 continue
             setup = "MA_BB_CHOP" if strat == "E" else "MA_BB"
             if not strategy.setup_allowed(setup, now.date()):

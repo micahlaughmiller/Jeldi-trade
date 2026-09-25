@@ -642,6 +642,47 @@ def test_mean_reversion_entry_none_when_signal_is_none(bot, monkeypatch):
     assert bot.pm.positions == {}
 
 
+def _de_candles_cross_session(today_count, today_body="up"):
+    """30 total 5-min candles: (30 - today_count) from "yesterday" (day 16) plus today_count from
+    today (day 17, starting at the open) -- proves the EMA/Bollinger window is a rolling one that
+    doesn't reset each session."""
+    import pandas as pd
+    from conftest import make_candles
+    yesterday = make_candles(et(10, 0, day=16), [(7600.0, 7601.0, 7599.0, 7600.0)] * (30 - today_count), minutes=5)
+    body = (7600.0, 7601.0, 7599.0, 7601.0) if today_body == "up" else (7601.0, 7601.5, 7599.0, 7599.0)
+    today = make_candles(et(9, 30, day=17), [body] * today_count, minutes=5)
+    return pd.concat([yesterday, today])
+
+
+def test_mean_reversion_entry_d_fires_early_in_session_using_prior_session_candles(bot, monkeypatch):
+    # Regression test: D must NOT need to wait for 30 candles to accumulate fresh each day -- only 1
+    # candle today, 29 from "yesterday" filling the rest of the rolling window, and D still fires.
+    monkeypatch.setattr(config, "STRATEGIES", ("D",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles_cross_session(1))
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    bot.check_mean_reversion_entry(et(9, 35, day=17), scheduler.Phase.ORB_ONLY)
+    assert set(bot.pm.positions) == {"D"}
+
+
+def test_mean_reversion_entry_e_does_not_confirm_across_the_session_boundary(bot, monkeypatch):
+    # E's 2-candle confirmation must be same-session-only: with just 1 candle today, there is no
+    # valid "2 consecutive today candles" no matter how many prior-session candles exist -- confirmed
+    # using the REAL two_candle_confirm (not mocked) on genuinely cross-day candle data.
+    monkeypatch.setattr(config, "STRATEGIES", ("E",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles_cross_session(1))
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    bot.check_mean_reversion_entry(et(9, 35, day=17), scheduler.Phase.ORB_ONLY)
+    assert bot.pm.positions == {}
+
+
+def test_mean_reversion_entry_e_confirms_with_two_real_same_session_candles(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("E",))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles_cross_session(2, "up"))
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    bot.check_mean_reversion_entry(et(9, 40, day=17), scheduler.Phase.ORB_ONLY)
+    assert set(bot.pm.positions) == {"E"}
+
+
 def test_mean_reversion_entry_skips_e_without_two_candle_confirm(bot, monkeypatch):
     monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
     monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())

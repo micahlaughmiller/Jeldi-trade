@@ -310,7 +310,15 @@ D_EMA_CHOP_THRESHOLD_PTS = 2.0
 D_BAND_TOUCH_PCT_B = 0.95
 # Candle interval D/E compute their EMA/Bollinger read on, and E's two-candle chop confirmation uses.
 D_E_CANDLE_INTERVAL = "5m"
-D_E_MIN_CANDLES = 30           # need a full period before the EMA(30)/Bollinger(30) read is trustworthy
+# 2026-09-25: this is a ROLLING window, same as any 30-period indicator on a real chart -- it does
+# NOT reset at the open and rebuild from zero each session (that was a bug, not a design choice: D/E
+# should be able to fire any time during the day, using the prior session's tail candles to fill the
+# window early in a new day, not sitting out until today alone has accumulated 30 bars). 4000 minutes
+# (~2.75 days) comfortably reaches across a normal overnight gap AND a long weekend (Friday close ->
+# Monday open). D_E_MIN_CANDLES stays as a safety net for a genuine data outage -- it should now
+# essentially always already be satisfied.
+D_E_LOOKBACK_MIN = 4000
+D_E_MIN_CANDLES = 30
 E_CONFIRM_CANDLES = 2
 
 # ---------------------------------------------------------------- testing-phase contract sizing

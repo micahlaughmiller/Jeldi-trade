@@ -659,6 +659,21 @@ class Bot:
             self.journal.event("ENTRY_REJECTED", now, strategy=strat, setup=setup, direction=direction,
                                right=right, short=short_strike, long=long_strike, reason=reject, quote=quote)
             return f"skip: {reject}{detail}", 0.0
+        # 2026-09-25: B, C, D, E all share select_strikes_b's OTM-at-expected-move logic, so two of
+        # them can land on the IDENTICAL contract on the same day -- Alpaca tracks positions by
+        # contract symbol, not by our per-strategy label, so two strategies both trying to manage
+        # "their" slice of what the broker sees as one combined position breaks its position_intent
+        # inference on close ("inferred: buy_to_open, specified: buy_to_close"), leaving the position
+        # stuck open after CLOSE_MAX_RETRIES. Refuse the second entry outright rather than risk that.
+        collision = next((s for s, p in self.pm.positions.items()
+                          if p.right == right and p.short_strike == short_strike
+                          and p.long_strike == long_strike and p.expiration == self.today), None)
+        if collision:
+            reason = f"STRIKE_COLLISION {short_strike:g}/{long_strike:g}{right} already open under {collision}"
+            log.info("[%s] ENTRY REJECTED %s %s: %s", strat, direction, right, reason)
+            self.journal.event("ENTRY_REJECTED", now, strategy=strat, setup=setup, direction=direction,
+                               right=right, short=short_strike, long=long_strike, reason=reason, quote=quote)
+            return f"skip: {reason}{detail}", 0.0
         qty = contracts_for(equity, width, quote.mid, open_risk, strategy.is_news_day(self.today),
                            half_size=(strat in ("D", "E")))
         if qty == 0:

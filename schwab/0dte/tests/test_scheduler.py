@@ -570,6 +570,28 @@ def test_es_break_fires_on_close_only_confirmation(bot, monkeypatch):
     assert sig["direction"] == "BULLISH"
 
 
+def test_es_break_rejects_strike_collision_with_already_open_b(bot, monkeypatch, caplog):
+    # Regression test for a real live failure: B and C (and D/E) all use select_strikes_b, so they
+    # can land on the identical contract -- Alpaca then can't reconcile two strategies each trying to
+    # manage "their" slice of one combined broker-side position, and CLOSE_FAILED with a
+    # position_intent mismatch once either side tries to exit. Refuse the second entry outright.
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    from conftest import make_candles
+    from strategy import Levels
+    bot.enter(et(10, 15), "ORB", BULLISH)   # opens A and B; B lands on 7565/7560 (see put_chain())
+    assert "B" in bot.pm.positions
+    b_qty_before = bot.pm.positions["B"].qty
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]   # would pick the SAME 7565/7560 as B
+    bot.try_es_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert "C" not in bot.pm.positions
+    assert bot.pm.positions["B"].qty == b_qty_before   # B untouched
+    rejected = [r for r in events(bot, "ENTRY_REJECTED") if r["strategy"] == "C"]
+    assert rejected and "STRIKE_COLLISION" in rejected[0]["reason"] and "B" in rejected[0]["reason"]
+
+
 def test_es_break_not_checked_when_c_not_in_strategies(bot):
     from conftest import make_candles
     from strategy import Levels

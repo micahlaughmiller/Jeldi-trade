@@ -246,6 +246,18 @@ class OrderManager:
     def _profit_target(self, entry_credit: float) -> float:
         return max(0.05, round_to_nickel(entry_credit * (1 - self.config.PROFIT_TARGET_PCT)))
 
+    def _profit_floor_arm_price(self, entry_credit: float) -> float:
+        """Spread price at which the profit floor arms: PROFIT_FLOOR_ARM_PCT_OF_TARGET of the way
+        to the profit target (e.g. 0.85 of a 50%-of-max target = 42.5% of max profit achieved)."""
+        arm_pct = self.config.PROFIT_TARGET_PCT * self.config.PROFIT_FLOOR_ARM_PCT_OF_TARGET
+        return max(0.05, round_to_nickel(entry_credit * (1 - arm_pct)))
+
+    def _profit_floor_price(self, entry_credit: float) -> float:
+        """Once armed, a hard exit floor at PROFIT_FLOOR_PCT_OF_MAX of max profit -- a fixed level,
+        not a trail off the best price seen, so a position that armed then gave back everything
+        still exits with at least this much rather than round-tripping to a loss."""
+        return max(0.05, round_to_nickel(entry_credit * (1 - self.config.PROFIT_FLOOR_PCT_OF_MAX)))
+
     def _ensure_close_order(self, position: dict[str, Any], force_replace: bool = False) -> None:
         close_id = position.get("close_order_id")
         if close_id and not force_replace:
@@ -339,6 +351,18 @@ class OrderManager:
                 continue
             self._ensure_close_order(position)
             price = self.refresh_price(position)
+            if cfg.PROFIT_FLOOR_ENABLED and price is not None:
+                arm_price = self._profit_floor_arm_price(position["entry_credit"])
+                if not position.get("profit_floor_armed") and price <= arm_price:
+                    position["profit_floor_armed"] = True
+                    self.log.log_event(
+                        "PROFIT_FLOOR_ARMED", f"{position['broker_symbol']}: armed at price {price} (arm level {arm_price})",
+                        spread_id=position["id"])
+                if position.get("profit_floor_armed"):
+                    floor_price = self._profit_floor_price(position["entry_credit"])
+                    if price >= floor_price:
+                        self.exit_at_market(position, f"profit floor (armed, price {price} >= floor {floor_price})")
+                        continue
             if self.risk.is_max_loss_hit(position["entry_credit"], price, spread_width(position)):
                 if not position.get("max_loss_hit"):
                     position["max_loss_hit"] = True

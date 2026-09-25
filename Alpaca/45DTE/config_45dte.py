@@ -68,6 +68,16 @@ DAILY_LOSS_ALERT_PCT = 0.03
 PROFIT_TARGET_PCT = 0.50
 EXIT_DTE = 7
 MAX_LOSS_EXIT = True
+# 2026-09-25: motivated by a real trade that reached 0.48 (40% of max profit, entry 0.80, target
+# 0.40 = 50% of max) then reversed straight through entry to 0.95 -- a near-winner that round-
+# tripped to a loss with no giveback protection at all. Once a position reaches
+# PROFIT_FLOOR_ARM_PCT_OF_TARGET of the way to the profit target (0.85 * 50% = 42.5% of max profit),
+# it arms a HARD FLOOR at PROFIT_FLOOR_PCT_OF_MAX of max profit (30%) -- a fixed level, not a trail
+# off the best price seen, so an armed position that gives back everything still exits with at
+# least 30% rather than riding all the way back through entry.
+PROFIT_FLOOR_ENABLED = True
+PROFIT_FLOOR_ARM_PCT_OF_TARGET = 0.85
+PROFIT_FLOOR_PCT_OF_MAX = 0.30
 ENTRY_TIME_IN_FORCE = "day"
 PRICE_REDUCTION_INTERVAL_MIN = 60
 PRICE_REDUCTION_AMOUNT = 0.02

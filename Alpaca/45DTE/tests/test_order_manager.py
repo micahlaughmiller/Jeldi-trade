@@ -259,6 +259,74 @@ class TestMaintenance:
         assert len(om.positions) == 1 and om.positions[0]["close_order_id"] is None
 
 
+class TestProfitFloor:
+    """entry_credit=1.60, PROFIT_TARGET_PCT=0.50, PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.85,
+    PROFIT_FLOOR_PCT_OF_MAX=0.30 -> arm price 0.90 (42.5% of max), floor price 1.10 (30% of max)."""
+
+    def _open_position(self, env, credit=1.60, qty=2):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(credit), qty)
+        broker.fill_order(oid, credit)
+        om.poll_entries()
+        return om.positions[0]
+
+    def test_arms_once_price_reaches_arm_level_but_does_not_exit_yet(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 0.60, 0.30)   # price 0.30, well past the 0.90 arm level, short of target
+        om.maintain()
+        assert pos["profit_floor_armed"] is True
+        assert len(om.positions) == 1   # not exited -- armed, not yet given back to the floor
+
+    def test_not_armed_stays_open_through_a_move_that_never_reached_the_arm_level(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.80, 0.30)   # price 1.50 -- never got close to the 0.90 arm level
+        om.maintain()
+        assert not pos.get("profit_floor_armed")
+        set_chain(broker, 2.00, 0.20)   # widens further to 1.80 (a real loser) -- floor must not fire unarmed
+        om.maintain()
+        assert len(om.positions) == 1 and not pos.get("profit_floor_armed")
+
+    def test_exits_at_floor_after_arming_and_giving_back(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        close_id = pos["close_order_id"]
+        set_chain(broker, 0.60, 0.30)    # price 0.30: arms (past the 0.90 arm level)
+        om.maintain()
+        assert pos["profit_floor_armed"] is True
+        set_chain(broker, 1.50, 0.30)    # reverses to price 1.20 -- past the 1.10 floor
+        om.maintain()
+        assert om.positions == []
+        assert broker.orders[close_id]["status"] == "canceled"
+        closed = om.state["closed"][-1]
+        assert closed["exit_debit"] == 1.20 and "profit floor" in closed["close_reason"]
+        # this is the user's own real scenario: reached close to target, reversed hard -- the floor
+        # exit at 1.20 (a real, if partial, profit) beats letting it round-trip through entry (1.60)
+        # to an outright loss.
+        assert closed["realized_pl"] == pytest.approx((1.60 - 1.20) * 100 * 2)
+
+    def test_armed_position_still_exits_on_dte_if_floor_never_re_triggers(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 0.60, 0.30)
+        om.maintain()
+        assert pos["profit_floor_armed"] is True
+        set_chain(broker, 0.50, 0.20)    # stays favorable, never gives back to the floor
+        clock.now = datetime.combine(EXP - timedelta(days=7), datetime.min.time(), tzinfo=ET).replace(hour=10)
+        om.maintain()
+        assert om.positions == []
+        assert "DTE 7" in om.state["closed"][-1]["close_reason"]
+
+    def test_disabled_via_config_never_arms_or_exits(self, env, monkeypatch):
+        clock, broker, log, om, tmp = env
+        monkeypatch.setattr(config_45dte, "PROFIT_FLOOR_ENABLED", False)
+        pos = self._open_position(env)
+        set_chain(broker, 0.60, 0.30)    # price 0.30 -- would have armed if enabled
+        om.maintain()
+        assert not pos.get("profit_floor_armed") and len(om.positions) == 1
+
+
 class TestAdoptAndReconcile:
     def test_adopts_paired_legs_and_matches_close_order(self, env):
         clock, broker, log, om, tmp = env

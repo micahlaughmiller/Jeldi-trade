@@ -39,6 +39,12 @@ class Phase(StrEnum):
 ENTRY_PHASES = {Phase.OVERNIGHT_ONLY, Phase.ORB_ONLY}
 OVERNIGHT_PHASES = {Phase.OVERNIGHT_ONLY}
 ORB_PHASES = {Phase.ORB_ONLY}
+ORB_SETUPS = ("ORB", "STOCK_ORB")   # opening-range setups admitted by NEWS_DAY_MODE "orb_only"
+
+
+def spx_strategies() -> tuple[str, ...]:
+    """Active strategies that trade the SPX signal funnel (stock strategies such as F are excluded)."""
+    return tuple(s for s in config.STRATEGIES if s not in config.STOCK_STRATEGIES)
 
 
 @dataclass(frozen=True)
@@ -222,6 +228,8 @@ EXIT_LEVELS_BY_STRATEGY = {
     "C": ("C_PROFIT_TARGET", "C_STOP_LOSS"),
     "D": ("D_PROFIT_TARGET", "D_STOP_LOSS"),
     "E": ("E_PROFIT_TARGET", "E_STOP_LOSS"),
+    # F's live target/stop are width-scaled per position (f_exit_params); these are registry placeholders.
+    "F": ("F_PROFIT_TARGET", "F_STOP_LOSS"),
 }
 
 
@@ -350,6 +358,98 @@ def select_strikes_b(spot: float, right: str, width: int, em: float,
     return None, None, f"B_NO_STRIKE_IN_RANGE no credit in {lo:.2f}-{hi:.2f} after 20 steps"
 
 
+# ---------------------------------------------------------------- Strategy F: stock ORB credit spreads
+
+def strike_increment(chain_rows: list[dict], spot: float, band_pct: float | None = None) -> float | None:
+    """Smallest gap between distinct quoted strikes within +/-band_pct of spot (every strike when fewer
+    than two sit in the band); None with fewer than two strikes at all."""
+    band = config.F_EM_WINDOW_PCT if band_pct is None else band_pct
+    strikes = sorted({round(float(q["strike"]), 2) for q in chain_rows})
+    near = [k for k in strikes if abs(k - spot) <= band * spot]
+    if len(near) < 2:
+        near = strikes
+    if len(near) < 2:
+        return None
+    return round(min(b - a for a, b in zip(near, near[1:])), 2)
+
+
+def width_for_stock(spot: float, increment: float, pct: float | None = None,
+                    min_width: float | None = None) -> float:
+    """Spread width: the multiple of the chain's strike increment nearest pct x spot, never below
+    max(min_width, increment)."""
+    pct = config.F_WIDTH_PCT if pct is None else pct
+    min_width = config.F_MIN_WIDTH if min_width is None else min_width
+    width = round(max(1, round(pct * spot / increment)) * increment, 2)
+    floor_width = max(min_width, increment)
+    if width < floor_width:
+        width = round(ceil(round(floor_width / increment, 9)) * increment, 2)
+    return width
+
+
+def select_strikes_f(spot: float, right: str, width: float, em: float, chain_rows: list[dict],
+                     credit_pct: tuple[float, float] | None = None,
+                     max_steps: int | None = None) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """OTM spread one expected move from spot, walked through the chain's QUOTED strikes until the
+    credit is inside credit_pct x width. Unquoted strikes (gaps, coarser grids further out) are
+    stepped over rather than failing the walk. Returns (short, long, quote) or (None, None, reason).
+    """
+    lo_pct, hi_pct = credit_pct or config.F_CREDIT_PCT_RANGE
+    max_steps = max_steps or config.F_MAX_STRIKE_STEPS
+    lo, hi = round(lo_pct * width, 2), round(hi_pct * width, 2)
+    quoted = sorted({round(float(q["strike"]), 2) for q in chain_rows if float(q.get("bid") or 0.0) > 0})
+    if right == "P":
+        outward, sign = [k for k in reversed(quoted) if k < spot], -1.0
+    elif right == "C":
+        outward, sign = [k for k in quoted if k > spot], 1.0
+    else:
+        raise ValueError(f"unknown right {right!r}")
+    i = next((n for n, k in enumerate(outward) if abs(k - spot) >= em), None)
+    if i is None:
+        return None, None, f"F_NO_STRIKE_IN_RANGE no quoted {right} strike at or beyond EM {em:.2f} from spot {spot:.2f}"
+    step = -1   # toward spot (more credit); +1 steps away
+    gap = ""
+    for _ in range(max_steps):
+        if i < 0 or i >= len(outward):
+            break
+        short = outward[i]
+        distance = abs(spot - short)
+        if distance < width:
+            return None, None, f"F_TOO_CLOSE_TO_SPOT short={short:g} within {width:g} of spot {spot:.2f}"
+        if distance > 2 * em:
+            return None, None, f"F_BEYOND_2EM short={short:g} beyond 2x EM {em:.2f} from spot {spot:.2f}"
+        long = round(short + sign * width, 2)
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            gap = f" (skipped unquoted {short:g}/{long:g})"
+        elif quote.mid < lo:
+            step = -1
+        elif quote.mid > hi:
+            step = 1
+        else:
+            return short, long, quote
+        i += step
+    return None, None, f"F_NO_STRIKE_IN_RANGE no credit in {lo:.2f}-{hi:.2f} after {max_steps} steps{gap}"
+
+
+def f_exit_params(width: float) -> dict:
+    """Width-scaled exits for one F spread, each floored at F_EXIT_FLOOR: target, stop, and the
+    per-position overrides for the profit lock and runner trail. Width 5.0 reproduces B's numbers."""
+    def scaled(pct: float) -> float:
+        return max(config.F_EXIT_FLOOR, round(pct * width, 2))
+    return {
+        "profit_target": scaled(config.F_TARGET_PCT), "stop_loss": scaled(config.F_STOP_PCT),
+        "overrides": {"PROFIT_LOCK_ARM": scaled(config.F_LOCK_ARM_PCT),
+                      "PROFIT_LOCK_GIVEBACK": scaled(config.F_LOCK_GIVEBACK_PCT),
+                      "TRAIL_AMOUNT": scaled(config.F_TRAIL_PCT_OF_WIDTH)},
+    }
+
+
+def quote_blown_out(quote: SpreadQuote, width: float, max_frac: float | None = None) -> bool:
+    """No bid-side credit, or a bid/ask spread on the vertical wider than max_frac of its width."""
+    max_frac = config.F_MAX_QUOTE_SPREAD_FRAC if max_frac is None else max_frac
+    return quote.bid_side <= 0 or (quote.ask_side - quote.bid_side) > max_frac * width
+
+
 def _signed_bodies(candles: pd.DataFrame, direction: str) -> pd.Series:
     sign = 1.0 if direction == BULLISH else -1.0
     return (candles["close"] - candles["open"]) * sign
@@ -414,7 +514,7 @@ def setup_allowed(setup: str, d: date) -> bool:
     if mode == "skip":
         return False
     if mode == "orb_only":
-        return setup == "ORB"
+        return setup in ORB_SETUPS
     return True
 
 

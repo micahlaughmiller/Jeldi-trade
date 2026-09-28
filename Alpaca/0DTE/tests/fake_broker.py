@@ -6,9 +6,15 @@ from datetime import date, datetime
 import config
 from broker import BrokerError
 
+SPX_NAMES = ("SPX", "^GSPC", "SPXW")
+
 
 def occ_symbol(root: str, expiration: date, right: str, strike: float) -> str:
     return f"{root}{expiration.strftime('%y%m%d')}{right}{int(round(strike * 1000)):08d}"
+
+
+def _chain_key(root: str) -> str | None:
+    return None if root == "SPXW" else root
 
 
 class FakeBroker:
@@ -21,10 +27,16 @@ class FakeBroker:
         self.today = today or date(2026, 9, 17)
         self.positions: dict[str, dict] = {}
         self.orders: dict[str, dict] = {}
-        self.chains: dict[str, dict[float, tuple[float, float]]] = {"P": {}, "C": {}}
+        # (underlying, right) -> {strike: (bid, ask)}; underlying None is the SPX chain
+        self.chains: dict[tuple[str | None, str], dict[float, tuple[float, float]]] = {(None, "P"): {}, (None, "C"): {}}
+        self.expirations: dict[str, list[date]] = {}
+        self.spots: dict[str, float] = {}
         self.spread_close_price: float | None = None
         self.close_failures = 0
         self.close_calls: list[dict] = []
+        self.close_roots: list[str] = []
+        self.chain_calls: list[tuple[str, date, str]] = []
+        self.chain_errors: set[str] = set()
         self.fill_entries = True
         self.spot = 7500.0
         self.equity_history: list[float] = []
@@ -41,22 +53,26 @@ class FakeBroker:
         self.equity_history.append(self.equity)
 
     # -------------------------------------------------------------- positions
-    def set_chain(self, right: str, quotes: dict[float, tuple[float, float]]) -> None:
-        self.chains[right] = dict(quotes)
+    def set_chain(self, right: str, quotes: dict[float, tuple[float, float]], underlying: str | None = None) -> None:
+        self.chains[(underlying.upper() if underlying else None, right)] = dict(quotes)
 
-    def _leg_price(self, right: str, strike: float) -> float:
-        bid, ask = self.chains[right].get(strike, (0.0, 0.0))
+    def _chain(self, right: str, underlying: str | None = None) -> dict[float, tuple[float, float]]:
+        return self.chains.get((underlying, right), self.chains[(None, right)])
+
+    def _leg_price(self, right: str, strike: float, underlying: str | None = None) -> float:
+        bid, ask = self._chain(right, underlying).get(strike, (0.0, 0.0))
         return round((bid + ask) / 2, 2)
 
     def add_spread_position(self, right: str, short_strike: float, long_strike: float, qty: int,
                             short_avg: float, long_avg: float, expiration: date | None = None,
                             root: str = "SPXW") -> None:
         exp = expiration or self.today
+        underlying = "SPX" if root == "SPXW" else root
         for strike, signed_qty, avg in ((short_strike, -qty, short_avg), (long_strike, qty, long_avg)):
             sym = occ_symbol(root, exp, right, strike)
             self.positions[sym] = {
-                "symbol": sym, "underlying": "SPX", "qty": signed_qty, "avg_price": avg,
-                "current_price": self._leg_price(right, strike) or avg, "market_value": None,
+                "symbol": sym, "underlying": underlying, "qty": signed_qty, "avg_price": avg,
+                "current_price": self._leg_price(right, strike, _chain_key(root)) or avg, "market_value": None,
                 "unrealized_pl": None, "asset_class": "option", "expiration": exp,
                 "strike": float(strike), "right": right,
             }
@@ -97,27 +113,35 @@ class FakeBroker:
 
     # ------------------------------------------------------------------ chain
     def get_expirations(self, underlying: str, min_dte: int = 0, max_dte: int = 120) -> list[date]:
-        return [self.today]
+        exps = self.expirations.get(underlying.upper())
+        if exps is None:
+            return [self.today]
+        return [d for d in sorted(exps) if min_dte <= (d - self.today).days <= max_dte]
 
     def get_option_chain(self, underlying: str, expiration: date, right: str,
                          strike_min: float | None = None, strike_max: float | None = None,
                          spot: float | None = None) -> list[dict]:
+        is_spx = underlying.upper() in SPX_NAMES
+        root = "SPXW" if is_spx else underlying.upper()
+        self.chain_calls.append((root, expiration, right))
+        if root in self.chain_errors:
+            raise BrokerError(f"simulated chain failure for {root}")
         out = []
-        for strike, (bid, ask) in sorted(self.chains[right].items()):
+        for strike, (bid, ask) in sorted(self._chain(right, _chain_key(root)).items()):
             if strike_min is not None and strike < strike_min:
                 continue
             if strike_max is not None and strike > strike_max:
                 continue
             if bid == 0 and ask == 0:
                 continue
-            out.append({"symbol": occ_symbol("SPXW", expiration, right, strike), "underlying": underlying,
-                        "root": "SPXW", "expiration": expiration, "strike": float(strike), "right": right,
+            out.append({"symbol": occ_symbol(root, expiration, right, strike), "underlying": underlying,
+                        "root": root, "expiration": expiration, "strike": float(strike), "right": right,
                         "bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 2), "last": None,
                         "delta": None, "iv": None, "quote_time": None})
         return out
 
     def get_spot(self, symbol: str) -> float:
-        return self.spot
+        return self.spots.get(symbol.upper(), self.spot)
 
     # ------------------------------------------------------------- mutations
     def place_credit_spread(self, underlying: str, expiration: date, right: str, short_strike: float,
@@ -127,7 +151,7 @@ class FakeBroker:
         sym = f"{occ_symbol(root, expiration, right, short_strike)}/{occ_symbol(root, expiration, right, long_strike)}"
         if not self.fill_entries:
             return self._order(sym, qty, limit_credit, "accepted", None, 0)
-        long_avg = self._leg_price(right, long_strike)
+        long_avg = self._leg_price(right, long_strike, _chain_key(root))
         self.add_spread_position(right, short_strike, long_strike, qty, round(limit_credit + long_avg, 2),
                                  long_avg, expiration, root)
         return self._order(sym, qty, limit_credit, "filled", limit_credit, qty)
@@ -143,13 +167,15 @@ class FakeBroker:
                                long_strike: float, qty: int, time_in_force: str = "gtc",
                                root: str | None = None, client_tag: str | None = None) -> dict:
         self.close_calls.append({"right": right, "short": short_strike, "long": long_strike, "qty": qty})
+        self.close_roots.append(root or underlying)
         if self.close_failures > 0:
             self.close_failures -= 1
             raise BrokerError("simulated close failure")
         root = root or underlying
         price = self.spread_close_price
         if price is None:
-            price = round(self._leg_price(right, short_strike) - self._leg_price(right, long_strike), 2)
+            price = round(self._leg_price(right, short_strike, _chain_key(root))
+                          - self._leg_price(right, long_strike, _chain_key(root)), 2)
         self._reduce_spread(root, expiration, right, short_strike, long_strike, qty)
         return self._order("close", qty, price, "filled", price, qty)
 

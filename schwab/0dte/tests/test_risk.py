@@ -179,3 +179,71 @@ def test_cooldown_setup_survives_state_roundtrip():
     rm.record_trade("A", -50.0, {"strategy": "A", "pnl": -50.0, "exit_time": et(10, 30), "setup": "ON_BREAK"})
     restored = DayState.from_dict(rm.state.to_dict())
     assert restored.for_strategy("A").last_exit_setup == "ON_BREAK"
+
+
+# ------------------------------------------------------------ Strategy F: entry-counted cap, exempt P/L
+
+def test_f_limits():
+    assert (limit("F", "MAX_TRADES_PER_DAY"), limit("F", "MAX_CONSECUTIVE_LOSSES"), limit("F", "COOLDOWN_MIN", 0)) == (10, 7, 0)
+    assert limit("F", "MAX_CONCURRENT_POSITIONS", 1) == 3 and limit("A", "MAX_CONCURRENT_POSITIONS", 1) == 1
+    assert limit("B", "MAX_CONCURRENT_POSITIONS", config.MAX_CONCURRENT_POSITIONS) == 1
+
+
+def test_entries_cap_counts_recorded_entries_and_open_positions():
+    rm = RiskManager(10_000)
+    assert rm.record_entry("F") == 1 and rm.state.for_strategy("F").entries_today == 1
+    for _ in range(8):
+        rm.record_entry("F")
+    assert rm.trading_allowed("F") == (True, "OK")                                  # 9 entries
+    assert rm.trading_allowed("F", open_count=1) == (True, "OK")                    # 0 closed + 1 open < 9 recorded
+    rm.record_entry("F")
+    assert rm.trading_allowed("F") == (False, "F: MAX_TRADES_PER_DAY (10)")
+    rm2 = RiskManager(10_000)
+    for _ in range(7):
+        rm2.record_trade("F", 5.0)
+    assert rm2.trading_allowed("F", open_count=2) == (True, "OK")
+    assert rm2.trading_allowed("F", open_count=3) == (False, "F: MAX_TRADES_PER_DAY (10)")
+    assert rm2.trading_allowed("A", open_count=3) == (True, "OK")                   # A-E never pass open_count
+    assert rm2.state.for_strategy("A").entries_today == 0
+
+
+def test_daily_loss_limit_excludes_exempt_realized_and_unrealized_pnl():
+    rm = RiskManager(10_000)
+    rm.record_trade("F", -900.0)
+    rm.record_trade("A", -300.0)
+    assert rm.state.realized_pnl == pytest.approx(-1_200.0)
+    assert rm.state.loss_limit_pnl == pytest.approx(-300.0) and rm.state.exempt_realized_pnl == pytest.approx(-900.0)
+    assert rm.trading_allowed("A") == (True, "OK") and rm.trading_allowed("B") == (True, "OK")
+    assert rm.trading_allowed("A", equity=8_800.0) == (True, "OK")                  # 8,800 + 900 = 9,700 ex-F
+    assert rm.trading_allowed("A", equity=8_300.0)[0] is True                       # exactly -1,000 + 900 = -100 ... fine
+    assert rm.trading_allowed("A", equity=8_099.0)[0] is False                      # -1,901 + 900 = -1,001
+    assert rm.trading_allowed("A", equity=8_500.0, exempt_open_pnl=-600.0) == (True, "OK")   # -1,500 + 900 + 600 = 0
+    ok, reason = rm.trading_allowed("A", equity=8_098.0, exempt_open_pnl=-1.0)
+    assert ok is False and reason == "DAILY_LOSS_LIMIT equity=8999.00 start=10000.00"
+    rm.record_trade("B", -700.0)
+    ok, reason = rm.trading_allowed("A")
+    assert ok is False and reason == "DAILY_LOSS_LIMIT realized=-1000.00"
+
+
+def test_ab_halt_does_not_stop_exempt_strategy_unless_configured(monkeypatch):
+    rm = RiskManager(10_000)
+    rm.record_trade("A", -1_000.0)
+    assert rm.trading_allowed("A")[0] is False and rm.trading_allowed("B")[0] is False
+    assert rm.trading_allowed("F", equity=8_000.0) == (True, "OK")
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_HALTS_EXEMPT", True)
+    assert rm.trading_allowed("F", equity=8_000.0) == (False, "DAILY_LOSS_LIMIT realized=-1000.00")
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    rm3 = RiskManager(10_000)
+    rm3.record_trade("F", -1_000.0)
+    assert rm3.trading_allowed("A")[0] is False                                     # no exemption: F counts again
+
+
+def test_day_state_roundtrip_with_entries_today():
+    rm = RiskManager(10_000)
+    rm.record_entry("F")
+    rm.record_entry("F")
+    rm.record_trade("F", -20.0, {"strategy": "F", "pnl": -20.0, "exit_time": et(10, 30), "setup": "STOCK_ORB"})
+    restored = DayState.from_dict(rm.state.to_dict())
+    assert restored == rm.state and restored.for_strategy("F").entries_today == 2
+    legacy = DayState.from_dict({"start_equity": 10_000, "strategies": {"A": {"trades_today": 1, "realized_pnl": 5.0}}})
+    assert legacy.for_strategy("A").entries_today == 0

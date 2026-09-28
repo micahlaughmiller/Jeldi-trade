@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -24,9 +25,12 @@ import market_data
 import strategy
 from broker import Broker, BrokerError
 from journal import Journal, format_close_card, format_day_table, format_entry_card
-from position_manager import OpenSpread, PositionManager, spxw_legs
+from position_manager import OpenSpread, PositionManager, occ_root, option_legs
 from risk_manager import DayState, RiskManager, contracts_for, tier
 from strategy import Phase
+
+if TYPE_CHECKING:   # stock_orb (and through it orb_scanner + yfinance) is imported lazily, by F personas only
+    from stock_orb import StockOrbTrader
 
 @dataclass
 class PendingMomentum:
@@ -107,6 +111,40 @@ class Bot:
         self.last_es_candle: datetime | None = None
         self.last_de_candle: datetime | None = None             # Strategies D/E, MA/Bollinger reversion
         self.news_blackout_was_active: bool = False
+        self._f_last_priced: dict[str, float] = {}              # Strategy F chain-mark throttle, per ticker
+        self.f: StockOrbTrader | None = None
+        if "F" in config.STRATEGIES:
+            try:
+                # Imported here, inside the guard: a broken stock_orb / orb_scanner / yfinance install can
+                # only cost this persona its F, never abort startup for the A-E personas that never import it.
+                from stock_orb import StockOrbTrader
+                self.f = StockOrbTrader(self, chain_broker_factory=lambda: Broker(config, dry_run=True, log=log.debug))
+            except Exception as e:
+                log.error("Strategy F disabled for today: %s", e)
+
+    def f_owns_expiration(self, expiration: date | str | None) -> bool:
+        """A stock option leg is this persona's (an F position, tracked or not) only when it expires inside
+        F's window: 0 to F_MAX_DTE days out. Anything longer-dated in the same account belongs to someone
+        else -- the 45DTE bot falling back to the same keys, or a manual position -- and is left alone."""
+        if expiration is None:
+            return False
+        exp = expiration if isinstance(expiration, date) else date.fromisoformat(str(expiration)[:10])
+        return 0 <= (exp - self.today).days <= config.F_MAX_DTE
+
+    def bot_legs(self, positions: list[dict]) -> list[dict]:
+        """Option legs at the broker that this persona adopts, closes and reconciles: SPXW, every root it
+        already tracks, and -- whenever F is configured, whether or not StockOrbTrader built today --
+        stock legs inside F's DTE window. Keyed on the persona's config, not on self.f, so a day F fails
+        to construct still re-adopts, marks and force-closes the stock spreads it left at the broker."""
+        tracked = {config.OPTION_ROOT} | {p.root for p in self.pm.positions.values()}
+        f_on = "F" in config.STRATEGIES
+        return [leg for leg in option_legs(positions)
+                if occ_root(leg["symbol"]) in tracked or (f_on and self.f_owns_expiration(leg.get("expiration")))]
+
+    def foreign_legs(self, positions: list[dict]) -> list[dict]:
+        """Option legs in the account that bot_legs() leaves alone."""
+        owned = self.bot_legs(positions)
+        return [leg for leg in option_legs(positions) if leg not in owned]
 
     # ------------------------------------------------------------ lifecycle
 
@@ -119,11 +157,18 @@ class Bot:
             self.risk = RiskManager(acct["equity"], DayState.from_dict(saved_today["day"]))
             self.acted = set(saved_today.get("acted", []))
             log.info("Restored state for %s: %s", self.today, saved_today["day"])
+            if self.f is not None:
+                self.f.restore(saved_today.get("f"), now)
         else:
             self.risk = RiskManager(acct["equity"])
         positions = self.broker.get_positions()
-        if spxw_legs(positions):
-            self.pm.adopt_from_broker(positions, now, self.broker.get_spot(config.UNDERLYING),
+        legs = self.bot_legs(positions)
+        foreign = self.foreign_legs(positions)
+        if foreign:
+            log.warning("Ignoring %d option leg(s) in the account that are not this persona's: %s", len(foreign),
+                        [(l["symbol"], l["qty"]) for l in foreign], extra={"keep": True})
+        if legs:
+            self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING),
                                       saved_today.get("positions") if saved_today else None)
         self.report_start(now, acct, positions)
         self.broker.record_daily_equity()
@@ -158,6 +203,8 @@ class Bot:
             if now >= levels_at and self.overnight is None:
                 self.overnight = market_data.get_overnight_levels(now)
                 self.log_levels("OVERNIGHT(ES)", self.overnight)
+            if self.f is not None:
+                self.f.step(now)   # pre-open: only the F_PREWARM_TIME history warm-up can run here
             if now >= strategy.at_time(now, config.MARKET_OPEN):
                 return
             time.sleep(config.TICK_SECONDS)
@@ -187,6 +234,8 @@ class Bot:
             for setup_obj in (self.orb_setup, self.on_setup, self.es_setup):
                 if setup_obj is not None:
                     setup_obj._reset()
+            if self.f is not None:
+                self.f.reset_setups()
         self.news_blackout_was_active = blackout_now
         self.refresh_levels(now)
         candles = market_data.get_candles(config.SPX_SYMBOL, config.CANDLE_INTERVAL,
@@ -200,6 +249,8 @@ class Bot:
         # The ORB state machine must see every completed 5-min candle, whether or not we can trade.
         orb_signal = self.orb_signal(now) if ph in strategy.ORB_PHASES else None
         if self.pm.positions:
+            if self.f is not None:
+                self.f.refresh_candles(now)     # F's ticker frames stay current in EVERY phase, disabled or not
             self.manage(now, candles)
         if self.pending_momentum:
             self.check_pending_momentum(now, ph)
@@ -211,6 +262,8 @@ class Bot:
                 self.try_orb_entry(now, *orb_signal)
             self.check_continuation_reentry(now, ph)
             self.check_mean_reversion_entry(now, ph)    # Strategies D/E
+            if self.f is not None:
+                self.f.step(now)                        # Strategy F (guarded; after manage())
         self.save_state()
 
     # ---------------------------------------------------------------- levels
@@ -260,11 +313,13 @@ class Bot:
     def entry_possible(self, equity: float, setup: str | None = None,
                        strategies: tuple[str, ...] | None = None) -> bool:
         reasons = []
-        for strat in (strategies or config.STRATEGIES):
+        exempt_open = self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT)
+        for strat in (strategies or strategy.spx_strategies()):
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
                 continue
-            allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup)
+            allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
+                                                        exempt_open_pnl=exempt_open)
             if allowed:
                 return True
             reasons.append(reason)
@@ -426,8 +481,8 @@ class Bot:
                 return False
             return strategy.exit_setting(strat, "MOMENTUM_CONFIRM_ENABLED", False)
 
-        confirm = tuple(s for s in config.STRATEGIES if wants_confirmation(s))
-        immediate = tuple(s for s in config.STRATEGIES if s not in confirm)
+        confirm = tuple(s for s in strategy.spx_strategies() if wants_confirmation(s))
+        immediate = tuple(s for s in strategy.spx_strategies() if s not in confirm)
         if immediate:
             self.enter(now, setup, direction, kind, strategies=immediate)
         if confirm:
@@ -491,7 +546,7 @@ class Bot:
         for setup, setup_obj in (("ORB", self.orb_setup), ("ON_BREAK", self.on_setup)):
             if setup_obj is None or setup_obj.state != strategy.OrbSetup.DONE:
                 continue
-            eligible = tuple(s for s in config.STRATEGIES
+            eligible = tuple(s for s in strategy.spx_strategies()
                              if strategy.exit_setting(s, "REENTRY_ON_CONTINUATION_ENABLED", False)
                              and setup in config.SETUPS_BY_STRATEGY.get(s, (setup,))
                              and s not in self.pm.positions)
@@ -585,7 +640,7 @@ class Bot:
         right = strategy.direction_to_spread(direction)
         em = self.expected_move(spot)
         day_er, day_er_n = None, 0
-        if any(strategy.exit_setting(s, "DAY_GATE_ENABLED", False) for s in (strategies or config.STRATEGIES)):
+        if any(strategy.exit_setting(s, "DAY_GATE_ENABLED", False) for s in (strategies or strategy.spx_strategies())):
             session_candles = market_data.get_candles(config.SPX_SYMBOL, "2m", config.CANDLE_LOOKBACK_MIN, now)
             session_candles = session_candles[session_candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
             day_er, day_er_n = strategy.efficiency_ratio(session_candles)
@@ -597,7 +652,7 @@ class Bot:
             # One chain wide enough for A and for B's whole strike walk (spot +/- 2 EM + width).
             lo, hi = min(lo, spot - 2 * em - width), max(hi, spot + 2 * em + width)
         chain = self.broker.get_option_chain(config.UNDERLYING, self.today, right, lo - 1, hi + 1, spot=spot)
-        strategies = strategies or config.STRATEGIES
+        strategies = strategies or strategy.spx_strategies()
         summaries: dict[str, str] = {}
         open_risk = self.pm.total_open_risk()
         for strat in strategies:
@@ -641,7 +696,8 @@ class Bot:
             min_er = strategy.exit_setting(strat, "DAY_GATE_MIN_ER", 0.15)
             if day_er is None or day_er < min_er:
                 return f"skip: DAY_GATE ER={0.0 if day_er is None else day_er:.2f} < {min_er:.2f} (choppy)", 0.0
-        allowed, reason = self.risk.trading_allowed(strat, equity, now, setup)
+        allowed, reason = self.risk.trading_allowed(strat, equity, now, setup,
+                                                    exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT))
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":
@@ -670,7 +726,7 @@ class Bot:
         # inference on close ("inferred: buy_to_open, specified: buy_to_close"), leaving the position
         # stuck open after CLOSE_MAX_RETRIES. Refuse the second entry outright rather than risk that.
         collision = next((s for s, p in self.pm.positions.items()
-                          if p.right == right and p.short_strike == short_strike
+                          if p.root == config.OPTION_ROOT and p.right == right and p.short_strike == short_strike
                           and p.long_strike == long_strike and p.expiration == self.today), None)
         if collision:
             reason = f"STRIKE_COLLISION {short_strike:g}/{long_strike:g}{right} already open under {collision}"
@@ -711,16 +767,21 @@ class Bot:
         self.journal.card(card, now)
         return f"sell {short_strike:g}{right} buy {long_strike:g}{right} x{filled_qty} @ {credit:.2f}{detail}", spread.open_risk
 
-    def work_entry(self, order: dict, start_limit: float, floor_limit: float) -> dict:
+    def work_entry(self, order: dict, start_limit: float, floor_limit: float, step: float | None = None,
+                   wait_sec: float | None = None, timeout_sec: float | None = None) -> dict:
+        """Work a resting credit order down toward floor_limit. The SPX strategies use the config
+        defaults; F passes its own width-scaled step and a shorter wait/timeout."""
         if order.get("status") == "dry_run":
             return order
+        step = config.ENTRY_PRICE_STEP if step is None else step
+        wait_sec = config.ENTRY_STEP_SEC if wait_sec is None else wait_sec
         limit = start_limit
-        deadline = time.monotonic() + config.ENTRY_TIMEOUT_SEC
+        deadline = time.monotonic() + (config.ENTRY_TIMEOUT_SEC if timeout_sec is None else timeout_sec)
         while True:
-            order = self.broker.wait_for_fill(order["id"], config.ENTRY_STEP_SEC)
+            order = self.broker.wait_for_fill(order["id"], wait_sec)
             if order["status"] in TERMINAL:
                 return order
-            next_limit = round(limit - config.ENTRY_PRICE_STEP, 2)
+            next_limit = round(limit - step, 2)
             if time.monotonic() >= deadline or next_limit < floor_limit - 1e-9:
                 break
             log.info("Entry not filled at %.2f, stepping to %.2f", limit, next_limit)
@@ -732,33 +793,50 @@ class Bot:
 
     # ---------------------------------------------------------------- manage
 
-    def spread_prices(self) -> dict[str, float]:
-        """Current mid per open strategy; positions sharing expiration/right share one chain call."""
-        groups: dict[tuple, list[OpenSpread]] = {}
-        for p in self.pm.positions.values():
-            groups.setdefault((p.expiration, p.right), []).append(p)
+    def spread_prices(self, force: bool = False) -> dict[str, float]:
+        """Current mid per open position key; positions sharing root/expiration/right share one chain call.
+        A stock (F) root is marked at most every F_PRICE_EVERY_SEC -- `force` bypasses that for a close --
+        and a failed stock chain is journaled and skipped so it never blocks the SPX marks."""
+        groups: dict[tuple, list[tuple[str, OpenSpread]]] = {}
+        for key, p in self.pm.positions.items():
+            groups.setdefault((p.root, p.expiration, p.right), []).append((key, p))
         prices: dict[str, float] = {}
-        for (expiration, right), group in groups.items():
-            strikes = [s for p in group for s in (p.short_strike, p.long_strike)]
-            chain = self.broker.get_option_chain(config.UNDERLYING, expiration, right,
-                                                 min(strikes) - 1, max(strikes) + 1)
-            for p in group:
+        mono = time.monotonic()
+        for (root, expiration, right), group in groups.items():
+            is_stock = root != config.OPTION_ROOT
+            if is_stock:
+                if not force and mono - self._f_last_priced.get(root, 0.0) < config.F_PRICE_EVERY_SEC:
+                    continue
+                self._f_last_priced[root] = mono   # stamped before the call: a failing stock chain is throttled too
+            strikes = [s for _, p in group for s in (p.short_strike, p.long_strike)]
+            try:
+                chain = self.broker.get_option_chain(root if is_stock else config.UNDERLYING, expiration, right,
+                                                     min(strikes) - 1, max(strikes) + 1)
+            except Exception as e:
+                if not is_stock:
+                    raise   # the SPX chain keeps today's semantics: a BrokerError reaches loop(), anything else propagates
+                log.error("[%s] chain unavailable for marks (%s): %s", group[0][0], type(e).__name__, e)
+                self.journal.event("BROKER_ERROR", now_et(), strategy=group[0][1].strategy, ticker=root,
+                                   error=str(e), type=type(e).__name__)
+                continue
+            for key, p in group:
                 quote = strategy.spread_quote(chain, p.short_strike, p.long_strike)
                 if quote is None:
                     log.warning("[%s] No chain quote for %s %s/%s; skipping manage this tick.",
-                                p.strategy, p.right, p.short_strike, p.long_strike)
+                                key, p.right, p.short_strike, p.long_strike)
                 else:
-                    prices[p.strategy] = quote.mid
+                    prices[key] = quote.mid
         return prices
 
     def manage(self, now: datetime, candles: pd.DataFrame) -> None:
         prices = self.spread_prices()
-        for strat, p in self.pm.positions.items():
-            if strat in prices:
-                log.info("[%s] Position %s%s/%s x%d entry %.2f now %.2f best %.2f%s", strat, p.short_strike,
-                         p.right, p.long_strike, p.remaining, p.entry_credit, prices[strat], p.best_price,
+        for key, p in self.pm.positions.items():
+            if key in prices:
+                log.info("[%s] Position %s%s/%s x%d entry %.2f now %.2f best %.2f%s", key, p.short_strike,
+                         p.right, p.long_strike, p.remaining, p.entry_credit, prices[key], p.best_price,
                          f" RUNNER best {p.runner_best:.2f}" if p.runner else "")
-        self.record_fills(self.pm.on_tick(now, prices, candles))
+        candles_by_key = self.f.candles_by_key() if self.f is not None else None
+        self.record_fills(self.pm.on_tick(now, prices, candles, candles_by_key))
 
     def record_fills(self, fills: list[dict]) -> None:
         for row in fills:
@@ -770,8 +848,10 @@ class Bot:
                 self.risk.record_trade(strat, row["position_pnl"], row)
                 remaining = 0
                 day_pnl = s.pnl_by_strategy()
+                if self.f is not None and strat in config.STOCK_STRATEGIES:
+                    self.f.on_exit(row["root"], row["exit_time"])
             else:
-                remaining = self.pm.positions[strat].remaining
+                remaining = self.pm.positions[row["key"]].remaining
                 day_pnl = s.pnl_by_strategy()
                 day_pnl[strat] = round(day_pnl.get(strat, 0.0) + row["position_pnl"], 2)
             card = format_close_card(row, trade_no, day_pnl, s.trades_today, remaining)
@@ -783,20 +863,22 @@ class Bot:
     # ------------------------------------------------------------ end of day
 
     def end_of_day(self, now: datetime) -> None:
+        if self.f is not None:
+            self.f.shutdown()
         log.warning("FORCE CLOSE at %s: cancelling orders and closing everything.", now.strftime("%H:%M:%S"))
         cancelled = self.broker.cancel_all_orders()
         log.info("Cancelled %d open orders.", cancelled)
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):
-            positions = self.broker.get_positions()
-            if spxw_legs(positions):
-                self.pm.adopt_from_broker(positions, now, self.broker.get_spot(config.UNDERLYING))
+            legs = self.bot_legs(self.broker.get_positions())
+            if legs:
+                self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING))
             if self.pm.positions:
-                self.record_fills(self.pm.force_close(now, self.spread_prices()))
-            legs = spxw_legs(self.broker.get_positions())
+                self.record_fills(self.pm.force_close(now, self.spread_prices(force=True)))
+            legs = self.bot_legs(self.broker.get_positions())
             if not legs and not self.pm.positions:
                 break
-            log.critical("CLOSE_FAILED: %s legs still at broker after attempt %d: %s",
-                         config.OPTION_ROOT, attempt, [(l["symbol"], l["qty"]) for l in legs])
+            log.critical("CLOSE_FAILED: option legs still at broker after attempt %d: %s",
+                         attempt, [(l["symbol"], l["qty"]) for l in legs])
             time.sleep(config.CLOSE_RETRY_SEC)
         self.report_end(now_et())
         self.save_state()
@@ -823,6 +905,7 @@ class Bot:
             f"Open orders: {len(orders)}" + "".join(
                 f"\n   {o['id']} {o['status']} {o['symbol']} qty {o['qty']} @ {o['limit_price']}" for o in orders),
             f"Tier {t}  width {width}  credit range A {lo:.2f}-{hi:.2f}  B {lo_b:.2f}-{hi_b:.2f}",
+            *(self.f.report_lines() if self.f is not None else []),
             f"Phase: {strategy.phase(now)}   News day: {strategy.is_news_day(now.date())} "
             f"(mode {config.NEWS_DAY_MODE})   Level source: {config.BREAKOUT_LEVEL_SOURCE}",
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
@@ -838,7 +921,8 @@ class Bot:
         acct = self.broker.get_account()
         positions = self.broker.get_positions()
         orders = self.broker.get_open_orders()
-        legs = spxw_legs(positions)
+        legs = self.bot_legs(positions)
+        foreign = self.foreign_legs(positions)
         s = self.risk.state
         lines = ["=" * 72, f"END-OF-DAY REPORT  {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
                  f"Trades closed: {s.trades_today}   Realized P&L: {fmt_money(s.realized_pnl)}   " + "  ".join(
@@ -849,13 +933,15 @@ class Bot:
         self.journal.card(table, now)
         mismatches = []
         if legs:
-            mismatches.append(f"broker still holds {config.OPTION_ROOT} legs: {[(l['symbol'], l['qty']) for l in legs]}")
+            mismatches.append(f"broker still holds option legs: {[(l['symbol'], l['qty']) for l in legs]}")
         for strat, p in self.pm.positions.items():
             mismatches.append(f"local state still has a {strat} position: {p.to_dict()}")
         if orders:
             mismatches.append(f"open orders remain: {[o['id'] for o in orders]}")
         lines.append("Reconciliation: " + ("OK - flat, no orders" if not mismatches else "MISMATCH"))
         lines.extend(f"   !! {m}" for m in mismatches)
+        if foreign:
+            lines.append(f"Ignored option legs not owned by this persona: {[(l['symbol'], l['qty']) for l in foreign]}")
         lines.append("=" * 72)
         for line in lines:
             (log.critical if mismatches else log.info)(line, extra={"keep": True})
@@ -865,16 +951,21 @@ class Bot:
     # ----------------------------------------------------------------- state
 
     def save_state(self) -> None:
-        self.journal.save_state({
+        state = {
             "date": self.today.isoformat(),
             "day": self.risk.state.to_dict(),
-            "positions": {strat: p.to_dict() for strat, p in self.pm.positions.items()},
+            "positions": {key: p.to_dict() for key, p in self.pm.positions.items()},
             "acted": sorted(self.acted),
             "levels": {"overnight": self.overnight, "basis": self.basis, "orb": self.orb},
-        })
+        }
+        if self.f is not None:
+            state["f"] = self.f.to_state()
+        self.journal.save_state(state)
 
     def on_interrupt(self) -> None:
         keep = {"extra": {"keep": True}}
+        if self.f is not None:
+            self.f.shutdown()
         if self.risk is not None:
             self.save_state()
         if not self.pm.positions:
@@ -884,7 +975,7 @@ class Bot:
             log.warning("Interrupted by user with %d open position(s): closing them now.",
                        len(self.pm.positions), **keep)
             try:
-                self.record_fills(self.pm.force_close(now_et(), self.spread_prices(), reason="INTERRUPT_CLOSE"))
+                self.record_fills(self.pm.force_close(now_et(), self.spread_prices(force=True), reason="INTERRUPT_CLOSE"))
             except BrokerError as e:
                 log.error("Close on interrupt failed: %s", e)
             self.save_state()
@@ -892,13 +983,13 @@ class Bot:
                 log.warning("All positions closed; flat.", **keep)
                 return
         log.warning("Nothing (more) was closed automatically.", **keep)
-        for strat, p in self.pm.positions.items():
+        for key, p in self.pm.positions.items():
             log.warning("OPEN POSITION [%s]: %s sell %s%s / buy %s%s x%d, entry credit %.2f, last %.2f, exp %s",
-                        strat, p.direction, p.short_strike, p.right, p.long_strike, p.right, p.remaining,
+                        key, p.direction, p.short_strike, p.right, p.long_strike, p.right, p.remaining,
                         p.entry_credit, p.current_price, p.expiration, **keep)
         log.warning("To close: restart `python scheduler.py` (it re-adopts and manages the spreads), "
                     "or run `python alpaca-reset.py` to liquidate ALL positions, "
-                    "or close the SPXW legs in the Alpaca dashboard.", **keep)
+                    "or close the SPXW / stock option legs in the Alpaca dashboard.", **keep)
 
 
 def _raise_interrupt(signum, frame) -> None:

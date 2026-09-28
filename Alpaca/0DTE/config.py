@@ -90,12 +90,16 @@ BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 # full catalog (used for things that must know about every strategy that exists, not just the
 # ones a given persona is currently running).
 STRATEGIES = ("A", "B")
-ALL_STRATEGIES = ("A", "B", "C", "D", "E")
+# Strategies that trade single-stock option roots with one position per ticker. They are excluded from
+# every SPX signal fan-out (strategy.spx_strategies) and from SPXW adoption; cards append the ticker.
+STOCK_STRATEGIES = ("F",)
+ALL_STRATEGIES = ("A", "B", "C", "D", "E", "F")
 STRATEGY_LABELS = {
     "A": "A - ITM", "B": "B - OTM (expected move)",
     "C": "C - ES overnight-break (OTM, same as B)",
     "D": "D - MA/Bollinger reversion, trend-gated",
     "E": "E - MA/Bollinger reversion, 5-min chop confirm",
+    "F": "F - STOCK ORB",
 }
 
 WIDTH_BY_TIER = {1: 5, 2: 5, 3: 10, 4: 10}
@@ -128,9 +132,19 @@ LIMITS_BY_STRATEGY = {
     "C": {"MAX_TRADES_PER_DAY": 5},
     "D": {"MAX_TRADES_PER_DAY": 5},
     "E": {"MAX_TRADES_PER_DAY": 5},
+    # 2026-09-28 Strategy F: 10 entries/day counted at ENTRY (and closed + open as a cross-check), 7
+    # consecutive losses across all F tickers, up to 3 F positions open at once in different tickers.
+    # No COOLDOWN_MIN: a cool-down is strategy-wide and would pause every F ticker after one F exit.
+    "F": {"MAX_TRADES_PER_DAY": 10, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
 }
 DAILY_LOSS_LIMIT_PCT = 0.10
-MAX_CONCURRENT_POSITIONS = 1   # per strategy
+# Per-strategy concurrency cap and the limit() fallback for strategies without their own entry (A-E are
+# single-slot by dict-key construction; only F's entry path consults this).
+MAX_CONCURRENT_POSITIONS = 1
+# Strategies whose P/L -- realized, and unrealized from the marks the tick already fetched -- is removed
+# from the combined 10% daily-loss basis. HALTS False: an A+B limit hit does not stop them either.
+DAILY_LOSS_LIMIT_EXEMPT = ("F",)
+DAILY_LOSS_LIMIT_HALTS_EXEMPT = False
 
 # Which setups and which ORB entry kinds each strategy trades. 2026-09-21: entries before 10:00 went
 # 1 for 12 and momentum-close entries bought the top of the 5-minute bar, so A takes only the ORB
@@ -146,9 +160,13 @@ MAX_CONCURRENT_POSITIONS = 1   # per strategy
 # wicks count," the user's own words) rather than ON_BREAK's wick-aware break/pullback/momentum machine.
 # D and E are NOT setup-driven at all: their signal comes from check_mean_reversion_entry each tick,
 # not from a fired breakout, so they have no entry here.
-SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB"), "C": ("ES_BREAK",)}
+# F MUST be listed: enter_leg's `.get(strat, (setup,))` default treats an ABSENT strategy as eligible for
+# every SPX setup, which would sell an SPX B-clone labelled F on every ORB/ON_BREAK signal.
+SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB"), "C": ("ES_BREAK",),
+                      "F": ("STOCK_ORB",)}
 # Both entry kinds for A: the 2026-09-21 replay showed a trend day with one momentum break and no pullback.
-ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK")}
+ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK"),
+                               "F": ("MOMENTUM", "PULLBACK")}
 
 PROFIT_TARGET = 0.30
 STOP_LOSS = 0.60
@@ -168,12 +186,16 @@ D_PROFIT_TARGET = B_PROFIT_TARGET
 D_STOP_LOSS = B_STOP_LOSS
 E_PROFIT_TARGET = 0.05
 E_STOP_LOSS = B_STOP_LOSS
+# Registry placeholders so strategy.exit_levels("F") can never raise; F's LIVE target/stop are width-scaled
+# per position (strategy.f_exit_params), never these.
+F_PROFIT_TARGET = B_PROFIT_TARGET
+F_STOP_LOSS = B_STOP_LOSS
 RUNNER_ENABLED = True
 RUNNER_MIN_CONTRACTS = 2
 # Fraction of the position booked at the target when momentum continues; the rest runs with the stop at
 # the target level and the trail. A runs the whole position (the trail was the only profit source on
 # 2026-09-21: +$2,650 from six exits vs +$180 from 34 fixed-target exits); B books half as before.
-RUNNER_CLOSE_FRACTION_BY_STRATEGY = {"A": 0.0, "B": 0.5}
+RUNNER_CLOSE_FRACTION_BY_STRATEGY = {"A": 0.0, "B": 0.5, "F": 0.5}   # F: runner rules like B
 TRAIL_AMOUNT = 0.50
 # Once a runner's best profit passes RUNNER_DEEP_PROFIT, tighten the trail to RUNNER_DEEP_TRAIL so a
 # pullback is caught closer to +0.30 instead of riding the flat $0.50 trail all the way down (2026-09-23:
@@ -256,9 +278,14 @@ B_BASE_TUNING = {"REENTRY_ON_CONTINUATION_ENABLED": True}
 C_BASE_TUNING: dict = {}
 D_BASE_TUNING: dict = {}
 E_BASE_TUNING: dict = {}
+# F: the shared exit knobs (profit lock, runner momentum gate, slowdown exit, STOP_CONFIRM_TICKS=1) at the
+# module defaults, evaluated on the TICKER's own 5-minute candles. Lock arm/giveback/trail are per-position
+# width-scaled overrides (strategy.f_exit_params), not tuned here.
+F_BASE_TUNING: dict = {}
 EXIT_TUNING_BY_STRATEGY = {
     "A": dict(A_BASE_TUNING), "B": dict(B_BASE_TUNING),
     "C": dict(C_BASE_TUNING), "D": dict(D_BASE_TUNING), "E": dict(E_BASE_TUNING),
+    "F": dict(F_BASE_TUNING),
 }
 
 ENTRY_STEP_SEC = 20
@@ -321,6 +348,61 @@ D_E_LOOKBACK_MIN = 4000
 D_E_MIN_CANDLES = 30
 E_CONFIRM_CANDLES = 2
 
+# ------------------------------------------------------ Strategy F: stock opening-range breakout
+# ASTRA only (PERSONA_OVERRIDES). The 30 names in data/orb_universe.json are scored by orb_scanner
+# (100-point Pre-Breakout Score over the 09:30-09:45 bars) and ranked ONCE at F_RANK_TIME; the top
+# F_WATCH_TOP with score >= F_MIN_SCORE are watched for a completed 5-minute candle closing through the
+# 15-minute opening range (strategy.OrbSetup per ticker, whichever boundary breaks), confirmed by
+# break-candle volume vs the same window on prior sessions, price on the trade side of VWAP with
+# EMA9/EMA21 aligned, remaining expected move, and an un-blown option quote. The trade is a B-style OTM
+# vertical credit spread on the stock's nearest 0-7 DTE expiration: width = the multiple of the chain's
+# strike increment nearest 1% of spot (min $1), short strike walked through the QUOTED strikes from the
+# ATM-straddle expected move until the credit is 13-22% of width. Exits scale with width (floored at
+# F_EXIT_FLOOR): on a $5-wide spread 6%/10%/3%/2%/6% == B's 0.30/0.50/0.15/0.10/0.30. F's realized AND
+# unrealized P/L are excluded from the combined 10% daily-loss basis and an A+B halt does not stop F
+# (DAILY_LOSS_LIMIT_EXEMPT / _HALTS_EXEMPT above); its open risk counts toward the 52% cap like every
+# other position. F positions are force-closed at FORCE_CLOSE_TIME with everything else.
+F_UNIVERSE_PATH = "data/orb_universe.json"   # relative to this folder; missing/invalid -> F off for the day
+F_PREWARM_TIME = time(9, 20)      # pre-open: warm the scanner's 1-min history pages + daily bars (background thread)
+F_RANK_TIME = time(9, 45)         # end of the 15-min OR: score + rank the universe once (background thread)
+F_RANK_GRACE_SEC = 45             # wait for Yahoo's lagging 09:44 bar before scoring
+F_SCAN_RETRY_SEC = 60             # retry cadence after a failed scan, and while the 1-min bars still lag the OR15
+F_SCAN_MAX_RETRIES = 5            # failed (raising) scans before F is off for the day; lagging scans never count
+F_SCAN_WITH_CHAINS = True         # score the 10-pt option-quality component through broker chains (in the scan thread)
+F_CHAIN_CALL_GAP_SEC = 0.25       # pacing between per-ticker chain calls inside the scan thread (429 protection)
+F_MIN_SCORE = 60.0                # qualification threshold on the raw 0-100 score (order = score_with_tier)
+F_WATCH_TOP = 5                   # watch the top N qualifiers; entries in this rank order
+F_OR_MINUTES = 15                 # opening range seeding each ticker's OrbSetup (scanner or15)
+F_CANDLE_MINUTES = 5              # breakout/confirmation candle, resampled from the scanner's 1-min bars
+F_CANDLE_MAX_WAIT_SEC = 90        # a candle still missing its last 1-min bar this long after its end is logged and no longer polled every DATA_CACHE_SEC (re-checked each candle); never accepted early
+F_BARS_SESSIONS = 6               # today + prior sessions kept per watched ticker (normal-volume baseline, EMA warm-up)
+F_SIGNAL_TTL_MIN = 30             # a confirmed break not entered within this window is dropped
+F_REQUIRE_SCANNER_DIRECTION = False   # True: only trade a break in the scanner's likely direction (direction_match is always journaled)
+F_REENTRY_MOMENTUM_MINUTES = 4    # after an F exit: this many consecutive completed 1-min closes beyond the previous close, still beyond the OR level, re-signal the ticker
+F_MIN_DTE = 0                     # broker.get_expirations(ticker, F_MIN_DTE, F_MAX_DTE)[0] is traded
+F_MAX_DTE = 7
+F_EM_WINDOW_PCT = 0.03            # +/- fraction of spot for the ATM straddle chains and the strike-increment read
+F_WIDTH_PCT = 0.01                # spread width ~1% of spot ...
+F_MIN_WIDTH = 1.0                 # ... snapped to the chain's strike increment, never below $1
+F_CREDIT_PCT_RANGE = (0.13, 0.22) # entry credit band as a fraction of width; lower bound = work_entry floor
+F_MAX_STRIKE_STEPS = 20           # strike-walk iterations before F_NO_STRIKE_IN_RANGE
+F_TARGET_PCT = 0.06               # profit target as a fraction of width (0.30 on $5)
+F_STOP_PCT = 0.10                 # stop as a fraction of width (0.50 on $5)
+F_LOCK_ARM_PCT = 0.03             # profit-lock arm as a fraction of width (0.15 on $5)
+F_LOCK_GIVEBACK_PCT = 0.02        # profit-lock giveback as a fraction of width (0.10 on $5)
+F_TRAIL_PCT_OF_WIDTH = 0.06       # runner trail as a fraction of width (0.30 on $5)
+F_EXIT_FLOOR = 0.05               # floor under every width-scaled exit level above
+F_BREAK_VOLUME_RATIO = 1.0        # break-candle volume >= ratio x same-window mean over prior sessions
+F_MIN_REMAINING_EM_FRAC = 0.35    # remaining expected move must still be >= this fraction of the day's EM
+F_MAX_QUOTE_SPREAD_FRAC = 0.12    # reject when (ask_side - bid_side) of the spread quote > this fraction of width
+F_ENTRY_STEP_PCT = 0.01           # work_entry limit step as a fraction of width, min $0.01 (0.05 on $5)
+F_ENTRY_STEP_SEC = 15             # work_entry fill wait per step for F orders (SPX keeps ENTRY_STEP_SEC) ...
+F_ENTRY_TIMEOUT_SEC = 45          # ... so this timeout is honoured after three steps instead of overrunning
+F_HALF_SIZE = False               # contracts_for half_size flag for F (TESTING cap 3 instead of 6)
+F_PRICE_EVERY_SEC = 15            # min seconds between chain marks per open F ticker (bypassed on force close)
+F_MAX_ENTRIES_PER_TICKER = None   # None = re-entry allowed via a fresh confirmed break or F_REENTRY_MOMENTUM_MINUTES
+F_MAX_ERRORS_PER_DAY = 20         # consecutive F_ERRORs before F disables itself for the day
+
 # ---------------------------------------------------------------- testing-phase contract sizing
 # 2026-09-25: while C/D/E are being live-tested, contract size is capped well below the normal
 # tier-based sizing regardless of equity tier -- half that cap again for Strategy D (always) and
@@ -341,7 +423,7 @@ TESTING_HALF_SIZE_MAX_CONTRACTS = 3
 #   method 2  break-even lock: arms at +0.10, floor +0.05, both widths
 #   method 3  5-minute stale timer: no target yet but in profit -> floor at +0.05
 def _a(momentum_only=False, **extra) -> dict:
-    out = {"EXIT_TUNING_BY_STRATEGY": {"A": {**A_BASE_TUNING, **extra}, "B": {}}}
+    out = {"EXIT_TUNING_BY_STRATEGY": {**EXIT_TUNING_BY_STRATEGY, "A": {**A_BASE_TUNING, **extra}, "B": {}}}
     if momentum_only:
         # 2026-09-24: A's day-type analysis flagged PULLBACK entries as the weaker of the two ORB/
         # ON_BREAK entry kinds (the one confirmed 2026-09-23 ORB loss was PULLBACK-tagged). Half the
@@ -353,6 +435,8 @@ def _a(momentum_only=False, **extra) -> dict:
 CDE_STRATEGIES = ("A", "B", "C", "D", "E")
 
 PERSONA_OVERRIDES: dict[str, dict] = {
+    # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. Nothing else about ASTRA changes.
+    "ASTRA":  {"STRATEGIES": ("A", "B", "F")},
     # momentum-only for A (one persona from each existing floor/timer method, both width tiers)
     "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
     # 2026-09-25: ELENA and SARAH picked at random (random.sample over every remaining non-ASTRA,

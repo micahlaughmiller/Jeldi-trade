@@ -20,7 +20,7 @@ def tier(equity: float) -> int:
     return config.TIER_BANDS[-1][1]
 
 
-def contracts_for(equity: float, width: int, credit: float, open_risk_dollars: float,
+def contracts_for(equity: float, width: float, credit: float, open_risk_dollars: float,
                   news_day: bool = False, half_size: bool = False) -> int:
     """`half_size` is Strategy D (always) and Strategy E (its choppy-day variant) trading at half
     the testing-phase contract cap, per the user's own instruction -- see config.TESTING_MODE."""
@@ -55,6 +55,11 @@ class StrategyState:
     closed_trades: list[dict] = field(default_factory=list)
     last_exit: str | None = None
     last_exit_setup: str | None = None
+    entries_today: int = 0   # counted at ENTRY by multi-position strategies (F); A-E count closes only
+
+    def record_entry(self) -> int:
+        self.entries_today += 1
+        return self.entries_today
 
     def record(self, pnl: float, row: dict | None) -> None:
         self.trades_today += 1
@@ -88,6 +93,17 @@ class DayState:
         return round(sum(s.realized_pnl for s in self.strategies.values()), 2)
 
     @property
+    def loss_limit_pnl(self) -> float:
+        """Realized P/L that counts toward the combined daily-loss limit (DAILY_LOSS_LIMIT_EXEMPT removed)."""
+        return round(sum(s.realized_pnl for k, s in self.strategies.items()
+                         if k not in config.DAILY_LOSS_LIMIT_EXEMPT), 2)
+
+    @property
+    def exempt_realized_pnl(self) -> float:
+        return round(sum(s.realized_pnl for k, s in self.strategies.items()
+                         if k in config.DAILY_LOSS_LIMIT_EXEMPT), 2)
+
+    @property
     def closed_trades(self) -> list[dict]:
         return sorted((r for s in self.strategies.values() for r in s.closed_trades), key=_exit_key)
 
@@ -113,18 +129,27 @@ class RiskManager:
     def record_trade(self, strat: str, pnl: float, row: dict | None = None) -> None:
         self.state.for_strategy(strat).record(pnl, row)
 
+    def record_entry(self, strat: str) -> int:
+        return self.state.for_strategy(strat).record_entry()
+
     def daily_loss_limit(self) -> float:
         return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
     def trading_allowed(self, strat: str, equity: float | None = None,
-                        now: datetime | None = None, setup: str | None = None) -> tuple[bool, str]:
+                        now: datetime | None = None, setup: str | None = None,
+                        open_count: int = 0, exempt_open_pnl: float = 0.0) -> tuple[bool, str]:
         """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
         the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
         different ORB signal that represented the morning's move continuing into the day) -- if either the
-        candidate setup or the last exit's setup is unknown, the cool-down still applies (conservative)."""
+        candidate setup or the last exit's setup is unknown, the cool-down still applies (conservative).
+        `open_count` is the strategy's currently open positions (its entries so far are at least the closed
+        ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
+        (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
+        from account equity before the drawdown check so nothing of theirs ever trips the SPX limit."""
         s = self.state.for_strategy(strat)
-        if s.trades_today >= limit(strat, "MAX_TRADES_PER_DAY"):
-            return False, f"{strat}: MAX_TRADES_PER_DAY ({s.trades_today})"
+        entries = max(s.entries_today, s.trades_today + open_count)
+        if entries >= limit(strat, "MAX_TRADES_PER_DAY"):
+            return False, f"{strat}: MAX_TRADES_PER_DAY ({entries})"
         if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
         cooldown = limit(strat, "COOLDOWN_MIN", 0)
@@ -133,9 +158,13 @@ class RiskManager:
             until = datetime.fromisoformat(s.last_exit) + timedelta(minutes=cooldown)
             if now < until:
                 return False, f"{strat}: COOLDOWN until {until.astimezone(config.ET).strftime('%H:%M')}"
-        realized = self.state.realized_pnl
+        if strat in config.DAILY_LOSS_LIMIT_EXEMPT and not config.DAILY_LOSS_LIMIT_HALTS_EXEMPT:
+            return True, "OK"
+        realized = self.state.loss_limit_pnl
         if realized <= self.daily_loss_limit():
             return False, f"DAILY_LOSS_LIMIT realized={realized:.2f}"
-        if equity is not None and equity - self.state.start_equity <= self.daily_loss_limit():
-            return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={self.state.start_equity:.2f}"
+        if equity is not None:
+            equity = equity - self.state.exempt_realized_pnl - exempt_open_pnl
+            if equity - self.state.start_equity <= self.daily_loss_limit():
+                return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={self.state.start_equity:.2f}"
         return True, "OK"

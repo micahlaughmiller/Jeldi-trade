@@ -7,7 +7,7 @@ import config
 from conftest import et, make_candles
 from fake_broker import FakeBroker
 from journal import Journal
-from position_manager import OpenSpread, PositionManager, classify_by_moneyness, spxw_legs
+from position_manager import OpenSpread, PositionManager, classify_by_moneyness, occ_root, option_legs, spxw_legs
 from strategy import BEARISH, BULLISH
 
 TODAY = date(2026, 9, 17)
@@ -425,7 +425,7 @@ def test_state_roundtrip_and_trades_csv(pm, broker, journal, monkeypatch):
     journal.trade(fills[0])
     text = journal.trades_path.read_text().splitlines()
     assert text[0].startswith("date,strategy,entry_time,exit_time,direction")
-    assert text[0].endswith("runner,trigger_price,exit_slippage,entry_mid,entry_slippage")
+    assert text[0].endswith("runner,trigger_price,exit_slippage,entry_mid,entry_slippage,ticker,expiration,mfe,mae,scanner_score")
     assert text[1].startswith("2026-09-17,A,")
     assert "PROFIT_TARGET" in text[1] and ",n," in text[1]
 
@@ -657,3 +657,208 @@ def test_a_runner_trail_tightens_past_1_deep_profit(pm, broker):
     broker.spread_close_price = 5.21
     fills = tick(pm, et(10, 6), 5.20, rising())               # +0.30 giveback trips the now-active tight trail
     assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and pm.positions == {}
+
+
+# ------------------------------------------------------------ Strategy F: stock roots, per-position exits
+
+EXP2 = date(2026, 9, 19)
+
+
+def f_spread(root: str = "TSLA", qty: int = 1, credit: float = 0.18, width: float = 1.0, **kw) -> OpenSpread:
+    from strategy import f_exit_params
+    ex = f_exit_params(width)
+    return OpenSpread(strategy="F", direction=BULLISH, setup="STOCK_ORB", right="P", root=root, expiration=EXP2,
+                      short_strike=100.0, long_strike=100.0 - width, width=width, qty=qty, entry_credit=credit,
+                      entry_time=et(9, 55), current_price=credit, best_price=credit, profit_target=ex["profit_target"],
+                      stop_loss=ex["stop_loss"], overrides=ex["overrides"], entry_mid=credit, **kw)
+
+
+def open_f(pm: PositionManager, broker: FakeBroker, root: str = "TSLA", qty: int = 1, width: float = 1.0,
+           credit: float = 0.18) -> OpenSpread:
+    broker.set_chain("P", {100.0: (0.45, 0.55), 100.0 - width: (0.28, 0.36)}, underlying=root)
+    broker.add_spread_position("P", 100.0, 100.0 - width, qty, 0.50, 0.32, EXP2, root=root)
+    spread = f_spread(root, qty, credit, width)
+    pm.open(spread)
+    return spread
+
+
+def test_open_spread_key_ticker_underlying_mfe_mae():
+    a = OpenSpread(strategy="A", direction=BULLISH, setup="ORB", right="P", root="SPXW", expiration=TODAY,
+                   short_strike=7510.0, long_strike=7505.0, width=5, qty=1, entry_credit=3.0, entry_time=et(10, 0),
+                   current_price=3.0, best_price=2.8, profit_target=0.3, stop_loss=0.6, worst_price=3.4)
+    assert (a.key, a.ticker, a.underlying, a.mfe, a.mae) == ("A", None, "SPX", 0.2, 0.4)
+    f = f_spread()
+    assert (f.key, f.ticker, f.underlying, f.mfe, f.mae) == ("F:TSLA", "TSLA", "TSLA", 0.0, 0.0)
+    f.current_price = 0.28
+    assert f.unrealized_pnl == pytest.approx(-10.0) and a.unrealized_pnl == 0.0
+
+
+def test_option_legs_filters_by_root_and_spxw_legs_is_the_spxw_subset(broker):
+    broker.add_spread_position("P", 7510.0, 7505.0, 1, 8.1, 5.05)
+    broker.add_spread_position("P", 100.0, 99.0, 1, 0.5, 0.32, EXP2, root="TSLA")
+    positions = broker.get_positions() + [{"symbol": "AAPL", "asset_class": "stock", "qty": 10, "avg_price": 100.0}]
+    assert {occ_root(l["symbol"]) for l in option_legs(positions)} == {"SPXW", "TSLA"}
+    assert {occ_root(l["symbol"]) for l in option_legs(positions, {"TSLA"})} == {"TSLA"}
+    assert option_legs(positions, {"SPXW"}) == spxw_legs(positions) and len(spxw_legs(positions)) == 2
+    assert option_legs(positions, set()) == []
+
+
+def test_from_dict_of_a_pre_f_state_and_roundtrip_with_overrides_and_scan():
+    old = {"strategy": "B", "direction": "BULLISH", "setup": "ORB", "right": "P", "root": "SPXW",
+           "expiration": "2026-09-17", "short_strike": 7450.0, "long_strike": 7445.0, "width": 5, "qty": 1,
+           "entry_credit": 1.0, "entry_time": et(10, 0).isoformat(), "current_price": 1.0, "best_price": 1.0,
+           "profit_target": 0.3, "stop_loss": 0.5}
+    restored = OpenSpread.from_dict(old)
+    assert restored.key == "B" and restored.overrides is None and restored.scan is None and restored.worst_price is None
+    f = f_spread(width=2.5, scan={"score": 71.5, "confirm": {"vwap": 99.1}}, entry_bid=0.12, entry_ask=0.24)
+    assert OpenSpread.from_dict(f.to_dict()) == f and f.to_dict()["overrides"]["TRAIL_AMOUNT"] == 0.15
+
+
+def test_f_knobs_use_width_scaled_overrides_a_keeps_exit_setting(pm, broker):
+    f = open_f(pm, broker, credit=0.20)                                       # $1-wide
+    assert (f.target_price, f.stop_price) == (0.14, 0.30)
+    assert (pm._knob(f, "PROFIT_LOCK_ARM"), pm._knob(f, "PROFIT_LOCK_GIVEBACK"), pm._knob(f, "TRAIL_AMOUNT")) == (0.05, 0.05, 0.06)
+    assert pm._knob(f, "STOP_CONFIRM_TICKS", 1) == 1 and pm._knob(f, "RUNNER_MOMENTUM_GATE", True) is True
+    a = open_put_spread(pm, broker, qty=1)
+    assert (pm._knob(a, "PROFIT_LOCK_ARM"), pm._knob(a, "PROFIT_LOCK_GIVEBACK"), pm._knob(a, "TRAIL_AMOUNT")) == (0.30, 0.35, 0.50)
+    a.runner_best = a.entry_credit
+    assert pm._runner_trail(f) == 0.06 and pm._runner_trail(a) == config.TRAIL_AMOUNT
+    # arms at +0.05, tolerates a 0.04 giveback, locks at a 0.05 giveback
+    assert pm.on_tick(et(10, 2), {"F:TSLA": 0.15}, None) == []
+    assert pm.on_tick(et(10, 3), {"F:TSLA": 0.19}, None) == []
+    broker.spread_close_price = 0.20
+    fills = pm.on_tick(et(10, 4), {"F:TSLA": 0.20}, None)
+    assert fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK" and fills[0]["key"] == "F:TSLA" and "F:TSLA" not in pm.positions
+    assert "A" in pm.positions
+
+
+def test_f_runner_trails_by_six_percent_of_width(pm, broker):
+    f = open_f(pm, broker, qty=2, width=5.0)                                  # $5-wide, credit 0.18 -> target -0.12
+    f.entry_credit, f.best_price, f.current_price, f.entry_mid = 0.90, 0.90, 0.90, 0.90
+    rising_ = make_candles(et(9, 40), [(100 + i, 101 + i, 99.5 + i, 100.8 + i) for i in range(3)], minutes=5)
+    broker.spread_close_price = 0.60
+    fills = pm.on_tick(et(10, 2), {"F:TSLA": 0.60}, None, {"F:TSLA": rising_})
+    assert fills[0]["exit_reason"] == "TARGET_HALF" and fills[0]["qty"] == 1 and f.runner is True
+    assert pm.on_tick(et(10, 4), {"F:TSLA": 0.20}, None, {"F:TSLA": rising_}) == []
+    assert pm.on_tick(et(10, 5), {"F:TSLA": 0.49}, None, {"F:TSLA": rising_}) == []   # +0.29 < the 0.30 trail
+    broker.spread_close_price = 0.52
+    fills = pm.on_tick(et(10, 6), {"F:TSLA": 0.50}, None, {"F:TSLA": rising_})
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["runner"] == "y" and pm.positions == {}
+
+
+def test_exact_tie_moves_arm_the_lock_fire_the_giveback_and_trip_the_trail(pm, broker):
+    # 0.15 - 0.10 = 0.04999... and 0.10 + 0.05 = 0.15000...02 in binary: compared at 2 dp, a 5-cent move
+    # arms a 0.05 lock and a 5-cent giveback closes, exactly as on any other credit
+    f = open_f(pm, broker, credit=0.15)                                       # $1-wide: arm 0.05, giveback 0.05
+    assert pm.on_tick(et(10, 2), {"F:TSLA": 0.10}, None) == []               # armed on the exact tie
+    broker.spread_close_price = 0.15
+    fills = pm.on_tick(et(10, 3), {"F:TSLA": 0.15}, None)
+    assert fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK" and pm.positions == {}
+    # runner trail: best 0.27 + 0.30 = 0.5700000000000001 must still trip on a 0.57 print
+    f = open_f(pm, broker, qty=2, width=5.0)
+    f.entry_credit, f.best_price, f.current_price, f.entry_mid = 0.90, 0.90, 0.90, 0.90
+    rising_ = make_candles(et(9, 40), [(100 + i, 101 + i, 99.5 + i, 100.8 + i) for i in range(3)], minutes=5)
+    broker.spread_close_price = 0.60
+    assert pm.on_tick(et(10, 4), {"F:TSLA": 0.60}, None, {"F:TSLA": rising_})[0]["exit_reason"] == "TARGET_HALF"
+    assert pm.on_tick(et(10, 5), {"F:TSLA": 0.27}, None, {"F:TSLA": rising_}) == []
+    broker.spread_close_price = 0.57
+    fills = pm.on_tick(et(10, 6), {"F:TSLA": 0.57}, None, {"F:TSLA": rising_})
+    assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and pm.positions == {}
+
+
+def test_open_pnl_includes_what_partial_fills_already_booked(pm, broker):
+    f = open_f(pm, broker, qty=4, width=5.0)
+    f.entry_credit, f.best_price, f.current_price, f.entry_mid = 0.90, 0.90, 0.90, 0.90
+    rising_ = make_candles(et(9, 40), [(100 + i, 101 + i, 99.5 + i, 100.8 + i) for i in range(3)], minutes=5)
+    broker.spread_close_price = 0.60
+    fills = pm.on_tick(et(10, 2), {"F:TSLA": 0.60}, None, {"F:TSLA": rising_})
+    assert (fills[0]["exit_reason"], fills[0]["qty"], fills[0]["position_closed"]) == ("TARGET_HALF", 2, False)
+    assert f.realized_pnl == pytest.approx(60.0) and f.remaining == 2
+    f.current_price = 0.90                                                    # runner marks flat at entry
+    assert pm.unrealized_pnl(("F",)) == 0.0 and pm.open_pnl(("F",)) == pytest.approx(60.0)
+    f.current_price = 0.70
+    assert pm.unrealized_pnl(("F",)) == pytest.approx(40.0) and pm.open_pnl(("F",)) == pytest.approx(100.0)
+    assert pm.open_pnl(("A", "B")) == 0.0
+
+
+def test_worst_price_and_exit_row_fields(pm, broker):
+    f = open_f(pm, broker)
+    assert pm.on_tick(et(10, 2), {"F:TSLA": 0.15}, None) == []
+    assert pm.on_tick(et(10, 3), {"F:TSLA": 0.24}, None) == []
+    assert (f.best_price, f.worst_price, f.mfe, f.mae) == (0.15, 0.24, pytest.approx(0.03), pytest.approx(0.06))
+    broker.spread_close_price = 0.30
+    row = pm.on_tick(et(10, 4), {"F:TSLA": 0.28}, None)[0]
+    assert (row["key"], row["ticker"], row["expiration"], row["exit_reason"]) == ("F:TSLA", "TSLA", "2026-09-19", "STOP_LOSS")
+    assert (row["mfe"], row["mae"], row["scanner_score"], row["direction_match"]) == (pytest.approx(0.03), pytest.approx(0.10), None, None)
+    a = open_put_spread(pm, broker, qty=1)
+    broker.spread_close_price = 3.65
+    tick(pm, et(10, 5), 3.60, rising())
+    row = tick(pm, et(10, 6), 3.61, rising())[0]
+    assert (row["key"], row["ticker"], row["expiration"], row["mae"], row["scanner_score"]) == ("A", None, "2026-09-17", pytest.approx(0.61), None)
+
+
+def test_on_tick_routes_ticker_candles_to_f_and_never_the_spx_frame(pm, broker):
+    f = open_f(pm, broker, qty=2)
+    open_put_spread(pm, broker, qty=2)
+    spx = rising()
+    broker.spread_close_price = 0.12
+    fills = pm.on_tick(et(10, 2), {"F:TSLA": 0.12, "A": 2.70}, spx, {"F:TSLA": None})
+    assert [fl["exit_reason"] for fl in fills] == ["PROFIT_TARGET"] and fills[0]["qty"] == 2   # no frame: no runner
+    assert pm.positions["A"].runner is True and pm.positions["A"].momentum_at_target == pytest.approx(2.0)   # A got the SPX frame
+    f2 = open_f(pm, broker, "AMZN", qty=2)
+    fills = pm.on_tick(et(10, 4), {"F:AMZN": 0.12}, spx, {"F:AMZN": spx})
+    assert fills[0]["exit_reason"] == "TARGET_HALF" and f2.runner is True                 # its own frame: runner
+
+
+def test_adopt_stock_pair_as_f_matching_saved_state_by_root(pm, broker):
+    broker.add_spread_position("P", 7510.0, 7505.0, 2, 8.10, 5.05)
+    broker.set_chain("P", {100.0: (0.45, 0.55), 99.0: (0.28, 0.36)}, underlying="TSLA")
+    broker.add_spread_position("P", 100.0, 99.0, 3, 0.50, 0.32, EXP2, root="TSLA")
+    broker.set_chain("P", {100.0: (0.45, 0.55), 97.5: (0.15, 0.25)}, underlying="AMZN")
+    broker.add_spread_position("P", 100.0, 97.5, 1, 0.55, 0.20, EXP2, root="AMZN")
+    saved = f_spread("TSLA", qty=3, scan={"score": 66.0})
+    saved.best_price = 0.11
+    adopted = pm.adopt_from_broker(broker.get_positions(), et(10, 15), SPOT, {"F:TSLA": saved.to_dict()})
+    assert {s.key for s in adopted} == {"A", "F:TSLA", "F:AMZN"} and set(pm.positions) == {"A", "F:TSLA", "F:AMZN"}
+    t = pm.positions["F:TSLA"]
+    assert t.setup == "STOCK_ORB" and t.best_price == 0.11 and t.scan == {"score": 66.0} and t.qty == 3
+    assert t.current_price == pytest.approx(0.18)
+    a = pm.positions["F:AMZN"]
+    assert (a.strategy, a.setup, a.root, a.width, a.direction, a.entry_credit) == ("F", "ADOPTED", "AMZN", 2.5, BULLISH, 0.35)
+    assert (a.profit_target, a.stop_loss) == (0.15, 0.25) and a.overrides["TRAIL_AMOUNT"] == 0.15
+    assert pm.positions["A"].strategy == "A" and pm.has_root("AMZN") and not pm.has_root("META")
+    assert pm.adopt_from_broker(broker.get_positions(), et(10, 16), SPOT) == []            # already tracked
+    assert [e["strategy"] for e in events(pm.journal, "ADOPTED")].count("F") == 2
+
+
+def test_adopt_roots_filter_keeps_stock_legs_out_for_spx_only_personas(pm, broker):
+    broker.add_spread_position("P", 7510.0, 7505.0, 2, 8.10, 5.05)
+    broker.add_spread_position("P", 100.0, 99.0, 1, 0.50, 0.32, EXP2, root="TSLA")
+    adopted = pm.adopt_from_broker(broker.get_positions(), et(10, 15), SPOT, roots={"SPXW"})
+    assert [s.key for s in adopted] == ["A"] and set(pm.positions) == {"A"}
+    # a third SPXW pair never lands on F: the free-slot list is the SPX strategies only
+    broker.add_spread_position("P", 7450.0, 7445.0, 1, 2.50, 1.50)
+    broker.set_chain("C", {7550.0: (2.4, 2.6), 7560.0: (0.9, 1.1)})
+    broker.add_spread_position("C", 7550.0, 7560.0, 1, 2.50, 1.00)
+    pm.adopt_from_broker(broker.get_positions(), et(10, 16), SPOT, roots={"SPXW"})
+    assert set(pm.positions) == {"A", "B"}
+
+
+def test_duplicate_key_is_tracked_not_raised(pm, broker, journal):
+    first = open_f(pm, broker)
+    second = f_spread()
+    assert pm.open(second) == "F:TSLA#2"
+    assert set(pm.positions) == {"F:TSLA", "F:TSLA#2"} and pm.key_of(second) == "F:TSLA#2" and pm.key_of(first) == "F:TSLA"
+    dup = events(journal, "DUPLICATE_POSITION_KEY")
+    assert len(dup) == 1 and dup[0]["tracked_as"] == "F:TSLA#2" and pm.open_count("F") == 2
+    broker.spread_close_price = 0.30
+    row = pm.on_tick(et(10, 4), {"F:TSLA#2": 0.28}, None)[0]
+    assert row["key"] == "F:TSLA#2" and set(pm.positions) == {"F:TSLA"}
+
+
+def test_remaining_at_broker_filters_by_root(pm, broker):
+    broker.add_spread_position("P", 100.0, 99.0, 2, 8.10, 5.05)              # SPXW legs on the same strikes
+    f = open_f(pm, broker, qty=1)
+    assert pm._remaining_at_broker(f) == 1
+    broker._reduce_spread("TSLA", EXP2, "P", 100.0, 99.0, 1)
+    assert pm._remaining_at_broker(f) == 0                                    # the SPXW legs do not count

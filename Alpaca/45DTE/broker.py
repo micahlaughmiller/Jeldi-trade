@@ -194,6 +194,11 @@ class Broker:
                     self._sleep(0.5 * 2 ** attempt)
                     continue
                 raise last_err
+            except requests.RequestException as e:
+                # Anything else requests raises (a truncated body -> ChunkedEncodingError, a bad
+                # content-encoding, too many redirects) is a hard failure of this call: the interface
+                # promises BrokerError, and the strategy code only ever catches that.
+                raise BrokerError(f"request error: {type(e).__name__}: {e}")
             if resp.status_code in ok:
                 if resp.status_code == 204 or not resp.content:
                     return None

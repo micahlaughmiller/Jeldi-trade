@@ -134,6 +134,20 @@ def test_http_error_and_retry(b):
     assert str(ei.value).startswith("403")
 
 
+def test_other_request_exceptions_become_broker_errors_without_retry(b):
+    import requests
+    sleeps = []
+    b._sleep = lambda s: sleeps.append(s)
+
+    def truncated(*a, **k):
+        raise requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead(512 bytes read)")
+
+    b._session.request = truncated
+    with pytest.raises(BrokerError) as ei:
+        b.get_positions()
+    assert "ChunkedEncodingError" in str(ei.value) and sleeps == []         # a hard failure of the call, not lag
+
+
 def test_positions_normalization(b):
     b._session.add("GET", "/v2/positions", body=[
         {"symbol": "SPXW260917P07510000", "qty": "-1", "avg_entry_price": "1.25", "current_price": "0.9", "market_value": "-90", "unrealized_pl": "35", "asset_class": "us_option"},

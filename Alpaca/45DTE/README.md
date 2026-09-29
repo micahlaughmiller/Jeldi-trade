@@ -61,7 +61,7 @@ where you launch from. Ctrl+C saves state and exits.
    else the next delta candidate, else skip). Credit = mid - mid rounded down to $0.05.
    Accept at >= 1.50 (>= 1.40 when both RSIs are beyond 25/75). Risk check, then one
    multi-leg DAY limit order at the credit. Every 60 min the limit drops $0.02 via
-   replace, down to the floor (1.50 / 1.40 strong), then the order is canceled. All
+   replace, down to the floor (1.50 / 1.40 strong), where it sits working. All
    unfilled entries are canceled at 15:55; no entries are started after that.
 5. **Fill -> GTC close.** On fill the actual `filled_avg_price` becomes the entry
    credit and a GTC close is submitted at `round_to_0.05(credit x 0.50)`. Partial fills

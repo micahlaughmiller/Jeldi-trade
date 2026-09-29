@@ -125,7 +125,7 @@ class TestEntryToClose:
 
 
 class TestPriceReduction:
-    def test_reduces_every_hour_to_floor_then_cancels(self, env):
+    def test_reduces_every_hour_to_floor_then_holds(self, env):
         clock, broker, log, om, tmp = env
         oid = om.submit_entry(spec(1.56), 1)
         clock.advance(minutes=30)
@@ -143,10 +143,34 @@ class TestPriceReduction:
         replaces = [c for c in broker.calls if c[0] == "replace_order_price"]
         assert [c[1][1] for c in replaces] == [1.54, 1.52, 1.50]
         last_id = om.working_entries[0]["order_id"]
-        clock.advance(minutes=31)
+        for _ in range(3):
+            clock.advance(minutes=61)
+            om.reduce_prices()
+        assert om.working_entries[0]["order_id"] == last_id
+        assert om.working_entries[0]["limit_credit"] == 1.50
+        assert broker.orders[last_id]["status"] != "canceled"
+        assert len([c for c in broker.calls if c[0] == "replace_order_price"]) == 3
+
+    def test_entry_at_the_floor_is_never_reduced_or_canceled(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.50), 1)
+        for _ in range(4):
+            clock.advance(minutes=61)
+            om.reduce_prices()
+        assert om.working_entries[0]["order_id"] == oid
+        assert om.working_entries[0]["limit_credit"] == 1.50
+        assert broker.orders[oid]["status"] != "canceled"
+        assert not [c for c in broker.calls if c[0] in ("replace_order_price", "cancel_order")]
+
+    def test_step_that_would_cross_the_floor_stops_at_it(self, env):
+        clock, broker, log, om, tmp = env
+        om.submit_entry(spec(1.51), 1)
+        clock.advance(minutes=61)
         om.reduce_prices()
-        assert om.working_entries == []
-        assert broker.orders[last_id]["status"] == "canceled"
+        assert om.working_entries[0]["limit_credit"] == 1.50
+        clock.advance(minutes=61)
+        om.reduce_prices()
+        assert om.working_entries[0]["limit_credit"] == 1.50 and om.working_entries
 
     def test_strong_signal_uses_lower_floor(self, env):
         clock, broker, log, om, tmp = env
@@ -156,7 +180,7 @@ class TestPriceReduction:
         assert om.working_entries[0]["limit_credit"] == 1.40
         clock.advance(minutes=61)
         om.reduce_prices()
-        assert om.working_entries == []
+        assert om.working_entries[0]["limit_credit"] == 1.40 and om.working_entries
 
     def test_cancel_unfilled_entries(self, env):
         clock, broker, log, om, tmp = env

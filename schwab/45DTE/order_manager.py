@@ -204,9 +204,10 @@ class OrderManager:
             last = datetime.fromisoformat(entry["last_reduction_at"])
             if (now - last).total_seconds() < cfg.PRICE_REDUCTION_INTERVAL_MIN * 60:
                 continue
-            new_limit = round(entry["limit_credit"] - cfg.PRICE_REDUCTION_AMOUNT, 2)
-            if new_limit + 1e-9 < entry["floor"]:
-                self._cancel_entry(order_id, entry, f"limit {entry['limit_credit']:.2f} at floor {entry['floor']:.2f}")
+            # Walk down to the floor and then sit there; only the CANCEL_UNFILLED_AT sweep cancels.
+            new_limit = max(round(entry["limit_credit"] - cfg.PRICE_REDUCTION_AMOUNT, 2), entry["floor"])
+            if new_limit + 1e-9 >= entry["limit_credit"]:
+                entry["last_reduction_at"] = now.isoformat()
                 continue
             try:
                 order = self.broker.replace_order_price(order_id, new_limit)

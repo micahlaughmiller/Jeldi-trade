@@ -42,7 +42,14 @@ RISK_FREE_RATE = 0.04
 # 2026-09-23: SPX 0DTE quotes are tight enough to work a closer limit; escalation step now $0.03/retry
 # instead of $0.05 (close_spread_at_market: limit = ask-side + CLOSE_SLIPPAGE * attempt_number).
 CLOSE_SLIPPAGE = 0.03
-CLOSE_RETRY_SEC = 15
+# 2026-09-29: 15s -> 2s. A's profit-lock/stop exits were chasing a moving target during fast moves
+# (one traced case: decision at 2.67, actual fill at 2.95 -- slippage well past the nominal
+# CLOSE_SLIPPAGE*attempts escalation, because the broker re-quotes its ask-side fresh on each retry,
+# so a slow retry cadence gives the underlying that much longer to keep running between attempts).
+# Retrying every 2s instead of 15s means far less time for price to move between escalations.
+# Note: CLOSE_MAX_RETRIES is unchanged, so the total give-up window also shrinks (90s -> 12s) --
+# watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
+CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
 LOG_DIR = "logs"
 

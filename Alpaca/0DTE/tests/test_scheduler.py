@@ -32,6 +32,10 @@ def bot(tmp_path, monkeypatch) -> scheduler.Bot:
     broker.set_chain("C", {7600.0: (21.0, 23.0)})   # ATM straddle: 22 + 20 = 42
     monkeypatch.setattr(scheduler, "LOG_DIR", tmp_path)
     monkeypatch.setattr(scheduler, "Broker", lambda *a, **k: broker)
+    # These tests call pm.on_tick()/bot.tick() directly rather than the real sleep loop, and were
+    # written around exactly 2 confirming ticks for A's stop -- pin TICK_SECONDS=15 so that still
+    # holds (A's real STOP_CONFIRM_SECONDS=30 / 15 = 2 ticks) rather than rewriting every such test.
+    monkeypatch.setattr(config, "TICK_SECONDS", 15)
     b = scheduler.Bot(dry_run=False, once=True)
     b.today = TODAY
     b.risk = RiskManager(10_000)

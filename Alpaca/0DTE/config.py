@@ -170,11 +170,13 @@ ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", 
 
 PROFIT_TARGET = 0.30
 STOP_LOSS = 0.60
-# Ticks the spread price must sit at/above the stop before it actually closes (default 1 = immediate,
-# today's behavior everywhere). 2026-09-23: five personas hit an identical ON_BREAK entry; two were
-# stopped out within the same minute by what looks like a single noisy print, while the other three
-# rode the same move to a runner win. A requires 2 consecutive ticks (~30s) to confirm a stop.
-STOP_CONFIRM_TICKS = 1
+# Real seconds the spread price must sit at/above the stop before it actually closes (default 0 =
+# immediate, today's behavior everywhere except A). 2026-09-23: five personas hit an identical
+# ON_BREAK entry; two were stopped out within the same minute by what looks like a single noisy
+# print, while the other three rode the same move to a runner win. A requires ~30s to confirm a
+# stop. Named in SECONDS (not a raw tick count) specifically so this can't silently drift if
+# TICK_SECONDS ever changes -- position_manager derives the actual tick count from the current rate.
+STOP_CONFIRM_SECONDS = 0
 B_PROFIT_TARGET = 0.30
 B_STOP_LOSS = 0.50
 # C, D: same target/stop as B by default (each has its own name so it can be tuned independently
@@ -261,6 +263,12 @@ RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOM
 # runner always starts at the target, and no momentum-slowdown exit. That set turned the day's real entries
 # from -$16.9k to +$13.5k on the model; the shared 0.15/0.10 lock cut every winner at about +0.10. B keeps
 # the shared defaults until it has its own data.
+# 2026-09-29: RETUNED tighter (arm +0.15, giveback 0.05), reversing the above -- A ran a full week at
+# 0% win rate, with the giveback repeatedly wiping out gains that had gotten close to target (one
+# traced case: locked profit around +0.32, gave it ALL back through entry to a real loss before the
+# looser 0.35 giveback ever triggered). The 2026-09-21 tuning solved "the lock cuts winners too early";
+# this solves "the lock doesn't cut losers running back through breakeven soon enough" -- a genuine
+# trade-off, not a strict improvement, and worth re-examining once there's a full week of data on it.
 # Profit floor: once the trade is `arm` in profit, a hard exit floor sits at `floor` profit while the position
 # (and any runner) keeps going. Keyed by spread width: {width: (arm, floor)}. Empty = off.
 PROFIT_FLOOR_BY_WIDTH: dict = {}
@@ -269,9 +277,9 @@ PROFIT_FLOOR_BY_WIDTH: dict = {}
 STALE_TIMER_MIN = None
 STALE_FLOOR = 0.05
 
-A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.30, "PROFIT_LOCK_GIVEBACK": 0.35, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
+A_BASE_TUNING = {"PROFIT_LOCK_ARM": 0.15, "PROFIT_LOCK_GIVEBACK": 0.05, "PROFIT_LOCK_ON_MOMENTUM_FLIP": False,
                  "RUNNER_MOMENTUM_GATE": False, "RUNNER_SLOWDOWN_EXIT": False, "RUNNER_TIGHTEN_ENABLED": True,
-                 "STOP_CONFIRM_TICKS": 2, "MOMENTUM_CONFIRM_ENABLED": True}
+                 "STOP_CONFIRM_SECONDS": 30, "MOMENTUM_CONFIRM_ENABLED": True}
 B_BASE_TUNING = {"REENTRY_ON_CONTINUATION_ENABLED": True}
 # C, D, E: no tuning of their own yet -- they use the shared/default exit knobs (profit-lock, runner,
 # etc.) at whatever the module-level values are, same as B started out.

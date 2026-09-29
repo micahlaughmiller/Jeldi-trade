@@ -14,6 +14,16 @@ TODAY = date(2026, 9, 17)
 SPOT = 7500.0
 
 
+@pytest.fixture(autouse=True)
+def _stop_confirm_at_two_ticks(monkeypatch):
+    # These tests call pm.on_tick() directly (never scheduler's sleep loop), so TICK_SECONDS only
+    # matters here as the divisor STOP_CONFIRM_SECONDS is scaled by. A's STOP_CONFIRM_SECONDS=30 at
+    # the real TICK_SECONDS=1 needs 30 ticks to confirm; these tests were written around exactly 2
+    # confirming ticks, so pin TICK_SECONDS=15 here to get that back (2 * 15 = 30, matching A's real
+    # setting) rather than rewriting every test to loop 30 times.
+    monkeypatch.setattr(config, "TICK_SECONDS", 15)
+
+
 @pytest.fixture
 def broker() -> FakeBroker:
     b = FakeBroker(equity=10_000, today=TODAY)
@@ -131,16 +141,16 @@ def test_a_runner_ignores_momentum_slowdown(pm, broker):
     assert pm.positions["A"].runner is True
 
 
-def test_a_profit_lock_arms_at_030_and_gives_back_035(pm, broker):
+def test_a_profit_lock_arms_at_015_and_gives_back_005(pm, broker):
+    # 2026-09-29: retuned tighter (arm +0.15, giveback 0.05) after a full week at 0% win rate where
+    # the looser 0.30/0.35 let gains that had gotten close to target give ALL the way back to a loss.
     open_put_spread(pm, broker, qty=2)
-    assert tick(pm, et(10, 2), 2.80, rising()) == []      # +0.20: below A's 0.30 arm
-    assert tick(pm, et(10, 4), 3.00, rising()) == []      # all given back, never armed, no exit
-    assert tick(pm, et(10, 6), 2.72, rising()) == []      # +0.28: still below the arm
-    pm.positions["A"].profit_target = 1.00                  # keep the runner out of the way for this test
-    assert tick(pm, et(10, 8), 2.65, rising()) == []      # +0.35 arms, best 2.65
-    assert tick(pm, et(10, 10), 2.99, rising()) == []     # gave back 0.34 < 0.35
-    broker.spread_close_price = 3.00
-    fills = tick(pm, et(10, 12), 3.00, rising())          # gave back 0.35 -> lock
+    assert tick(pm, et(10, 2), 2.90, rising()) == []      # +0.10: below A's 0.15 arm
+    assert tick(pm, et(10, 4), 2.95, rising()) == []      # worse print, still unarmed, no exit
+    assert tick(pm, et(10, 6), 2.80, rising()) == []      # +0.20 arms, best 2.80
+    assert tick(pm, et(10, 8), 2.83, rising()) == []      # gave back 0.03 < 0.05
+    broker.spread_close_price = 2.85
+    fills = tick(pm, et(10, 10), 2.85, rising())          # gave back 0.05 -> lock
     assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK" and pm.positions == {}
 
 
@@ -157,7 +167,7 @@ def test_b_keeps_shared_lock_gate_and_slowdown(pm, broker):
     assert (exit_setting("B", "PROFIT_LOCK_ARM"), exit_setting("B", "PROFIT_LOCK_GIVEBACK")) == (0.15, 0.10)
     assert exit_setting("B", "PROFIT_LOCK_ON_MOMENTUM_FLIP") is True
     assert exit_setting("B", "RUNNER_MOMENTUM_GATE", True) is True and exit_setting("B", "RUNNER_SLOWDOWN_EXIT", True) is True
-    assert (exit_setting("A", "PROFIT_LOCK_ARM"), exit_setting("A", "PROFIT_LOCK_GIVEBACK")) == (0.30, 0.35)
+    assert (exit_setting("A", "PROFIT_LOCK_ARM"), exit_setting("A", "PROFIT_LOCK_GIVEBACK")) == (0.15, 0.05)
     open_b_put_spread(pm, broker, qty=1)
     assert tick(pm, et(10, 2), 0.80, rising(), strat="B") == []           # +0.20 arms B's lock
     broker.spread_close_price = 0.90
@@ -720,7 +730,7 @@ def test_f_knobs_use_width_scaled_overrides_a_keeps_exit_setting(pm, broker):
     assert (pm._knob(f, "PROFIT_LOCK_ARM"), pm._knob(f, "PROFIT_LOCK_GIVEBACK"), pm._knob(f, "TRAIL_AMOUNT")) == (0.05, 0.05, 0.06)
     assert pm._knob(f, "STOP_CONFIRM_TICKS", 1) == 1 and pm._knob(f, "RUNNER_MOMENTUM_GATE", True) is True
     a = open_put_spread(pm, broker, qty=1)
-    assert (pm._knob(a, "PROFIT_LOCK_ARM"), pm._knob(a, "PROFIT_LOCK_GIVEBACK"), pm._knob(a, "TRAIL_AMOUNT")) == (0.30, 0.35, 0.50)
+    assert (pm._knob(a, "PROFIT_LOCK_ARM"), pm._knob(a, "PROFIT_LOCK_GIVEBACK"), pm._knob(a, "TRAIL_AMOUNT")) == (0.15, 0.05, 0.50)
     a.runner_best = a.entry_credit
     assert pm._runner_trail(f) == 0.06 and pm._runner_trail(a) == config.TRAIL_AMOUNT
     # arms at +0.05, tolerates a 0.04 giveback, locks at a 0.05 giveback

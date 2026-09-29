@@ -321,13 +321,20 @@ class PositionManager:
             return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)
         if p.runner:
             return self._runner_tick(p, now, spread_price, candles)
-        confirm = strategy.exit_setting(p.strategy, "STOP_CONFIRM_TICKS", 1)
+        # 2026-09-29: time-based, not a raw tick count -- STOP_CONFIRM_TICKS=2 meant ~30s of real
+        # confirmation back when TICK_SECONDS was 15, but silently became ~2s once TICK_SECONDS
+        # dropped to 1 (a real, unintended regression: A's 0% win rate one week traced partly to
+        # this). STOP_CONFIRM_SECONDS names the real-world window directly; the number of ticks
+        # needed to satisfy it is derived from the CURRENT tick rate, so it can never silently drift
+        # again if TICK_SECONDS changes.
+        confirm_seconds = strategy.exit_setting(p.strategy, "STOP_CONFIRM_SECONDS", 0)
+        confirm = max(1, round(confirm_seconds / config.TICK_SECONDS))
         if spread_price >= p.stop_price:
             p.stop_streak += 1
             if p.stop_streak >= confirm:
                 return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
-            log.info("[%s] STOP_LOSS candidate tick %d/%d at %.2f (stop %.2f): holding for confirmation",
-                     p.key, p.stop_streak, confirm, spread_price, p.stop_price)
+            log.info("[%s] STOP_LOSS candidate tick %d/%d (%ds) at %.2f (stop %.2f): holding for confirmation",
+                     p.key, p.stop_streak, confirm, confirm_seconds, spread_price, p.stop_price)
             return []
         p.stop_streak = 0
         if spread_price <= p.target_price:

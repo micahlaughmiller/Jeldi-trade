@@ -88,7 +88,7 @@ def test_win_resets_consecutive_losses():
 def test_a_limits_are_tighter_than_b():
     assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (5, 5, 30)
     from strategy import exit_setting
-    assert exit_setting("A", "STOP_CONFIRM_TICKS", 1) == 2 and exit_setting("B", "STOP_CONFIRM_TICKS", 1) == 1
+    assert exit_setting("A", "STOP_CONFIRM_SECONDS", 0) == 30 and exit_setting("B", "STOP_CONFIRM_SECONDS", 0) == 0
     assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (20, 5, 0)
     rm = RiskManager(10_000)
     for _ in range(5):

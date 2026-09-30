@@ -317,6 +317,56 @@ EXIT_BB_STD = 2.0
 RSI_PERIOD = 14
 RSI_REVERSAL_PTS = 5.0
 
+# ------------------------------------------------------------------- quote-jump sanity gate
+# 2026-09-30: ASTRA reported a spread price of 5.21 one tick, then exited ~6.10 the very next tick --
+# too large a move for that one second's real underlying action (confirmed against the live chart).
+# spread_prices() (scheduler.py) fetches a fresh option-chain quote every tick with zero validation --
+# a single stale/bad print from the indicative feed reaches every exit check (stop, target, floor,
+# trail, staged or legacy) immediately, and self-corrects on the next tick with no trace except the
+# real (bad) exit it triggered. This does not distinguish "bad print" from "genuinely fast real move"
+# by inspecting the quote itself (no bid/ask width check yet -- see the TODO below); it uses the same
+# tool already trusted elsewhere in this file for the identical class of problem (STOP_CONFIRM_SECONDS,
+# STAGE3_CONFIRM_SECONDS): require a second, means a real move; a one-tick spike that doesn't repeat is
+# suspect and gets held rather than acted on.
+#
+# _tick_position (position_manager.py) checks each new quote against the position's last ACCEPTED
+# price (p.current_price): a jump within QUOTE_JUMP_SANITY_PCT * width (floored at
+# QUOTE_JUMP_SANITY_FLOOR), scaled by a FIXED per-strategy expected polling interval -- F's much
+# slower F_PRICE_EVERY_SEC, everyone else's TICK_SECONDS -- capped at QUOTE_JUMP_MAX_NOMINAL_TICKS,
+# passes through untouched -- this only ever engages on a jump big enough to already look wrong. A
+# jump that exceeds it is held as "pending": that tick is skipped entirely (no exit check runs,
+# p.current_price does NOT advance) and logged/journaled (QUOTE_JUMP_HELD) rather than silently
+# swallowed. If the VERY NEXT accepted-quote attempt is close to that pending value, it's a real move
+# and gets accepted once it's held for QUOTE_JUMP_CONFIRM_SECONDS; if not, the anomaly didn't repeat
+# and the pending value is dropped in favor of whatever came next. QUOTE_JUMP_MAX_HOLD_SECONDS is a
+# separate, explicit backstop for a genuinely fast REAL move that never settles on one repeated
+# reading long enough to confirm -- past that ceiling the current reading is forced through anyway
+# (QUOTE_JUMP_FORCED), so a position can never be stuck refusing to tick forever.
+#
+# 2026-09-30, post-review (an independent adversarial pass on the first version of this fix, before
+# it ever reached Schwab or was pushed): the FIRST draft scaled the allowed jump by however much real
+# wall-clock time had elapsed since the last accepted price, INCLUDING time spent stuck holding an
+# unconfirmed quote -- which meant the bound kept widening open the longer a bad reading went
+# unconfirmed, and eventually any value (not just the one actually held pending) would slip through
+# the plain jump<=bound check on its own, never needing the "two consistent readings" confirmation at
+# all. Worse, the same wide-open-by-cadence design made Strategy F (F_PRICE_EVERY_SEC=15, i.e. ~15x
+# TICK_SECONDS) effectively ungated in ordinary operation, not just once stuck -- on a $1-wide F
+# spread the resulting bound covered ~90% of the entire feasible price range, wide enough that nearly
+# any single print passes immediately regardless of how implausible it is. Fixed by (a) making the
+# cadence multiplier a FIXED, capped figure derived from each strategy's own configured polling
+# interval rather than measured wall-clock elapsed time, so it no longer grows just because a quote
+# has been sitting unconfirmed, and (b) adding the explicit MAX_HOLD_SECONDS backstop above to replace
+# the safety property the old (broken) widening accidentally provided -- guaranteeing a position can't
+# get stuck indefinitely without reopening the same "just wait it out" hole the fix in (a) closed.
+# TODO: also sanity-check the raw bid/ask width itself (something like F's quote_blown_out), not just
+# mid-to-mid movement -- a blown-out quote can be wrong without necessarily being a big jump from the
+# last accepted price (e.g. two consecutive bad prints).
+QUOTE_JUMP_SANITY_PCT = 0.06     # $0.30 on $5 per nominal tick -- same magnitude as STAGE2_TARGET_PCT
+QUOTE_JUMP_SANITY_FLOOR = 0.05   # floor so a thin/cheap spread (e.g. F on a $1 width) isn't gated on noise
+QUOTE_JUMP_MAX_NOMINAL_TICKS = 5.0   # caps F's real ~15x cadence gap so its bound stays meaningful
+QUOTE_JUMP_CONFIRM_SECONDS = 2
+QUOTE_JUMP_MAX_HOLD_SECONDS = 6      # backstop: never withhold a tick this long, no matter what
+
 # Per-strategy overrides of the exit knobs above (strategy.exit_setting). A, from the 2026-09-21 replay:
 # lock arms at +0.30 and tolerates a 0.35 giveback (about one quote width), no candle-against exit, the
 # runner always starts at the target, and no momentum-slowdown exit. That set turned the day's real entries

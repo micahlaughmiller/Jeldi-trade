@@ -57,6 +57,20 @@ class OpenSpread:
     # two while the real root cause (stale/bad quote source feeding spread_price, most likely) is dug
     # into separately; not itself a behavior change to any exit decision.
     prev_price: float | None = None
+    # 2026-09-30: quote-jump sanity gate (config.QUOTE_JUMP_SANITY_PCT) -- the actual fix for the
+    # anomaly above. last_tick_at is when current_price was last ACCEPTED (used to scale the sanity
+    # bound by elapsed time, so F's slower per-ticker cadence isn't held to the same per-second band as
+    # the 1-second SPX strategies); pending_quote/_since track an unconfirmed large jump awaiting a
+    # second, consistent reading before _tick_position acts on it.
+    last_tick_at: datetime | None = None
+    pending_quote: float | None = None
+    pending_quote_since: datetime | None = None
+    # When THIS position first became unable to progress (the first tick that failed the sanity
+    # bound), regardless of how many different pending_quote values it's cycled through since --
+    # last_tick_at is NOT usable for this: for F it's naturally ~F_PRICE_EVERY_SEC stale even under
+    # completely normal operation, which would make QUOTE_JUMP_MAX_HOLD_SECONDS fire immediately on
+    # every single F tick. Cleared the moment a value is accepted (immediate, confirmed, or forced).
+    stuck_since: datetime | None = None
 
     @property
     def remaining(self) -> int:
@@ -107,6 +121,9 @@ class OpenSpread:
         d["expiration"] = self.expiration.isoformat()
         d["entry_time"] = self.entry_time.isoformat()
         d["best_price_since"] = self.best_price_since.isoformat() if self.best_price_since else None
+        d["last_tick_at"] = self.last_tick_at.isoformat() if self.last_tick_at else None
+        d["pending_quote_since"] = self.pending_quote_since.isoformat() if self.pending_quote_since else None
+        d["stuck_since"] = self.stuck_since.isoformat() if self.stuck_since else None
         return d
 
     @classmethod
@@ -116,6 +133,12 @@ class OpenSpread:
         kw["entry_time"] = datetime.fromisoformat(kw["entry_time"])
         if kw.get("best_price_since"):
             kw["best_price_since"] = datetime.fromisoformat(kw["best_price_since"])
+        if kw.get("last_tick_at"):
+            kw["last_tick_at"] = datetime.fromisoformat(kw["last_tick_at"])
+        if kw.get("pending_quote_since"):
+            kw["pending_quote_since"] = datetime.fromisoformat(kw["pending_quote_since"])
+        if kw.get("stuck_since"):
+            kw["stuck_since"] = datetime.fromisoformat(kw["stuck_since"])
         return cls(**kw)
 
 
@@ -300,6 +323,103 @@ class PositionManager:
             return p.overrides[name]
         return strategy.exit_setting(p.strategy, name, default)
 
+    def _sanitize_quote(self, p: OpenSpread, now: datetime, spread_price: float) -> float | None:
+        """Guard against a single bad/stale option-chain print reaching any exit decision (config.py's
+        quote-jump-sanity section has the full rationale -- a real live anomaly, ASTRA reported 5.21
+        one tick then exited ~6.10 the next). Returns the price to act on this tick, or None to sit
+        this tick out entirely (p.current_price/prev_price/etc. stay untouched, same as the existing
+        "no chain quote this tick" skip in scheduler.spread_prices).
+
+        A jump within QUOTE_JUMP_SANITY_PCT of width (floored at QUOTE_JUMP_SANITY_FLOOR), scaled by a
+        FIXED per-strategy expected polling interval (F's much slower F_PRICE_EVERY_SEC, everyone
+        else's TICK_SECONDS -- capped at QUOTE_JUMP_MAX_NOMINAL_TICKS so F's real 15x-ish cadence gap
+        doesn't inflate the bound to where it stops meaning anything on a thin/cheap width), passes
+        straight through. 2026-09-30, post-review: this scaling is deliberately NOT based on how long
+        a quote has actually been held pending -- an earlier version measured real elapsed time since
+        the last accepted price, which meant the bound kept widening open the longer a bad reading
+        went unconfirmed, silently accepting an unconfirmed value once enough wall-clock time had
+        passed rather than ever actually requiring a second, consistent reading. Fixed cadence-only
+        scaling means the ONLY way a big jump is trusted is the explicit paths below.
+
+        A jump over the bound is held as "pending" until either a second, similarly-sized reading
+        confirms it's real (QUOTE_JUMP_CONFIRM_SECONDS held), or a different reading arrives and
+        restarts the confirmation clock on that instead. QUOTE_JUMP_MAX_HOLD_SECONDS is a separate,
+        explicit backstop measured from p.stuck_since (when THIS position first became unable to
+        progress, regardless of how many different pending_quote values it's cycled through since --
+        deliberately NOT last_tick_at, which for F is naturally ~F_PRICE_EVERY_SEC stale even under
+        normal operation and would fire this on every single F tick): a position must never be stuck
+        refusing to tick forever just because a genuinely fast, continuously-evolving REAL move never
+        settles on one repeated reading long enough to satisfy the confirm path above -- past that
+        ceiling the current reading is forced through regardless, logged distinctly (QUOTE_JUMP_FORCED)
+        so a persistently noisy feed shows up rather than silently degrading protection.
+        QUOTE_JUMP_SANITY_PCT=None (or 0) disables the gate entirely for that strategy.
+        """
+        if p.last_tick_at is None:
+            p.last_tick_at = now
+            return spread_price   # first tick ever for this position -- nothing to compare against
+        pct = self._knob(p, "QUOTE_JUMP_SANITY_PCT", None)
+        if not pct:
+            p.pending_quote = None
+            p.pending_quote_since = None
+            p.stuck_since = None
+            p.last_tick_at = now
+            return spread_price
+        floor = self._knob(p, "QUOTE_JUMP_SANITY_FLOOR", 0.0)
+        expected_interval = config.F_PRICE_EVERY_SEC if p.strategy in config.STOCK_STRATEGIES else config.TICK_SECONDS
+        raw_nominal_ticks = expected_interval / max(config.TICK_SECONDS, 1e-9)
+        max_nominal_ticks = self._knob(p, "QUOTE_JUMP_MAX_NOMINAL_TICKS", 1.0)
+        nominal_ticks = max(1.0, min(raw_nominal_ticks, max_nominal_ticks))
+        max_jump = max(floor, pct * p.width) * nominal_ticks
+        jump = abs(spread_price - p.current_price)
+        if jump <= max_jump:
+            p.pending_quote = None
+            p.pending_quote_since = None
+            p.stuck_since = None
+            p.last_tick_at = now
+            return spread_price
+        # How long THIS position has been unable to progress, regardless of how many different
+        # pending_quote values it's cycled through since -- NOT last_tick_at (which for F is
+        # naturally ~F_PRICE_EVERY_SEC stale even under completely normal operation, and would make
+        # this fire on every single F tick).
+        if p.stuck_since is None:
+            p.stuck_since = now
+        held_sec = (now - p.stuck_since).total_seconds()
+        max_hold = self._knob(p, "QUOTE_JUMP_MAX_HOLD_SECONDS", None)
+        if max_hold is not None and held_sec >= max_hold:
+            log.warning("[%s] Quote jump FORCED after %ds stuck (max hold %ds): %.2f -> %.2f (%+.2f, bound %.2f)",
+                       p.key, held_sec, max_hold, p.current_price, spread_price,
+                       spread_price - p.current_price, max_jump)
+            self.journal.event("QUOTE_JUMP_FORCED", now, strategy=p.strategy, from_price=p.current_price,
+                               to_price=spread_price, jump=round(jump, 2), max_jump=round(max_jump, 2),
+                               held_sec=round(held_sec, 1))
+            p.pending_quote = None
+            p.pending_quote_since = None
+            p.stuck_since = None
+            p.last_tick_at = now
+            return spread_price
+        confirm_sec = self._knob(p, "QUOTE_JUMP_CONFIRM_SECONDS", 0)
+        if p.pending_quote is not None and abs(spread_price - p.pending_quote) <= max_jump \
+                and p.pending_quote_since is not None \
+                and (now - p.pending_quote_since).total_seconds() >= confirm_sec:
+            log.warning("[%s] Quote jump CONFIRMED: %.2f -> %.2f (%+.2f, bound %.2f) held %ds -- accepting.",
+                       p.key, p.current_price, spread_price, spread_price - p.current_price, max_jump,
+                       (now - p.pending_quote_since).total_seconds())
+            self.journal.event("QUOTE_JUMP_CONFIRMED", now, strategy=p.strategy, from_price=p.current_price,
+                               to_price=spread_price, jump=round(jump, 2), max_jump=round(max_jump, 2))
+            p.pending_quote = None
+            p.pending_quote_since = None
+            p.stuck_since = None
+            p.last_tick_at = now
+            return spread_price
+        if p.pending_quote is None or abs(spread_price - p.pending_quote) > max_jump:
+            p.pending_quote = spread_price
+            p.pending_quote_since = now
+            log.warning("[%s] Quote jump HELD for confirmation: %.2f -> %.2f (%+.2f, bound %.2f)",
+                       p.key, p.current_price, spread_price, spread_price - p.current_price, max_jump)
+            self.journal.event("QUOTE_JUMP_HELD", now, strategy=p.strategy, from_price=p.current_price,
+                               to_price=spread_price, jump=round(jump, 2), max_jump=round(max_jump, 2))
+        return None
+
     def _set_floor(self, p: OpenSpread, now: datetime, profit_floor: float, why: str) -> None:
         floor_price = round(p.entry_credit - profit_floor, 2)
         if p.floor_price is not None and p.floor_price <= floor_price:
@@ -322,6 +442,9 @@ class PositionManager:
             self._set_floor(p, now, strategy.exit_setting(p.strategy, "STALE_FLOOR", 0.05), f"STALE_TIMER {timer}m")
 
     def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame | None) -> list[dict]:
+        spread_price = self._sanitize_quote(p, now, spread_price)
+        if spread_price is None:
+            return []   # unconfirmed quote jump -- sit this tick out entirely, see _sanitize_quote
         p.prev_price = p.current_price
         p.current_price = spread_price
         if p.worst_price is None or spread_price > p.worst_price:

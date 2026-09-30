@@ -33,6 +33,16 @@ def _legacy_exit_flow(monkeypatch):
     monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _no_quote_sanity_gate(monkeypatch):
+    # 2026-09-30: every strategy also defaults to config.QUOTE_JUMP_SANITY_PCT != None now
+    # (test_quote_sanity.py covers that path directly). This file's tests deliberately jump straight
+    # to specific price points across ticks to exercise the runner/trail/lock mechanics in isolation --
+    # not simulating a real gradual tick-by-tick sequence -- so the sanity gate would otherwise hold
+    # many of them as "implausible," which has nothing to do with what these tests are checking.
+    monkeypatch.setattr(config, "QUOTE_JUMP_SANITY_PCT", None)
+
+
 @pytest.fixture
 def broker() -> FakeBroker:
     b = FakeBroker(equity=10_000, today=TODAY)

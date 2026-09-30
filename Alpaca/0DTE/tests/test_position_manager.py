@@ -194,6 +194,39 @@ def test_exit_row_records_trigger_and_slippage(pm, broker):
     assert row["trigger_price"] == 3.61 and row["exit_price"] == 3.65
     assert row["exit_slippage"] == pytest.approx(0.04)
     assert row["entry_mid"] == 3.05 and row["entry_slippage"] == pytest.approx(0.05)
+    # 2026-09-30: prev-tick diagnostic fields (a real live anomaly -- a reported price jumped an
+    # implausible amount in a single tick right before an exit). prev_tick_price is current_price as
+    # of the 10:02 tick (3.60, the tick immediately before the closing one), NOT the entry credit and
+    # NOT the exit fill -- isolating the decision-price jump (trigger vs. prior tick) from fill
+    # slippage (fill vs. this tick's trigger, already covered by exit_slippage above).
+    assert row["prev_tick_price"] == pytest.approx(3.60)
+    assert row["prev_tick_jump"] == pytest.approx(0.01)                 # 3.61 trigger - 3.60 prior tick
+    assert row["prev_tick_pnl"] == pytest.approx((3.00 - 3.60) * 100)    # entry 3.00, 1 contract
+
+
+def test_exit_row_prev_tick_compares_against_entry_on_the_very_first_tick(pm, broker):
+    # No REAL prior tick exists yet -- current_price is initialized to entry_credit at construction,
+    # so the first tick's "prior" naturally reads as the entry credit itself (a real, if less
+    # interesting, baseline), not None. B has no STOP_CONFIRM_SECONDS override, so it closes on the
+    # very first qualifying tick.
+    open_b_put_spread(pm, broker, qty=1, credit=1.00)
+    fills = tick(pm, et(10, 2), 1.50, rising(), strat="B")   # >= B's 0.50 stop, closes immediately
+    row = fills[0]
+    assert row["exit_reason"] == "STOP_LOSS"
+    assert row["prev_tick_price"] == pytest.approx(1.00)
+    assert row["prev_tick_jump"] == pytest.approx(0.50)
+    assert row["prev_tick_pnl"] == pytest.approx(0.00)
+
+
+def test_exit_row_prev_tick_fields_none_on_a_force_close_with_no_prior_tick(pm, broker):
+    # force_close() never runs _tick_position (it closes directly), so a position closed before its
+    # first real tick has no prev_price at all -- None, not a misleading fabricated comparison.
+    open_b_put_spread(pm, broker, qty=1, credit=1.00)
+    fills = pm.force_close(et(15, 30), {"B": 1.20})
+    row = fills[0]
+    assert row["prev_tick_price"] is None
+    assert row["prev_tick_pnl"] is None
+    assert row["prev_tick_jump"] is None
 
 
 def test_target_two_contracts_without_momentum_full_close(pm, broker, monkeypatch):

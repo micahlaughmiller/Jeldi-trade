@@ -50,6 +50,13 @@ class OpenSpread:
     stage2_armed: bool = False                # STAGE2_TARGET_PCT profit has been reached at least once
     confirmed_best_price: float | None = None  # stage-3 trail anchor: a best_price that has HELD for
     best_price_since: datetime | None = None   # STAGE3_CONFIRM_SECONDS before the trail ratchets to it
+    # 2026-09-30: diagnostic instrumentation for a live anomaly (ASTRA reported 5.21 one tick, exited
+    # 6.10 the very next -- too large a jump for the real underlying move that second, every persona
+    # affected since this is shared position_manager code). current_price AS OF THE PRIOR TICK, so
+    # _close can journal what P/L would have been at last quote alongside the real exit -- compare the
+    # two while the real root cause (stale/bad quote source feeding spread_price, most likely) is dug
+    # into separately; not itself a behavior change to any exit decision.
+    prev_price: float | None = None
 
     @property
     def remaining(self) -> int:
@@ -315,6 +322,7 @@ class PositionManager:
             self._set_floor(p, now, strategy.exit_setting(p.strategy, "STALE_FLOOR", 0.05), f"STALE_TIMER {timer}m")
 
     def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame | None) -> list[dict]:
+        p.prev_price = p.current_price
         p.current_price = spread_price
         if p.worst_price is None or spread_price > p.worst_price:
             p.worst_price = spread_price
@@ -531,6 +539,17 @@ class PositionManager:
         # Fill quality: positive slippage = the fill cost us relative to the quote mid that triggered it.
         exit_slippage = round(exit_price - spread_price, 2)
         entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
+        # 2026-09-30: diagnostic instrumentation for a live anomaly -- ASTRA's reported price jumped
+        # from 5.21 to ~6.10 in the ONE TICK between reporting and exiting, too large a move for that
+        # second's real underlying action. prev_price is current_price as of the PRIOR tick (captured
+        # in _tick_position before this tick's spread_price overwrote it) -- prev_tick_pnl is what
+        # today's real pnl would compare against had the decision used that prior quote instead,
+        # and prev_tick_jump isolates the tick-to-tick DECISION price move itself (spread_price vs the
+        # prior tick), separate from exit_slippage (which is fill vs. THIS tick's decision). None on
+        # the very first tick after entry (no prior tick yet) or on a force-close (no tick preceded it).
+        prev_price = p.prev_price
+        prev_tick_pnl = round((p.entry_credit - prev_price) * 100 * fill_qty, 2) if prev_price is not None else None
+        prev_tick_jump = round(spread_price - prev_price, 2) if prev_price is not None else None
         scan = p.scan or {}
         row = {
             "date": now.date().isoformat(), "strategy": p.strategy,
@@ -540,6 +559,7 @@ class PositionManager:
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
             "trigger_price": spread_price, "exit_slippage": exit_slippage,
+            "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
             "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
             "total_qty": p.qty, "root": p.root, "key": key, "ticker": p.ticker,
@@ -547,8 +567,12 @@ class PositionManager:
             "scanner_score": scan.get("score"), "scanner_direction": scan.get("scanner_direction"),
             "direction_match": scan.get("direction_match"),
         }
-        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f | position realized %.2f, %d left",
+        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f | prev-tick %.2f (jump %+.2f, "
+                    "pnl would've been %.2f) | position realized %.2f, %d left",
                     key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl,
+                    prev_price if prev_price is not None else float("nan"),
+                    prev_tick_jump if prev_tick_jump is not None else float("nan"),
+                    prev_tick_pnl if prev_tick_pnl is not None else float("nan"),
                     p.realized_pnl, p.remaining)
         self.journal.event("EXIT", now, **row)
         if p.remaining == 0:

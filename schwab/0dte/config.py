@@ -169,12 +169,19 @@ DAILY_LOSS_LIMIT_HALTS_EXEMPT = False
 # both strategies; the detector function itself (strategy.detect_breakout) is left in place, unused.
 # ES_BREAK (2026-09-25, Strategy C): the SAME overnight level run through strategy.TwoCandleBreak
 # instead of OrbSetup -- a deliberately simpler close-only break+confirm ("no wicks count") rather
-# than ON_BREAK's wick-aware break/pullback/momentum machine. D and E are NOT setup-driven: their
-# signal comes from check_mean_reversion_entry each tick, not from a fired breakout.
+# than ON_BREAK's wick-aware break/pullback/momentum machine. D and E are NOT setup-driven: their own
+# signal comes from check_mean_reversion_entry each tick (setup "MA_BB"/"MA_BB_CHOP"), not from a
+# fired breakout. They still MUST be listed here, same as F: enter_leg's `.get(strat, (setup,))`
+# default treats an ABSENT strategy as eligible for every SPX setup it's ever called with -- since
+# dispatch_entry/enter() route every fired ORB/ON_BREAK signal through strategy.spx_strategies()
+# (which includes D and E), an absent entry silently let D and E sell a same-day B-clone spread
+# tagged with their own strategy letter on ANY breakout signal, not just their own mean-reversion
+# one. 2026-09-30: found live (a real D EXIT event tagged setup="ORB", structurally impossible) --
+# fixed by listing each one's OWN setup only. Identical to Alpaca/0DTE/config.py.
 # F MUST be listed: enter_leg's `.get(strat, (setup,))` default treats an ABSENT strategy as eligible for
 # every SPX setup, which would sell an SPX B-clone labelled F on every ORB/ON_BREAK signal.
 SETUPS_BY_STRATEGY = {"A": ("ORB", "ON_BREAK"), "B": ("ON_BREAK", "ORB"), "C": ("ES_BREAK",),
-                      "F": ("STOCK_ORB",)}
+                      "D": ("MA_BB",), "E": ("MA_BB_CHOP",), "F": ("STOCK_ORB",)}
 # Both entry kinds for A: the 2026-09-21 replay showed a trend day with one momentum break and no pullback.
 ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", "PULLBACK"),
                                "F": ("MOMENTUM", "PULLBACK")}

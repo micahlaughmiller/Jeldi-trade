@@ -728,6 +728,37 @@ def test_mean_reversion_entry_skipped_when_d_and_e_already_positioned(bot, monke
     assert called == []   # short-circuited before even fetching candles
 
 
+def test_d_rejects_a_fired_orb_signal_it_does_not_trade(bot, monkeypatch):
+    # Regression test for a real live bug: D/E had no SETUPS_BY_STRATEGY entry, so enter_leg's
+    # `.get(strat, (setup,))` fallback silently made them eligible for ANY fired breakout setup routed
+    # through dispatch_entry/enter() (which fans out across every strategy.spx_strategies(), D/E
+    # included) -- not just their own MA_BB/MA_BB_CHOP mean-reversion signal. A real D EXIT event was
+    # found tagged setup="ORB", which should be structurally impossible by D's design. No "B" here so
+    # D's select_strikes_b pick can't ALSO be rejected by the unrelated strike-collision guard --
+    # this isolates the SETUPS_BY_STRATEGY gate specifically.
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "D"))
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert "A" in bot.pm.positions
+    assert "D" not in bot.pm.positions
+
+
+def test_e_rejects_a_fired_on_break_signal_it_does_not_trade(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "E"))
+    bot.enter(et(10, 15), "ON_BREAK", BULLISH)
+    assert "A" in bot.pm.positions
+    assert "E" not in bot.pm.positions
+
+
+def test_d_still_enters_on_its_own_setup_alongside_a_and_b(bot, monkeypatch):
+    # The fix must not touch D's OWN entry path -- check_mean_reversion_entry always calls enter_leg
+    # with D's own "MA_BB" setup, which the new SETUPS_BY_STRATEGY["D"] entry allows same as before.
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "D"))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", lambda *a, **k: "BULLISH")
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert "D" in bot.pm.positions
+
+
 # --------------------------------------------------------------------------------- news blackout
 
 def test_news_blackout_blocks_entry_and_clears_after(bot, monkeypatch):

@@ -19,6 +19,14 @@ from strategy import BULLISH, OrbSetup
 EXP = TODAY + timedelta(days=2)
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exit_flow(monkeypatch):
+    # 2026-09-30: F now defaults to config.STAGED_EXIT_ENABLED=True too (test_staged_exit.py covers
+    # that path); this file's exit tests predate it and exercise the flat target/stop/lock/runner
+    # sequence _tick_position still falls back to when it's off.
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+
+
 def bare_bot_f(tmp_path, monkeypatch, broker) -> scheduler.Bot:
     """A Bot constructed the way scheduler.main() does it (F persona), without f_fixtures swapping in
     the stubbed engine -- for the paths where StockOrbTrader itself is what fails."""

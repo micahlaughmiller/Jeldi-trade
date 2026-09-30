@@ -265,6 +265,50 @@ PROFIT_LOCK_ON_MOMENTUM_FLIP = True
 RUNNER_MOMENTUM_GATE = True      # momentum must be continuing at the target for the runner to start
 RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOMENTUM_SLOWDOWN_PCT
 
+# ------------------------------------------------------------ staged exit system (every strategy)
+# 2026-09-29/30: replaces the flat target/stop/lock/runner sequence above for EVERY strategy -- A
+# included, per the user's own instruction ("A should be tuned the same, I use the same signals for
+# A"). Modeled directly on a real manual trade (10:01 SPX call credit spread, entered ~2.10, rode a
+# downtrend, stopped at 1.50 after entering the stop order at 1.40 once the 30-cent target was hit):
+# ride ordinary noise on just the raw stop, tighten once profit is real AND momentum shows signs of
+# turning, lock a hard floor once the named target is hit ("no matter what" -- the user's own words),
+# then let a genuine continuation run behind a trail that only ratchets to a new best price once that
+# price has actually HELD (not a brief wiggle) for a while with momentum still continuing.
+#
+# Stage 0 (always): raw stop-loss, unconditional -- $0.40 from entry (on a $5-wide reference spread).
+# Stage 1 (profit >= $0.20 -- armed once, stays armed): exits on EITHER a $0.15 giveback from the best
+#   price seen, OR the moment candles/RSI/Bollinger-edge show the move reversing -- whichever first.
+# Stage 2 (profit >= $0.30 target -- armed once, stays armed, supersedes stage 1): a hard,
+#   unconditional floor at $0.25 profit, no momentum check.
+# Stage 3 (stage 2 armed, still running past the floor): trails at $0.15 off a CONFIRMED best price --
+#   that anchor only advances to a new, deeper best price after it has held (no further improvement)
+#   for STAGE3_CONFIRM_SECONDS with momentum still continuing, so a brief spike that reverses right
+#   back doesn't tighten the trail and kick a real runner out on ordinary wiggle.
+#
+# All four dollar levels are fractions of spread width (same convention as F_xxx_PCT below -- these
+# ARE that reference: F's percentages were calibrated to reproduce B's flat-cents defaults on a
+# $5-wide spread), so the same constants apply unscaled to every strategy's own width(s): A/B/C/D/E
+# trade $5 or $10 wide (WIDTH_BY_TIER), F trades whatever width the scan produced.
+STAGED_EXIT_ENABLED = True
+STAGE0_STOP_PCT = 0.08          # $0.40 on $5
+STAGE1_ARM_PCT = 0.04           # $0.20 on $5
+STAGE1_TRAIL_PCT = 0.03         # $0.15 on $5
+STAGE2_TARGET_PCT = 0.06        # $0.30 on $5 -- matches PROFIT_TARGET/B_PROFIT_TARGET already
+STAGE2_FLOOR_PCT = 0.05         # $0.25 on $5
+STAGE3_TRAIL_PCT = 0.03         # $0.15 on $5
+STAGE3_CONFIRM_SECONDS = 30
+STAGE_EXIT_FLOOR = 0.05         # floor under every width-scaled level above, same role as F_EXIT_FLOOR
+
+# Stage 1's momentum-reversal read: candles/RSI (strategy.momentum_reversing) plus a Bollinger-edge
+# proximity check (strategy.bb_edge_reversal_risk) using its OWN, shorter period -- per the user's
+# explicit "use shorter 20 day BB" correction, distinct from D/E's own 30-period ENTRY-signal read
+# (D_BB_PERIOD). Same 2 std dev and touch threshold as D/E (D_BB_STD, D_BAND_TOUCH_PCT_B), same
+# 5-minute candle interval (D_E_CANDLE_INTERVAL).
+EXIT_BB_PERIOD = 20
+EXIT_BB_STD = 2.0
+RSI_PERIOD = 14
+RSI_REVERSAL_PTS = 5.0
+
 # Per-strategy overrides of the exit knobs above (strategy.exit_setting). A, from the 2026-09-21 replay:
 # lock arms at +0.30 and tolerates a 0.35 giveback (about one quote width), no candle-against exit, the
 # runner always starts at the target, and no momentum-slowdown exit. That set turned the day's real entries

@@ -496,6 +496,56 @@ def candle_against(candles: pd.DataFrame, direction: str) -> bool:
     return float(_signed_bodies(candles.tail(1), direction).iloc[0]) < 0
 
 
+def rsi(closes: pd.Series, period: int = 14) -> pd.Series:
+    """Standard Wilder-style RSI (simple rolling mean of gains/losses, not the smoothed EMA variant --
+    close enough for a same-day reversal read and simpler to reason about). NaN for the first `period`
+    bars, same as a Bollinger Band's rolling std."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def momentum_reversing(candles: pd.DataFrame, direction: str, rsi_period: int = 14,
+                       rsi_reversal_pts: float = 5.0) -> bool:
+    """2026-09-29: a position management "is the move showing signs of turning" read -- candles AND
+    RSI, per the user's own words. True if EITHER the last completed candle closed against the trade,
+    OR RSI has moved at least rsi_reversal_pts against the trade direction over its last 3 readings
+    (a meaningful swing, not just noise). False (never flags a reversal) with too little data for RSI.
+    """
+    if candle_against(candles, direction):
+        return True
+    if candles is None or len(candles) < rsi_period + 3:
+        return False
+    r = rsi(candles["close"], rsi_period)
+    if r.isna().iloc[-1] or r.isna().iloc[-3]:
+        return False
+    change = float(r.iloc[-1] - r.iloc[-3])
+    return change < -rsi_reversal_pts if direction == BULLISH else change > rsi_reversal_pts
+
+
+def bb_edge_reversal_risk(candles: pd.DataFrame, direction: str, period: int, num_std: float,
+                          band_touch: float) -> bool:
+    """2026-09-30: exit-timing read from the user's own manual process ("wasn't close to the
+    bollinger band edge, once it got close..."). As a trade runs in its favor, price approaching the
+    Bollinger extreme IN THE DIRECTION IT HAS BEEN MOVING (upper band for a BULLISH position riding a
+    rally, lower band for a BEARISH position riding a decline) warns the move is stretched and due
+    for a mean-reversion snap-back against the position. Uses its OWN, shorter period (config.
+    EXIT_BB_PERIOD) rather than D/E's 30-period ENTRY-signal read -- a deliberately faster window for
+    exit timing. False (never flags risk) with too little data yet.
+    """
+    if candles is None or len(candles) < period:
+        return False
+    _, upper, lower = bollinger(candles["close"], period, num_std)
+    if upper.isna().iloc[-1] or lower.isna().iloc[-1]:
+        return False
+    pct_b = percent_b(float(candles["close"].iloc[-1]), float(upper.iloc[-1]), float(lower.iloc[-1]))
+    if pct_b is None:
+        return False
+    return pct_b >= band_touch if direction == BULLISH else pct_b <= (1.0 - band_touch)
+
+
 def momentum_slowed(current: float, reference: float, pct: float | None = None) -> bool:
     pct = pct if pct is not None else config.MOMENTUM_SLOWDOWN_PCT
     return current < reference * (1.0 - pct)

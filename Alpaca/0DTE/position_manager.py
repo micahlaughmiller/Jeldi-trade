@@ -45,6 +45,11 @@ class OpenSpread:
     entry_ask: float | None = None
     overrides: dict | None = None     # per-position exit knobs consulted before exit_setting (F: width-scaled)
     scan: dict | None = None          # F: scanner row + break/confirmation snapshot, carried into the ENTRY event
+    # 2026-09-29/30: staged exit system -- every strategy (config.STAGED_EXIT_ENABLED).
+    stage1_armed: bool = False                # STAGE1_ARM_PCT profit has been reached at least once
+    stage2_armed: bool = False                # STAGE2_TARGET_PCT profit has been reached at least once
+    confirmed_best_price: float | None = None  # stage-3 trail anchor: a best_price that has HELD for
+    best_price_since: datetime | None = None   # STAGE3_CONFIRM_SECONDS before the trail ratchets to it
 
     @property
     def remaining(self) -> int:
@@ -94,6 +99,7 @@ class OpenSpread:
         d = asdict(self)
         d["expiration"] = self.expiration.isoformat()
         d["entry_time"] = self.entry_time.isoformat()
+        d["best_price_since"] = self.best_price_since.isoformat() if self.best_price_since else None
         return d
 
     @classmethod
@@ -101,6 +107,8 @@ class OpenSpread:
         kw = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
         kw["expiration"] = date.fromisoformat(kw["expiration"])
         kw["entry_time"] = datetime.fromisoformat(kw["entry_time"])
+        if kw.get("best_price_since"):
+            kw["best_price_since"] = datetime.fromisoformat(kw["best_price_since"])
         return cls(**kw)
 
 
@@ -312,6 +320,7 @@ class PositionManager:
             p.worst_price = spread_price
         if spread_price < p.best_price:
             p.best_price = spread_price
+            p.best_price_since = now
             log.info("[%s] BEST PRICE %.2f (entry %.2f, +%.2f)", p.key, spread_price,
                      p.entry_credit, p.entry_credit - spread_price, extra={"keep": True})
             self.journal.event("BEST_PRICE", now, strategy=p.strategy, best_price=spread_price,
@@ -319,6 +328,8 @@ class PositionManager:
         self._update_floor(p, now, spread_price)
         if p.floor_price is not None and spread_price >= p.floor_price and spread_price > p.target_price:
             return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)
+        if strategy.exit_setting(p.strategy, "STAGED_EXIT_ENABLED", False):
+            return self._staged_tick(p, now, spread_price, candles)
         if p.runner:
             return self._runner_tick(p, now, spread_price, candles)
         # 2026-09-29: time-based, not a raw tick count -- STOP_CONFIRM_TICKS=2 meant ~30s of real
@@ -371,6 +382,72 @@ class PositionManager:
                 log.info("[%s] PROFIT LOCK: candle closed against the trade with %+.2f open profit",
                          p.key, profit)
                 return self._close(p, p.remaining, "PROFIT_LOCK_MOMENTUM", now, spread_price)
+        return []
+
+    def _staged_tick(self, p: OpenSpread, now: datetime, spread_price: float,
+                     candles: pd.DataFrame | None) -> list[dict]:
+        """2026-09-29/30: staged exit progression -- every strategy uses this (config.
+        STAGED_EXIT_ENABLED), replacing the flat stop/target/lock/runner sequence in _tick_position
+        above. See config.py's staged-exit section for the four dollar levels and the rationale.
+        """
+        width = p.width
+
+        def level(pct_name: str) -> float:
+            return max(config.STAGE_EXIT_FLOOR, self._knob(p, pct_name) * width)
+
+        confirm_seconds = strategy.exit_setting(p.strategy, "STOP_CONFIRM_SECONDS", 0)
+        confirm = max(1, round(confirm_seconds / config.TICK_SECONDS))
+        stop_price = round(p.entry_credit + level("STAGE0_STOP_PCT"), 2)
+        if spread_price >= stop_price:
+            p.stop_streak += 1
+            if p.stop_streak >= confirm:
+                return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+            log.info("[%s] STAGE0 STOP candidate tick %d/%d (%ds) at %.2f (stop %.2f): holding for confirmation",
+                     p.key, p.stop_streak, confirm, confirm_seconds, spread_price, stop_price)
+            return []
+        p.stop_streak = 0
+
+        profit = round(p.entry_credit - spread_price, 2)
+        if profit >= level("STAGE1_ARM_PCT"):
+            p.stage1_armed = True
+        if profit >= level("STAGE2_TARGET_PCT"):
+            if not p.stage2_armed:
+                # Anchor the stage-3 trail at the price that just crossed the target, NOT any deeper
+                # (unconfirmed) best_price seen earlier -- that price hasn't held yet, so it shouldn't
+                # be trusted as the trail's starting point either.
+                p.confirmed_best_price = spread_price
+            p.stage2_armed = True
+
+        if p.stage2_armed:
+            floor_price = round(p.entry_credit - level("STAGE2_FLOOR_PCT"), 2)
+            if spread_price >= floor_price:
+                return self._close(p, p.remaining, "STAGE2_FLOOR", now, spread_price)
+            confirm_sec = config.STAGE3_CONFIRM_SECONDS
+            held_long_enough = (p.best_price_since is not None
+                                and (now - p.best_price_since).total_seconds() >= confirm_sec)
+            if p.best_price < p.confirmed_best_price and held_long_enough \
+                    and strategy.momentum_continuing(candles, p.direction):
+                p.confirmed_best_price = p.best_price
+                log.info("[%s] STAGE3 trail ratcheted to %.2f (held %ds)",
+                         p.key, p.confirmed_best_price, confirm_sec)
+            trail = level("STAGE3_TRAIL_PCT")
+            if spread_price >= round(p.confirmed_best_price + trail, 2):
+                return self._close(p, p.remaining, "STAGE3_TRAIL", now, spread_price)
+            return []
+
+        if p.stage1_armed:
+            trail1 = level("STAGE1_TRAIL_PCT")
+            if spread_price >= round(p.best_price + trail1, 2):
+                return self._close(p, p.remaining, "STAGE1_TRAIL", now, spread_price)
+            rsi_period = strategy.exit_setting(p.strategy, "RSI_PERIOD", 14)
+            rsi_pts = strategy.exit_setting(p.strategy, "RSI_REVERSAL_PTS", 5.0)
+            bb_period = strategy.exit_setting(p.strategy, "EXIT_BB_PERIOD", 20)
+            bb_std = strategy.exit_setting(p.strategy, "EXIT_BB_STD", 2.0)
+            band_touch = strategy.exit_setting(p.strategy, "D_BAND_TOUCH_PCT_B", 0.95)
+            reversing = strategy.momentum_reversing(candles, p.direction, rsi_period, rsi_pts) \
+                or strategy.bb_edge_reversal_risk(candles, p.direction, bb_period, bb_std, band_touch)
+            if reversing:
+                return self._close(p, p.remaining, "STAGE1_MOMENTUM_REVERSAL", now, spread_price)
         return []
 
     def _runner_trail(self, p: OpenSpread) -> float:

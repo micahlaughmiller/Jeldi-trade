@@ -24,6 +24,15 @@ def _stop_confirm_at_two_ticks(monkeypatch):
     monkeypatch.setattr(config, "TICK_SECONDS", 15)
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exit_flow(monkeypatch):
+    # 2026-09-30: every strategy defaults to config.STAGED_EXIT_ENABLED=True now (test_staged_exit.py
+    # covers that path). This whole file predates the staged system and exercises the flat
+    # target/stop/lock/runner sequence _tick_position still falls back to when it's off -- that
+    # sequence is unchanged code, just no longer the default, so these tests stay valid against it.
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+
+
 @pytest.fixture
 def broker() -> FakeBroker:
     b = FakeBroker(equity=10_000, today=TODAY)

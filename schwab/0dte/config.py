@@ -68,6 +68,17 @@ LOG_DIR = "logs"
 UNDERLYING = "SPX"
 OPTION_ROOT = "SPXW"
 SPX_SYMBOL = "^GSPC"
+# 2026-10-01: Alpaca has no genuine SPX index bars on this plan (confirmed by broker.get_spot's own
+# yfinance fallback for index underlyings) -- market_data.get_spx_candles_via_alpaca instead pulls
+# REAL, high-frequency bars for SPY (the ETF, which Alpaca does serve directly on the free IEX feed)
+# and scales them up to SPX-equivalent terms, same trick as the existing ES_TO_SPX basis shift. This
+# replaces the high-frequency, every-tick, every-persona yf.download("^GSPC", ...) candle fetching
+# that caused a real live incident (see Alpaca/0DTE/config.py for the full write-up). This folder
+# already carries optional cross-broker ALPACA_API_KEY/SECRET (for the SPX option-chain gap below);
+# the same credentials now also cover this. Identical to Alpaca/0DTE/config.py otherwise.
+SPY_SYMBOL = "SPY"
+SPX_SPY_RATIO_REFRESH_MIN = 60
+SPX_SPY_RATIO_FALLBACK = 10.0
 ES_SYMBOL = "ES=F"
 # 2026-09-25: Schwab's own futures quote symbol for the same instrument -- this folder already
 # authenticates to Schwab, so live ES via market_data.get_es_candles_live works here directly (no
@@ -75,6 +86,10 @@ ES_SYMBOL = "ES=F"
 ES_SCHWAB_SYMBOL = "/ES"
 
 MARKET_OPEN = time(9, 30)
+# 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same
+# session the SPX series they're standing in for actually trades -- NOT FORCE_CLOSE_TIME (this bot's
+# own early close). Identical to Alpaca/0DTE/config.py.
+MARKET_CLOSE = time(16, 0)
 OVERNIGHT_SESSION_START = time(18, 0)
 OPENING_RANGE_MINUTES = 30
 OVERNIGHT_ENTRY_END_MIN = 30

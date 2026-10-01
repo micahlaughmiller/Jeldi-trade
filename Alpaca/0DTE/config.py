@@ -56,6 +56,28 @@ LOG_DIR = "logs"
 UNDERLYING = "SPX"
 OPTION_ROOT = "SPXW"
 SPX_SYMBOL = "^GSPC"
+# 2026-10-01: Alpaca has no genuine SPX index bars on this plan (confirmed by broker.get_spot's own
+# yfinance fallback for index underlyings) -- market_data.get_spx_candles_via_alpaca instead pulls
+# REAL, high-frequency bars for SPY (the ETF, which Alpaca does serve directly on the free IEX feed)
+# and scales them up to SPX-equivalent terms, same trick as the existing ES_TO_SPX basis shift. This
+# replaces the high-frequency, every-tick, every-persona yf.download("^GSPC", ...) candle fetching
+# that caused a real live incident: the SPX opening range broke hard downside at 10:00 ET and every
+# persona stayed completely silent, because Yahoo's API came back empty (rate-limited/outage) with no
+# exception raised at all, and orb_signal() silently iterated zero candles forever. get_candles() now
+# tries Alpaca/SPY first and falls back to the existing yfinance ^GSPC path only if that's unavailable
+# or fails -- fail-soft, same contract as the existing ES live-feed fallback. SPX_SYMBOL/^GSPC itself
+# is NOT removed: get_spx_es_basis (a once-per-day call, not the high-frequency path) still uses it
+# directly, and it's still the fallback here.
+SPY_SYMBOL = "SPY"
+# The SPX/SPY ratio drifts slowly over time (SPY's small dividend-driven decay vs SPX's total-return
+# style), so it's refreshed periodically rather than computed once and trusted forever -- via ONE
+# lightweight single-price yfinance lookup (NOT a bulk historical-candle download), so this still cuts
+# yfinance call volume by roughly 1000x (one price check per ~hour per persona vs a 5-day candle
+# download on every tick) rather than eliminating yfinance entirely. If that lookup ever fails, the
+# last known-good ratio keeps being used; SPX_SPY_RATIO_FALLBACK only applies if none has ever
+# succeeded (e.g. right at startup).
+SPX_SPY_RATIO_REFRESH_MIN = 60
+SPX_SPY_RATIO_FALLBACK = 10.0
 ES_SYMBOL = "ES=F"
 # 2026-09-25: Schwab's own futures quote symbol for the same instrument, used only if this folder's
 # .env has SCHWAB_APP_KEY/SCHWAB_APP_SECRET set (see market_data.get_es_candles_live) -- optional,
@@ -71,6 +93,11 @@ SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
 SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
 
 MARKET_OPEN = time(9, 30)
+# 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same
+# session the SPX series they're standing in for actually trades -- NOT the same thing as
+# FORCE_CLOSE_TIME (15:30, this bot's own early close), which would wrongly discard 30 real minutes
+# of genuine SPX-equivalent session data from the candle series signal detection relies on.
+MARKET_CLOSE = time(16, 0)
 OVERNIGHT_SESSION_START = time(18, 0)
 OPENING_RANGE_MINUTES = 30
 OVERNIGHT_ENTRY_END_MIN = 30

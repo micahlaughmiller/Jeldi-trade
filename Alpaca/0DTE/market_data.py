@@ -9,6 +9,7 @@ import time as _time
 from datetime import datetime, timedelta
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 import config
@@ -101,6 +102,163 @@ def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | No
     return df
 
 
+# 2026-10-01: real-time SPX-equivalent candles via Alpaca's own SPY bars (see config.py's SPY_SYMBOL
+# section for the full rationale -- Alpaca has no genuine SPX index bars on this plan). Every function
+# below fails soft: a missing credential, network error, or unexpected response shape just returns
+# None, and get_candles() falls back to the existing yfinance ^GSPC path -- same contract as the
+# existing ES live-feed fallback. This must never be able to crash the bot over an optional feed swap.
+_SPX_RATIO_CACHE: dict = {"ratio": None, "at": 0.0}   # monotonic-timestamped; see _spx_spy_ratio
+
+
+def _alpaca_creds() -> tuple[str, str] | None:
+    key = getattr(config, "ALPACA_API_KEY", "").strip()
+    secret = getattr(config, "ALPACA_SECRET_KEY", "").strip()
+    return (key, secret) if key and secret else None
+
+
+def _alpaca_data_get(path: str, params: dict) -> dict | None:
+    creds = _alpaca_creds()
+    if creds is None:
+        return None
+    key, secret = creds
+    base = getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret, "Accept": "application/json"}
+    try:
+        resp = requests.get(f"{base}{path}", headers=headers, params=params, timeout=10)
+    except requests.RequestException as e:
+        log.warning("Alpaca data API %s failed (falling back to yfinance): %s", path, e)
+        return None
+    if resp.status_code != 200:
+        log.warning("Alpaca data API %s returned HTTP %d (falling back to yfinance): %s",
+                   path, resp.status_code, resp.text[:200])
+        return None
+    try:
+        data = resp.json()
+    except ValueError as e:
+        log.warning("Alpaca data API %s returned unparseable JSON (falling back to yfinance): %s", path, e)
+        return None
+    # 2026-10-01, post-review: a malformed body (a JSON array/string/number instead of an object --
+    # a proxy/WAF error page, an unexpected endpoint response) would otherwise reach .get("bars") in
+    # the caller as an AttributeError, which nothing downstream catches (the tick loop only catches
+    # BrokerError) -- checked once, here, so every current and future caller of this function is covered.
+    if not isinstance(data, dict):
+        log.warning("Alpaca data API %s returned a non-object JSON body (%s) (falling back to yfinance)",
+                   path, type(data).__name__)
+        return None
+    return data
+
+
+def _spx_spy_ratio() -> float | None:
+    """SPX/SPY ratio, refreshed at most every SPX_SPY_RATIO_REFRESH_MIN via ONE lightweight yfinance
+    single-price lookup (not a bulk candle download -- see config.py). Returns the last known-good
+    ratio if a refresh attempt fails or produces a nonsensical reading, and None only if no refresh has
+    EVER succeeded (caller then falls back to SPX_SPY_RATIO_FALLBACK)."""
+    stale = _time.monotonic() - _SPX_RATIO_CACHE["at"] >= config.SPX_SPY_RATIO_REFRESH_MIN * 60
+    if _SPX_RATIO_CACHE["ratio"] is not None and not stale:
+        return _SPX_RATIO_CACHE["ratio"]
+    try:
+        spx = yf.Ticker(config.SPX_SYMBOL).fast_info["last_price"]
+        spy = yf.Ticker(config.SPY_SYMBOL).fast_info["last_price"]
+        if spx and spy and float(spx) > 0 and float(spy) > 0:
+            _SPX_RATIO_CACHE["ratio"] = float(spx) / float(spy)
+            _SPX_RATIO_CACHE["at"] = _time.monotonic()
+        else:
+            log.warning("SPX/SPY ratio calibration got a non-positive price (spx=%s spy=%s); keeping "
+                       "last known ratio", spx, spy)
+    except Exception as e:
+        log.warning("SPX/SPY ratio calibration failed (%s); keeping last known ratio", e)
+    return _SPX_RATIO_CACHE["ratio"]
+
+
+def _fetch_alpaca_spy_bars(interval_min: int, now: datetime) -> pd.DataFrame | None:
+    """Raw SPY bars (not yet scaled to SPX terms), cached for DATA_CACHE_SEC. None on any failure --
+    caller reports feed health and falls back to yfinance."""
+    cache_key = ("spx_via_spy", interval_min)
+    hit = _CACHE.get(cache_key)
+    if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
+        return hit[1]
+    # A generous CALENDAR-day lookback (not lookback_min) mirrors _download's own "5d" yfinance period
+    # for the same reason: a large lookback_min (D/E's multi-session EMA/Bollinger window) needs to
+    # reach back far enough on a Monday morning, and every caller filters down to its own lookback_min
+    # afterward regardless -- the extra data is free. 2026-10-01, post-review: DERIVED from
+    # D_E_LOOKBACK_MIN (the largest real lookback_min any caller uses today) plus a 2-day buffer for
+    # weekends, floored at 6, rather than an independent hardcoded "6" that could silently under-fetch
+    # if D_E_LOOKBACK_MIN is ever increased without anyone remembering to update this too.
+    fetch_days = max(6, -(-config.D_E_LOOKBACK_MIN // (24 * 60)) + 2)   # ceil-div minutes -> days
+    start = now - timedelta(days=fetch_days)
+    params = {"timeframe": f"{interval_min}Min", "start": start.isoformat(), "end": now.isoformat(),
+              "feed": "iex", "limit": 10000, "adjustment": "raw"}
+    rows: list[dict] = []
+    for _ in range(20):   # hard cap on pagination -- never loop forever on a malformed token
+        data = _alpaca_data_get(f"/v2/stocks/{config.SPY_SYMBOL}/bars", params)
+        if data is None:
+            return None
+        bars = data.get("bars")
+        if not isinstance(bars, list):
+            log.warning("Alpaca bars response missing/malformed 'bars' list (falling back to yfinance)")
+            return None
+        rows.extend(bars)
+        token = data.get("next_page_token")
+        if not token:
+            break
+        params = {**params, "page_token": token}
+    try:
+        df = _normalize_alpaca_bars(rows)
+    except (KeyError, ValueError, TypeError) as e:
+        log.warning("Alpaca bars response had an unexpected shape (falling back to yfinance): %s", e)
+        return None
+    _CACHE[cache_key] = (_time.monotonic(), df)
+    return df
+
+
+def get_spx_candles_via_alpaca(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
+    """SPX-equivalent candles: real SPY bars via Alpaca's market data API (free IEX feed), scaled up
+    by the periodically-calibrated SPX/SPY ratio. Returns None -- never raises -- if Alpaca credentials
+    aren't configured or the call fails for any reason; get_candles() falls back to yfinance in that
+    case. Reports its own up/down transitions (same _report_feed_health used for the yfinance path) so
+    a broken Alpaca credential/feed doesn't stay invisible just because yfinance happens to still work."""
+    if _alpaca_creds() is None:
+        return None
+    now = _now(now)
+    df = _fetch_alpaca_spy_bars(interval_min, now)
+    _report_feed_health((config.SPY_SYMBOL, f"{interval_min}Min"), df is not None, None)
+    if df is None:
+        return None
+    if df.empty:
+        return df
+    ratio = _spx_spy_ratio() or config.SPX_SPY_RATIO_FALLBACK
+    scaled = df.copy()
+    for col in ("open", "high", "low", "close"):
+        scaled[col] = scaled[col] * ratio
+    scaled = scaled[(scaled.index >= now - timedelta(minutes=lookback_min))
+                    & (scaled.index + timedelta(minutes=interval_min) <= now)]
+    return scaled
+
+
+def _normalize_alpaca_bars(rows: list[dict]) -> pd.DataFrame:
+    """Alpaca bar fields: t (RFC-3339), o/h/l/c/v. Raises KeyError/ValueError/TypeError on an
+    unexpected shape -- the caller catches that and fails soft to yfinance rather than ever proceeding
+    with reinterpreted/garbage candles. 2026-10-01, post-review: pd.to_numeric(errors="raise") forces
+    a non-numeric OHLCV value (a string, a nested object, anything malformed) to surface HERE, inside
+    this try/except, rather than surviving into get_spx_candles_via_alpaca's un-guarded ratio-scaling
+    step -- the prior version's "never raises" contract wasn't actually upheld for that case. Also
+    drops anything outside regular trading hours: Alpaca's SPY bars have no RTH filter the way
+    yfinance's SPX_SYMBOL calls always get (prepost=False everywhere else in this file), and feeding
+    thin, real-market-has-no-analog pre/post-market SPY prints into D/E's rolling, never-resets
+    EMA/Bollinger window would be a genuine behavior change, not just cosmetic noise."""
+    if not rows:
+        return pd.DataFrame(columns=_COLUMNS)
+    df = pd.DataFrame(rows)
+    df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
+    df = df[["t", *_COLUMNS]]
+    for col in _COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="raise")
+    df["t"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(config.ET)
+    df = df.set_index("t").sort_index()
+    rth = (df.index.time >= config.MARKET_OPEN) & (df.index.time < config.MARKET_CLOSE)
+    return df[rth]
+
+
 def _now(now: datetime | None) -> datetime:
     return now or datetime.now(config.ET)
 
@@ -108,15 +266,16 @@ def _now(now: datetime | None) -> datetime:
 def _report_feed_health(feed_key: tuple, healthy: bool, err: Exception | None) -> None:
     """Log a feed's up/down transitions loudly (ERROR, bypasses the console's keep-tag filter since
     ERROR+ always passes) instead of letting a dead data source look identical to a quiet market.
-    Re-announces an ongoing outage at most every DATA_FEED_REMINDER_SEC rather than once per tick."""
+    Re-announces an ongoing outage at most every DATA_FEED_REMINDER_SEC rather than once per tick.
+    Shared by both the yfinance path (_download) and the Alpaca/SPY path (get_spx_candles_via_alpaca)
+    -- `err` is whatever extra detail that feed wants appended, or None."""
     state = _FEED_STATE.setdefault(feed_key, {"healthy": True, "last_notice": 0.0})
     mono = _time.monotonic()
     symbol, interval = feed_key
     if not healthy:
         if state["healthy"] or mono - state["last_notice"] >= config.DATA_FEED_REMINDER_SEC:
-            log.error("DATA FEED DOWN: %s %s returned no data after %d attempt(s)%s",
-                     symbol, interval, config.DATA_DOWNLOAD_RETRIES, f" ({err})" if err else "",
-                     extra={"keep": True})
+            log.error("DATA FEED DOWN: %s %s returned no data%s", symbol, interval,
+                     f" ({err})" if err else "", extra={"keep": True})
             state["last_notice"] = mono
     elif not state["healthy"]:
         log.warning("DATA FEED RECOVERED: %s %s", symbol, interval, extra={"keep": True})
@@ -207,6 +366,10 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
     now = _now(now)
     if symbol == config.ES_SYMBOL:
         live = get_es_candles_live(int(interval.rstrip("m")), lookback_min, now)
+        if live is not None and not live.empty:
+            return live
+    if symbol == config.SPX_SYMBOL:
+        live = get_spx_candles_via_alpaca(int(interval.rstrip("m")), lookback_min, now)
         if live is not None and not live.empty:
             return live
     # 2026-09-25: "5d" (not "2d") so a large lookback_min (D/E's multi-session EMA/Bollinger window)

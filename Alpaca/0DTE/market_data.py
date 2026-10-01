@@ -117,20 +117,43 @@ def _alpaca_creds() -> tuple[str, str] | None:
 
 
 def _alpaca_data_get(path: str, params: dict) -> dict | None:
+    """2026-10-01: a 429/5xx from Alpaca's data API is often transient -- the SAME class of failure
+    broker.py's own _request() already retries with backoff for the trading API -- so this retries
+    in-call too rather than immediately reporting the feed down on the very first throttle. Real live
+    evidence this matters: moving SPX candles off yfinance onto Alpaca (this same function) pushed
+    Alpaca's OWN rate limit hard enough to also throw a 429 on the bot's unrelated trading-API calls
+    (broker.py's option-chain/account polling, same account) -- a 429 here is retried immediately
+    instead of adding to that same burst of near-simultaneous requests via get_candles()'s yfinance
+    fallback path."""
     creds = _alpaca_creds()
     if creds is None:
         return None
     key, secret = creds
     base = getattr(config, "ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret, "Accept": "application/json"}
-    try:
-        resp = requests.get(f"{base}{path}", headers=headers, params=params, timeout=10)
-    except requests.RequestException as e:
-        log.warning("Alpaca data API %s failed (falling back to yfinance): %s", path, e)
-        return None
+    resp = None
+    for attempt in range(config.ALPACA_DATA_RETRIES):
+        try:
+            resp = requests.get(f"{base}{path}", headers=headers, params=params, timeout=10)
+        except requests.RequestException as e:
+            log.warning("Alpaca data API %s failed (falling back to yfinance): %s", path, e)
+            return None
+        if resp.status_code == 200:
+            break
+        if resp.status_code != 429 and resp.status_code < 500:
+            break   # a real client error (4xx other than 429) won't be fixed by retrying
+        if attempt < config.ALPACA_DATA_RETRIES - 1:
+            _time.sleep(config.ALPACA_DATA_RETRY_SEC * (attempt + 1))
     if resp.status_code != 200:
-        log.warning("Alpaca data API %s returned HTTP %d (falling back to yfinance): %s",
-                   path, resp.status_code, resp.text[:200])
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # ERROR + keep=True (not just a filtered warning) -- the generic "DATA FEED DOWN" line
+            # alone doesn't say WHY, and a rate limit on this SAME account is a distinct, actionable
+            # signal (it can also start affecting real order/chain calls) worth surfacing on its own.
+            log.error("Alpaca data API %s returned HTTP %d after retries (falling back to yfinance): %s",
+                     path, resp.status_code, resp.text[:200], extra={"keep": True})
+        else:
+            log.warning("Alpaca data API %s returned HTTP %d (falling back to yfinance): %s",
+                       path, resp.status_code, resp.text[:200])
         return None
     try:
         data = resp.json()
@@ -170,23 +193,27 @@ def _spx_spy_ratio() -> float | None:
     return _SPX_RATIO_CACHE["ratio"]
 
 
-def _fetch_alpaca_spy_bars(interval_min: int, now: datetime) -> pd.DataFrame | None:
-    """Raw SPY bars (not yet scaled to SPX terms), cached for DATA_CACHE_SEC. None on any failure --
-    caller reports feed health and falls back to yfinance."""
-    cache_key = ("spx_via_spy", interval_min)
+def _fetch_alpaca_spy_bars_1min(now: datetime) -> pd.DataFrame | None:
+    """Raw 1-MINUTE SPY bars (not yet scaled to SPX terms), cached for DATA_CACHE_SEC. Every interval
+    get_spx_candles_via_alpaca needs (1m/2m/5m today) resamples locally from this SAME base fetch
+    rather than each making its own separate Alpaca request -- 2026-10-01, same day as the original
+    yfinance incident: moving SPX candles onto Alpaca immediately pushed Alpaca's OWN rate limit hard
+    enough to also 429 this bot's unrelated trading-API calls (same account). One base request per
+    cache window instead of one per distinct interval cuts that candle-request volume roughly 3x.
+    None on any failure -- caller reports feed health and falls back to yfinance."""
+    cache_key = ("spx_via_spy", 1)
     hit = _CACHE.get(cache_key)
     if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
         return hit[1]
     # A generous CALENDAR-day lookback (not lookback_min) mirrors _download's own "5d" yfinance period
     # for the same reason: a large lookback_min (D/E's multi-session EMA/Bollinger window) needs to
     # reach back far enough on a Monday morning, and every caller filters down to its own lookback_min
-    # afterward regardless -- the extra data is free. 2026-10-01, post-review: DERIVED from
-    # D_E_LOOKBACK_MIN (the largest real lookback_min any caller uses today) plus a 2-day buffer for
-    # weekends, floored at 6, rather than an independent hardcoded "6" that could silently under-fetch
-    # if D_E_LOOKBACK_MIN is ever increased without anyone remembering to update this too.
+    # afterward regardless -- the extra data is free. Derived from D_E_LOOKBACK_MIN (the largest real
+    # lookback_min any caller uses today) plus a 2-day weekend buffer, floored at 6, rather than an
+    # independent hardcoded figure that could silently under-fetch if D_E_LOOKBACK_MIN grows later.
     fetch_days = max(6, -(-config.D_E_LOOKBACK_MIN // (24 * 60)) + 2)   # ceil-div minutes -> days
     start = now - timedelta(days=fetch_days)
-    params = {"timeframe": f"{interval_min}Min", "start": start.isoformat(), "end": now.isoformat(),
+    params = {"timeframe": "1Min", "start": start.isoformat(), "end": now.isoformat(),
               "feed": "iex", "limit": 10000, "adjustment": "raw"}
     rows: list[dict] = []
     for _ in range(20):   # hard cap on pagination -- never loop forever on a malformed token
@@ -212,20 +239,24 @@ def _fetch_alpaca_spy_bars(interval_min: int, now: datetime) -> pd.DataFrame | N
 
 
 def get_spx_candles_via_alpaca(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
-    """SPX-equivalent candles: real SPY bars via Alpaca's market data API (free IEX feed), scaled up
-    by the periodically-calibrated SPX/SPY ratio. Returns None -- never raises -- if Alpaca credentials
-    aren't configured or the call fails for any reason; get_candles() falls back to yfinance in that
-    case. Reports its own up/down transitions (same _report_feed_health used for the yfinance path) so
-    a broken Alpaca credential/feed doesn't stay invisible just because yfinance happens to still work."""
+    """SPX-equivalent candles: real 1-minute SPY bars via Alpaca's market data API (free IEX feed),
+    resampled to interval_min and scaled up by the periodically-calibrated SPX/SPY ratio. Returns
+    None -- never raises -- if Alpaca credentials aren't configured or the call fails for any reason;
+    get_candles() falls back to yfinance in that case. Reports its own up/down transitions (same
+    _report_feed_health used for the yfinance path) so a broken Alpaca credential/feed doesn't stay
+    invisible just because yfinance happens to still work."""
     if _alpaca_creds() is None:
         return None
     now = _now(now)
-    df = _fetch_alpaca_spy_bars(interval_min, now)
-    _report_feed_health((config.SPY_SYMBOL, f"{interval_min}Min"), df is not None, None)
+    df = _fetch_alpaca_spy_bars_1min(now)
+    _report_feed_health((config.SPY_SYMBOL, "1Min"), df is not None, None)
     if df is None:
         return None
     if df.empty:
         return df
+    if interval_min > 1:
+        df = df.resample(f"{interval_min}min").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
     ratio = _spx_spy_ratio() or config.SPX_SPY_RATIO_FALLBACK
     scaled = df.copy()
     for col in ("open", "high", "low", "close"):

@@ -78,6 +78,16 @@ SPY_SYMBOL = "SPY"
 # succeeded (e.g. right at startup).
 SPX_SPY_RATIO_REFRESH_MIN = 60
 SPX_SPY_RATIO_FALLBACK = 10.0
+# 2026-10-01, same day: moving SPX candles onto Alpaca immediately pushed Alpaca's OWN data-API rate
+# limit hard enough to also throw a 429 on this bot's unrelated TRADING-api calls (same account,
+# option-chain/account polling in broker.py) -- traded one feed's rate limit for another's, on the
+# account that actually places real orders this time. Two fixes: (1) market_data._alpaca_data_get
+# retries a 429/5xx with backoff in-call, same pattern broker.py's own _request() already uses for
+# the trading API; (2) get_spx_candles_via_alpaca now fetches ONE base 1-minute series and resamples
+# locally to whatever interval a caller needs (1m/2m/5m today), instead of one separate Alpaca request
+# PER interval -- cuts Alpaca candle REQUEST volume roughly 3x on top of the retry.
+ALPACA_DATA_RETRIES = 3
+ALPACA_DATA_RETRY_SEC = 0.5
 ES_SYMBOL = "ES=F"
 # 2026-09-25: Schwab's own futures quote symbol for the same instrument, used only if this folder's
 # .env has SCHWAB_APP_KEY/SCHWAB_APP_SECRET set (see market_data.get_es_candles_live) -- optional,

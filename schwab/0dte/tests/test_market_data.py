@@ -249,6 +249,121 @@ def test_get_spx_candles_via_alpaca_returns_none_on_malformed_bars_shape(monkeyp
     assert market_data.get_spx_candles_via_alpaca(5, 180) is None
 
 
+# ---------------------------------------------------------------------------------------------------
+# 2026-10-01, same day: moving SPX candles onto Alpaca immediately pushed Alpaca's OWN data-API rate
+# limit hard enough to also 429 this bot's unrelated TRADING-api calls (same account). Fixed by (1)
+# fetching ONE base 1-minute series and resampling locally to whatever interval a caller needs,
+# instead of one separate Alpaca request per interval, and (2) retrying a 429/5xx with backoff
+# in-call, same pattern broker.py's own _request() already uses for the trading API.
+
+def test_get_spx_candles_via_alpaca_requests_1min_regardless_of_interval_asked(monkeypatch):
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    seen = []
+    monkeypatch.setattr(market_data, "_alpaca_data_get",
+                        lambda path, params: seen.append(params["timeframe"]) or {"bars": [], "next_page_token": None})
+    market_data.get_spx_candles_via_alpaca(5, 180)
+    assert seen == ["1Min"]   # asked for 5m candles, but the underlying Alpaca request is always 1Min
+
+
+def test_get_spx_candles_via_alpaca_resamples_1min_bars_to_the_requested_interval(monkeypatch):
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    now = pd.Timestamp("2026-10-01 10:11:00", tz=config.ET)
+    base = pd.Timestamp("2026-10-01 10:00:00", tz=config.ET)
+    # 10 genuine 1-minute bars (not pre-aligned to any coarser bucket by coincidence): 10:00-10:09.
+    one_min_closes = [76.0, 76.1, 76.3, 76.05, 76.2, 76.4, 76.15, 76.5, 76.25, 76.6]
+    bars = []
+    for i, c in enumerate(one_min_closes):
+        t = (base + pd.Timedelta(minutes=i)).tz_convert("UTC")
+        bars.append({"t": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": c - 0.02, "h": c + 0.05,
+                    "l": c - 0.05, "c": c, "v": 100})
+    monkeypatch.setattr(market_data, "_alpaca_data_get", lambda path, params: {"bars": bars, "next_page_token": None})
+    monkeypatch.setattr(market_data, "_spx_spy_ratio", lambda: 1.0)   # ratio=1 -> compare directly to SPY values
+    df = market_data.get_spx_candles_via_alpaca(5, 180, now=now)
+    assert len(df) == 2   # two complete 5-minute buckets: 10:00-10:04 and 10:05-10:09
+    assert df["close"].iloc[0] == pytest.approx(one_min_closes[4])    # last close in the first bucket
+    assert df["high"].iloc[0] == pytest.approx(max(one_min_closes[:5]) + 0.05)
+    assert df["volume"].iloc[0] == 500   # 5 one-minute bars summed
+
+
+def test_get_spx_candles_via_alpaca_shares_one_fetch_across_different_intervals(monkeypatch):
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    now = pd.Timestamp("2026-10-01 10:06:00", tz=config.ET)
+    base = pd.Timestamp("2026-10-01 09:55:00", tz=config.ET)
+    calls = []
+    monkeypatch.setattr(market_data, "_alpaca_data_get",
+                        lambda path, params: calls.append(1) or _alpaca_bars_page([76.0, 76.5], base))
+    monkeypatch.setattr(market_data, "_spx_spy_ratio", lambda: 10.0)
+    market_data.get_spx_candles_via_alpaca(1, 180, now=now)
+    market_data.get_spx_candles_via_alpaca(5, 180, now=now)   # different interval, same tick/cache window
+    assert len(calls) == 1   # the second call reused the cached 1-minute base fetch
+
+
+def test_alpaca_data_get_retries_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setattr(market_data._time, "sleep", lambda s: None)
+    attempts = []
+
+    class Resp:
+        def __init__(self, status):
+            self.status_code = status
+            self.text = "too many requests" if status == 429 else "{}"
+
+        def json(self):
+            return {}
+
+    def fake_get(url, headers, params, timeout):
+        attempts.append(1)
+        return Resp(429) if len(attempts) < 2 else Resp(200)
+
+    monkeypatch.setattr(market_data.requests, "get", fake_get)
+    data = market_data._alpaca_data_get("/v2/stocks/SPY/bars", {})
+    assert data == {}
+    assert len(attempts) == 2
+
+
+def test_alpaca_data_get_gives_up_after_all_retries_on_persistent_429(monkeypatch, caplog):
+    caplog.set_level("ERROR")
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setattr(market_data._time, "sleep", lambda s: None)
+    attempts = []
+
+    class Resp:
+        status_code = 429
+        text = "too many requests"
+
+    def fake_get(url, headers, params, timeout):
+        attempts.append(1)
+        return Resp()
+
+    monkeypatch.setattr(market_data.requests, "get", fake_get)
+    assert market_data._alpaca_data_get("/v2/stocks/SPY/bars", {}) is None
+    assert len(attempts) == config.ALPACA_DATA_RETRIES
+    assert any("HTTP 429" in r.message for r in caplog.records)
+
+
+def test_alpaca_data_get_does_not_retry_a_non_retryable_4xx(monkeypatch):
+    monkeypatch.setattr(config, "ALPACA_API_KEY", "key")
+    monkeypatch.setattr(config, "ALPACA_SECRET_KEY", "secret")
+    attempts = []
+
+    class Resp:
+        status_code = 404
+        text = "not found"
+
+    def fake_get(url, headers, params, timeout):
+        attempts.append(1)
+        return Resp()
+
+    monkeypatch.setattr(market_data.requests, "get", fake_get)
+    assert market_data._alpaca_data_get("/v2/stocks/SPY/bars", {}) is None
+    assert len(attempts) == 1   # a real client error isn't retried
+
+
 # 2026-10-01, post-review (independent adversarial pass before this ever reached Schwab or was
 # pushed): three real gaps found -- a non-dict JSON body would reach .get("bars") as an AttributeError
 # (nothing downstream catches that), a non-numeric OHLC value would survive _normalize_alpaca_bars'

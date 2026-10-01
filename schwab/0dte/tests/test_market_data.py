@@ -2,6 +2,7 @@
 
 import pandas as pd
 import pytest
+import requests
 
 import config
 import market_data
@@ -16,20 +17,59 @@ def _clear_es_cache():
     market_data._CACHE.clear()
 
 
-def test_schwab_client_none_without_credentials(monkeypatch):
-    # _schwab_client reads through config (which itself has a hardcoded SCHWAB_TOKEN_PATH default),
-    # not a raw os.getenv -- blank out all three explicitly rather than relying on env absence.
+def _write_token(path, access_token="atok", expires_in=1800, expires_at=None):
+    import time as _time
+    if expires_at is None:
+        expires_at = _time.time() + expires_in
+    path.write_text(__import__("json").dumps({
+        "creation_timestamp": int(_time.time()),
+        "token": {
+            "expires_in": expires_in, "token_type": "Bearer", "scope": "api",
+            "refresh_token": "rtok-should-never-be-used-by-this-folder",
+            "access_token": access_token, "id_token": "idtok", "expires_at": expires_at,
+        },
+    }))
+
+
+def test_schwab_read_only_client_none_without_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
-    monkeypatch.setattr(config, "SCHWAB_APP_SECRET", "")
     monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", "")
-    market_data._SCHWAB_CLIENT = None
-    assert market_data._schwab_client() is None
-    # cached as False (tried once, not retried) rather than None (untried) on the second call
-    assert market_data._SCHWAB_CLIENT is False
+    assert market_data._schwab_read_only_client() is None
+
+
+def test_schwab_read_only_client_none_when_token_file_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(tmp_path / "does_not_exist.json"))
+    assert market_data._schwab_read_only_client() is None
+
+
+def test_schwab_read_only_client_none_when_access_token_expired(monkeypatch, tmp_path):
+    # 2026-10-01: this folder must NEVER attempt a refresh (see the module-level comment above --
+    # Schwab refresh tokens are single-use and shared across up to 9 personas + the real Schwab bot).
+    # An expired token is just "unavailable this cycle," exactly like a missing credential.
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, expires_at=__import__("time").time() - 10)   # already expired
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(token_path))
+    assert market_data._schwab_read_only_client() is None
+
+
+def test_schwab_read_only_client_builds_a_non_refreshing_session_when_valid(monkeypatch, tmp_path):
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, access_token="a-real-looking-token")
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(token_path))
+    client = market_data._schwab_read_only_client()
+    assert client is not None
+    # A plain requests.Session with a static Bearer header -- no OAuth2 token/refresh_token attached at
+    # all, so there is no code path by which this client could ever call Schwab's refresh endpoint.
+    assert isinstance(client.session, requests.Session)
+    assert client.session.headers["Authorization"] == "Bearer a-real-looking-token"
+    assert not hasattr(client.session, "token")
 
 
 def test_get_es_candles_live_returns_none_without_client(monkeypatch):
-    monkeypatch.setattr(market_data, "_schwab_client", lambda: None)
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: None)
     assert market_data.get_es_candles_live(2, 180) is None
 
 
@@ -38,7 +78,7 @@ def test_get_es_candles_live_returns_none_on_api_error(monkeypatch):
         def get_price_history_every_minute(self, *a, **k):
             raise RuntimeError("network error")
 
-    monkeypatch.setattr(market_data, "_schwab_client", lambda: BoomClient())
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: BoomClient())
     assert market_data.get_es_candles_live(2, 180) is None
 
 
@@ -51,7 +91,7 @@ def test_get_es_candles_live_returns_none_on_empty_candles(monkeypatch):
         def get_price_history_every_minute(self, *a, **k):
             return EmptyResp()
 
-    monkeypatch.setattr(market_data, "_schwab_client", lambda: EmptyClient())
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: EmptyClient())
     assert market_data.get_es_candles_live(2, 180) is None
 
 
@@ -76,7 +116,7 @@ def test_get_es_candles_live_resamples_to_requested_interval(monkeypatch):
         def get_price_history_every_minute(self, *a, **k):
             return FakeResp()
 
-    monkeypatch.setattr(market_data, "_schwab_client", lambda: FakeClient())
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: FakeClient())
     df = market_data.get_es_candles_live(2, 180, now=now)
     assert df is not None
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]

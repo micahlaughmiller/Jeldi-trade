@@ -4,6 +4,7 @@ Every function takes `now` (tz-aware ET) so tests can inject time. Downloads are
 cached for config.DATA_CACHE_SEC to avoid hammering Yahoo on a 15 s tick.
 """
 
+import json
 import logging
 import time as _time
 from datetime import datetime, timedelta
@@ -31,46 +32,68 @@ _FEED_STATE: dict[tuple, dict] = {}
 # a genuine live ES-leads-SPX confirmation. Every function below fails soft: any missing credential,
 # import error, or API error just returns None, and the caller falls back to the existing yfinance
 # path -- this must never be able to crash the bot over an optional speed upgrade.
-_SCHWAB_CLIENT = None   # None = not yet tried, False = tried and failed (don't retry every tick)
+#
+# 2026-10-01: this folder must NEVER be the one to call Schwab's refresh endpoint. Schwab refresh
+# tokens are single-use -- rotate on every call -- and up to 9 Alpaca personas plus the real Schwab
+# trading bot were all sharing ONE token.json, each independently letting schwab-py's OAuth2 client
+# auto-refresh whenever its own copy's access token expired. Any one of those refreshing invalidated
+# every other process's in-memory copy, repeatedly forcing a fresh login on the Schwab bot (which has
+# no fallback for its own primary auth, unlike this optional feature). User's explicit decision: only
+# the Schwab bot may ever refresh. _schwab_read_only_client() below builds a schwab-py Client around a
+# PLAIN, non-OAuth requests.Session carrying a static Bearer header read directly from the token file
+# -- BaseClient only ever needs session.get(url, params=...) (confirmed by reading the installed
+# schwab-py source directly: schwab.client.base.BaseClient.__init__ takes just an api_key and a
+# session, and schwab.client.synchronous.Client._get_request is a bare self.session.get(...)) -- so
+# this reuses schwab-py's own proven request-building/enum logic with ZERO refresh capability at all:
+# an access token that's expired (checked locally against the file's own expires_at, with a safety
+# margin) or that 401s anyway is treated as "unavailable this cycle," exactly like every other
+# optional-data-source failure in this file, instead of ever attempting a refresh. Rebuilt fresh every
+# time (no permanent client caching like the old design) specifically so it keeps picking up the
+# Schwab bot's latest refreshed access token from the file rather than using a token baked in at
+# process startup that would itself go stale after ~30 minutes.
 
 
-def _schwab_client():
-    global _SCHWAB_CLIENT
-    if _SCHWAB_CLIENT is not None:
-        return _SCHWAB_CLIENT or None
-    # Reads through config (not a raw os.getenv) so this picks up the SAME SCHWAB_APP_KEY/SECRET/
-    # TOKEN_PATH resolution config.py already does (including its own sensible per-folder default
-    # for TOKEN_PATH) -- a direct os.getenv here would silently miss credentials that are only set
-    # via config.py's fallback, not literally present as an environment variable.
-    app_key = getattr(config, "SCHWAB_APP_KEY", "").strip()
-    app_secret = getattr(config, "SCHWAB_APP_SECRET", "").strip()
+def _schwab_read_only_client():
     token_path = getattr(config, "SCHWAB_TOKEN_PATH", "").strip()
-    if not (app_key and app_secret and token_path):
-        _SCHWAB_CLIENT = False
+    api_key = getattr(config, "SCHWAB_APP_KEY", "").strip()
+    if not token_path or not api_key:
         return None
     try:
-        from schwab.auth import client_from_token_file
-        _SCHWAB_CLIENT = client_from_token_file(token_path, app_key, app_secret)
+        with open(token_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        token = raw["token"]
+        access_token = token["access_token"]
+        expires_at = float(token["expires_at"])
     except Exception as e:
-        log.warning("Schwab client unavailable for live ES data (falling back to delayed yfinance "
-                    "ES=F): %s", e)
-        _SCHWAB_CLIENT = False
+        log.warning("Reading Schwab access token failed (falling back to delayed yfinance ES=F): %s", e)
         return None
-    return _SCHWAB_CLIENT
+    if _time.time() >= expires_at - 30:   # expired, or close enough to expire mid-request -- do NOT refresh
+        return None
+    try:
+        from schwab.client import Client
+    except Exception as e:
+        log.warning("schwab-py unavailable (falling back to delayed yfinance ES=F): %s", e)
+        return None
+    session = requests.Session()
+    session.headers["Authorization"] = f"Bearer {access_token}"
+    return Client(api_key, session)
 
 
 def live_es_available() -> bool:
-    """True once this folder's Schwab cross-auth is configured and working -- lets callers switch
-    from the ES_TO_SPX proxy (confirm on live SPX candles against a basis-shifted ES level) to
-    confirming directly on ES's own (now genuinely live) candles for the real lead-time edge."""
-    return _schwab_client() is not None
+    """True once this folder's Schwab cross-auth is configured and the shared token file currently
+    holds an unexpired access token -- lets callers switch from the ES_TO_SPX proxy (confirm on live
+    SPX candles against a basis-shifted ES level) to confirming directly on ES's own (now genuinely
+    live) candles for the real lead-time edge. Cheap (a local file read, no network call) so this is
+    safe to call on every tick without caching, unlike the old design's permanent client cache."""
+    return _schwab_read_only_client() is not None
 
 
 def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
     """Real ES futures candles via Schwab (config.ES_SCHWAB_SYMBOL, e.g. "/ES"), resampled to
     interval_min. Returns None -- never raises -- if Schwab cross-auth isn't configured in this
-    folder's .env or the call fails for any reason; get_candles() falls back to yfinance in that case."""
-    client = _schwab_client()
+    folder's .env, the shared token has expired, or the call fails for any reason; get_candles() falls
+    back to yfinance in that case."""
+    client = _schwab_read_only_client()
     if client is None:
         return None
     now = _now(now)

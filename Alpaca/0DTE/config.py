@@ -54,13 +54,10 @@ CLOSE_MAX_RETRIES = 6
 # 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
 # broker fill (exit_price) swings wildly from the trigger price during fast moves (confirmed from real
 # data: 26% of all realized losses were pure execution slippage, skewed adverse, concentrated in
-# Strategy A). A real account closing (buying back) a credit spread tends to land close to the last
-# quote plus a small, realistic premium, not wherever the paper sim's escalating-limit retry happens
-# to catch up. pnl_realistic (position_manager._close) models that: entry_credit vs. (trigger_price +
-# REALISTIC_CLOSE_SLIPPAGE), a flat add regardless of direction since every position here is a credit
-# spread and closing one is always a BUY -- a diagnostic/reporting figure only, never the real pnl/
-# realized_pnl the bot's own risk management (daily loss limit, consecutive losses) tracks.
-REALISTIC_CLOSE_SLIPPAGE = 0.05
+# Strategy A). The bot's OWN official pnl/realized_pnl (position_manager._close) now uses
+# realistic_exit_price = the tick immediately before the one that triggered the exit (prev_price),
+# not a flat slippage assumption -- the closest stand-in for where a live fill would realistically
+# land. The real broker fill is still recorded separately as pnl_actual_fill, for comparison only.
 LOG_DIR = "logs"
 
 UNDERLYING = "SPX"
@@ -197,24 +194,28 @@ ALLOW_MIN_CONTRACT_OVERRIDE = True
 MAX_PORTFOLIO_RISK_PCT = 0.52
 MAX_CONTRACTS_PER_TRADE = 10
 # Trade count and loss streak are per strategy; the daily loss limit and portfolio risk cap are combined.
-MAX_TRADES_PER_DAY = 20
+# 2026-10-01: narrowing every strategy to a uniform 5 trades/day/persona across the board -- enough
+# live data gathered to start cutting toward an actual live-trading version rather than wide-open
+# exploratory limits (this also caps the kind of single-persona re-entry concentration risk the 9/30-
+# 10/1 analysis surfaced on B).
+MAX_TRADES_PER_DAY = 5
 MAX_CONSECUTIVE_LOSSES = 5
 # Per-strategy overrides of the two counters plus a cool-down (minutes after that strategy's last exit
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every
-# five minutes; capping at 3 trades would have cut the day's loss by 84%. B keeps the defaults.
+# five minutes; capping at 3 trades would have cut the day's loss by 84%.
 LIMITS_BY_STRATEGY = {
     "A": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 5, "COOLDOWN_MIN": 30},   # 2026-09-22: 5 trades to test the exit floors
     "B": {},
     # 2026-09-25: 5 trades/day per strategy is the general rule for the new multi-strategy personas
     # (each active strategy gets its OWN 5/day allowance, not a combined cap across a persona's
-    # strategies -- config.MAX_TRADES_PER_DAY, the fallback default, is 20 and stays that way for B).
+    # strategies).
     "C": {"MAX_TRADES_PER_DAY": 5},
     "D": {"MAX_TRADES_PER_DAY": 5},
     "E": {"MAX_TRADES_PER_DAY": 5},
-    # 2026-09-28 Strategy F: 10 entries/day counted at ENTRY (and closed + open as a cross-check), 7
+    # 2026-09-28 Strategy F: entries counted at ENTRY (and closed + open as a cross-check), 7
     # consecutive losses across all F tickers, up to 3 F positions open at once in different tickers.
     # No COOLDOWN_MIN: a cool-down is strategy-wide and would pause every F ticker after one F exit.
-    "F": {"MAX_TRADES_PER_DAY": 10, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
+    "F": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
 }
 DAILY_LOSS_LIMIT_PCT = 0.10
 # Per-strategy concurrency cap and the limit() fallback for strategies without their own entry (A-E are

@@ -102,7 +102,12 @@ def test_stop_hit_closes_all(pm, broker, journal):
     broker.spread_close_price = 3.65
     fills = tick(pm, et(10, 6), 3.62, rising())               # 2nd confirming print: closes
     assert len(fills) == 1 and fills[0]["exit_reason"] == "STOP_LOSS"
-    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-130.0)
+    # 2026-10-01: pnl is now the OFFICIAL, realistic-close P/L (the tick just before this one, 3.60,
+    # not the triggering tick 3.62), not the real broker fill (3.65, pnl_actual_fill) -- user's
+    # explicit call so the bot's own risk management runs on a simulated real-world close instead of
+    # the paper sim's actual fill. Both are reported so the two stay comparable.
+    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(-120.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(-130.0)
     assert fills[0]["position_closed"] is True and fills[0]["strategy"] == "A"
     assert pm.positions == {}
     assert spxw_legs(broker.get_positions()) == []
@@ -117,7 +122,10 @@ def test_b_target_with_one_contract_full_close(pm, broker):
     broker.spread_close_price = 0.70
     fills = tick(pm, et(10, 2), 0.70, rising(), strat="B")
     assert fills[0]["exit_reason"] == "PROFIT_TARGET" and fills[0]["qty"] == 1
-    assert fills[0]["pnl"] == pytest.approx(30.0)
+    # no prior tick exists (this is the first tick after entry) -> realistic_exit_price falls back
+    # to the trigger price itself (0.70), same as entry_credit -> pnl 0.
+    assert fills[0]["pnl"] == pytest.approx(0.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(30.0)
     assert pm.positions == {} and broker.get_positions() == []
 
 
@@ -133,7 +141,10 @@ def test_a_runs_whole_position_at_target(pm, broker, journal):
     broker.spread_close_price = 2.50
     fills = tick(pm, et(10, 6), 2.50, rising())
     assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["qty"] == 2
-    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(100.0)
+    # realistic_exit_price uses the prior tick (2.00), which here is BETTER than the trigger (2.50) --
+    # that's the whole point of using the tick before the close.
+    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(200.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(100.0)
     assert fills[0]["position_closed"] is True and pm.positions == {}
 
 
@@ -203,17 +214,15 @@ def test_exit_row_records_trigger_and_slippage(pm, broker):
     row = fills[0]
     assert row["trigger_price"] == 3.61 and row["exit_price"] == 3.65
     assert row["exit_slippage"] == pytest.approx(0.04)
-    # 2026-10-01: a perfect, zero-slippage fill exactly at the trigger price would have been -61.00
-    # (entry 3.00, trigger 3.61) vs the real -65.00 (entry 3.00, actual fill 3.65) -- isolates
-    # execution-quality slippage from the decision itself, to help tell a paper-sim fill artifact
-    # apart from a real script problem.
-    assert row["pnl_at_trigger"] == pytest.approx(-61.00)
-    assert row["pnl"] == pytest.approx(-65.00)
-    # 2026-10-01: a third diagnostic P/L -- trigger_price + REALISTIC_CLOSE_SLIPPAGE (0.05), modeling
-    # a realistic real-world close rather than either the zero-slippage ideal or the paper sim's
-    # actual (here, worse) fill: 3.61 + 0.05 = 3.66 -> (3.00-3.66)*100 = -66.00.
-    assert row["realistic_exit_price"] == pytest.approx(3.66)
-    assert row["pnl_realistic"] == pytest.approx(-66.00)
+    # 2026-10-01, revised same day: "pnl" is now the bot's OFFICIAL P/L, computed from
+    # realistic_exit_price (the tick immediately BEFORE the one that triggered this exit, 3.60 ->
+    # (3.00-3.60)*100 = -60.00) rather than the real broker fill -- user's explicit call, so the bot's
+    # own risk management runs on a simulated real-world close instead of the paper sim's actual fill.
+    # The real fill is still fully recorded as pnl_actual_fill (3.00-3.65)*100 = -65.00, reported
+    # alongside pnl specifically so the two stay comparable.
+    assert row["realistic_exit_price"] == pytest.approx(3.60)
+    assert row["pnl"] == pytest.approx(-60.00)
+    assert row["pnl_actual_fill"] == pytest.approx(-65.00)
     assert row["entry_mid"] == 3.05 and row["entry_slippage"] == pytest.approx(0.05)
     # 2026-09-30: prev-tick diagnostic fields (a real live anomaly -- a reported price jumped an
     # implausible amount in a single tick right before an exit). prev_tick_price is current_price as
@@ -282,8 +291,9 @@ def test_target_with_momentum_enters_runner_then_trails_out(pm, broker, journal,
     broker.spread_close_price = 2.60
     fills = tick(pm, et(10, 8), 2.60, rising())
     assert fills[0]["exit_reason"] == "RUNNER_TRAIL" and fills[0]["qty"] == 2
-    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(80.0)
-    assert fills[0]["position_pnl"] == pytest.approx(110.0)
+    assert fills[0]["runner"] == "y" and fills[0]["pnl"] == pytest.approx(90.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(80.0)
+    assert fills[0]["position_pnl"] == pytest.approx(90.0)
     assert pm.positions == {} and broker.get_positions() == []
 
 
@@ -297,7 +307,8 @@ def test_runner_stop_at_target_level(pm, broker, monkeypatch):
     broker.spread_close_price = 2.72
     fills = tick(pm, et(10, 4), 2.71, rising())
     assert fills[0]["exit_reason"] == "RUNNER_STOP"
-    assert fills[0]["pnl"] == pytest.approx(28.0)
+    assert fills[0]["pnl"] == pytest.approx(30.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(28.0)
     assert pm.positions == {}
 
 
@@ -353,7 +364,9 @@ def test_force_close(pm, broker):
     broker.spread_close_price = 2.95
     fills = pm.force_close(et(15, 30), {"A": 2.95})
     assert fills[0]["exit_reason"] == "FORCE_CLOSE" and fills[0]["qty"] == 2
+    # no prior tick exists -> realistic_exit_price falls back to the trigger price itself, same as the fill here
     assert fills[0]["pnl"] == pytest.approx(10.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(10.0)
     assert pm.positions == {}
 
 
@@ -382,7 +395,8 @@ def test_b_hits_its_own_wider_stop_a_unaffected(pm, broker):
     broker.spread_close_price = 1.55
     fills = pm.on_tick(et(10, 4), {"A": 3.10, "B": 1.50}, rising())
     assert [f["strategy"] for f in fills] == ["B"] and fills[0]["exit_reason"] == "STOP_LOSS"
-    assert fills[0]["pnl"] == pytest.approx(-55.0)
+    assert fills[0]["pnl"] == pytest.approx(-45.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(-55.0)
     assert set(pm.positions) == {"A"} and pm.positions["A"].current_price == 3.10
 
 
@@ -390,7 +404,8 @@ def test_b_target_uses_its_own_profit_target(pm, broker):
     open_b_put_spread(pm, broker, qty=1)
     broker.spread_close_price = 0.70
     fills = pm.on_tick(et(10, 2), {"B": 0.70}, rising())
-    assert fills[0]["exit_reason"] == "PROFIT_TARGET" and fills[0]["pnl"] == pytest.approx(30.0)
+    assert fills[0]["exit_reason"] == "PROFIT_TARGET" and fills[0]["pnl"] == pytest.approx(0.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(30.0)
 
 
 def test_missing_price_skips_that_position_only(pm, broker):
@@ -498,8 +513,8 @@ def test_state_roundtrip_and_trades_csv(pm, broker, journal, monkeypatch):
     journal.trade(fills[0])
     text = journal.trades_path.read_text().splitlines()
     assert text[0].startswith("date,strategy,entry_time,exit_time,direction")
-    assert text[0].endswith("runner,trigger_price,exit_slippage,pnl_at_trigger,realistic_exit_price,"
-                           "pnl_realistic,entry_mid,entry_slippage,"
+    assert text[0].endswith("runner,trigger_price,exit_slippage,realistic_exit_price,"
+                           "pnl_actual_fill,entry_mid,entry_slippage,"
                            "prev_tick_price,prev_tick_pnl,prev_tick_jump,ticker,expiration,mfe,mae,scanner_score")
     assert text[1].startswith("2026-09-17,A,")
     assert "PROFIT_TARGET" in text[1] and ",n," in text[1]
@@ -527,7 +542,8 @@ def test_profit_lock_giveback_exits_once_armed(pm, broker, monkeypatch):
     broker.spread_close_price = 2.90
     fills = tick(pm, et(10, 6), 2.90, rising())           # gave back 0.10 -> lock it in
     assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_GIVEBACK"
-    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(20.0)
+    assert fills[0]["qty"] == 2 and fills[0]["pnl"] == pytest.approx(22.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(20.0)
     assert pm.positions == {}
 
 
@@ -539,7 +555,8 @@ def test_profit_lock_momentum_flip_exits_once_armed(pm, broker, monkeypatch):
     broker.spread_close_price = 2.82
     fills = tick(pm, et(10, 4), 2.82, falling_last())     # still +0.18 but last candle closed red
     assert len(fills) == 1 and fills[0]["exit_reason"] == "PROFIT_LOCK_MOMENTUM"
-    assert fills[0]["pnl"] == pytest.approx(18.0)
+    assert fills[0]["pnl"] == pytest.approx(20.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(18.0)
 
 
 def test_profit_lock_momentum_flip_ignored_before_arming(pm, broker, monkeypatch):
@@ -616,7 +633,8 @@ def test_stale_timer_sets_breakeven_floor_only_when_in_profit(pm, broker, journa
     assert events(journal, "FLOOR_SET")[0]["why"] == "STALE_TIMER 5m"
     broker.spread_close_price = 2.96
     fills = tick(pm, et(10, 8), 2.95, rising())
-    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(4.0)
+    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(10.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(4.0)
 
 
 def test_stale_timer_with_tiny_profit_exits_at_once(pm, broker, monkeypatch):
@@ -625,7 +643,8 @@ def test_stale_timer_with_tiny_profit_exits_at_once(pm, broker, monkeypatch):
     open_put_spread(pm, broker, qty=1)
     broker.spread_close_price = 2.98
     fills = tick(pm, et(10, 6), 2.97, rising())
-    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(2.0)
+    assert fills[0]["exit_reason"] == "PROFIT_FLOOR" and fills[0]["pnl"] == pytest.approx(0.0)
+    assert fills[0]["pnl_actual_fill"] == pytest.approx(2.0)
 
 
 def test_stale_timer_ignored_once_runner_started(pm, broker, monkeypatch):
@@ -848,11 +867,13 @@ def test_open_pnl_includes_what_partial_fills_already_booked(pm, broker):
     broker.spread_close_price = 0.60
     fills = pm.on_tick(et(10, 2), {"F:TSLA": 0.60}, None, {"F:TSLA": rising_})
     assert (fills[0]["exit_reason"], fills[0]["qty"], fills[0]["position_closed"]) == ("TARGET_HALF", 2, False)
-    assert f.realized_pnl == pytest.approx(60.0) and f.remaining == 2
+    # prev_price (the manually-set current_price, 0.90) is this fill's realistic_exit_price -- equal to
+    # entry_credit, so the OFFICIAL pnl for this partial close is 0.
+    assert f.realized_pnl == pytest.approx(0.0) and f.remaining == 2
     f.current_price = 0.90                                                    # runner marks flat at entry
-    assert pm.unrealized_pnl(("F",)) == 0.0 and pm.open_pnl(("F",)) == pytest.approx(60.0)
+    assert pm.unrealized_pnl(("F",)) == 0.0 and pm.open_pnl(("F",)) == pytest.approx(0.0)
     f.current_price = 0.70
-    assert pm.unrealized_pnl(("F",)) == pytest.approx(40.0) and pm.open_pnl(("F",)) == pytest.approx(100.0)
+    assert pm.unrealized_pnl(("F",)) == pytest.approx(40.0) and pm.open_pnl(("F",)) == pytest.approx(40.0)
     assert pm.open_pnl(("A", "B")) == 0.0
 
 

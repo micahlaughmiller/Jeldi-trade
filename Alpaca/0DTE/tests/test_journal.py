@@ -141,8 +141,8 @@ def _f_row() -> dict:
 
 def test_trade_fields_gain_strategy_neutral_columns():
     assert TRADE_FIELDS[-5:] == ["ticker", "expiration", "mfe", "mae", "scanner_score"]
-    assert TRADE_FIELDS[:26] == TRADE_FIELDS[:16] + [
-        "trigger_price", "exit_slippage", "pnl_at_trigger", "realistic_exit_price", "pnl_realistic",
+    assert TRADE_FIELDS[:25] == TRADE_FIELDS[:16] + [
+        "trigger_price", "exit_slippage", "realistic_exit_price", "pnl_actual_fill",
         "entry_mid", "entry_slippage", "prev_tick_price", "prev_tick_pnl", "prev_tick_jump",
     ]
 

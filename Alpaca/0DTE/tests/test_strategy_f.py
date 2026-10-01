@@ -127,5 +127,5 @@ def test_only_astra_opts_into_f():
     assert all("F" not in o.get("STRATEGIES", ()) for name, o in overrides.items() if name != "ASTRA")
     assert config.STOCK_STRATEGIES == ("F",) and config.DAILY_LOSS_LIMIT_EXEMPT == ("F",)
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None
-    assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 10, "MAX_CONSECUTIVE_LOSSES": 7,
+    assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7,
                                               "MAX_CONCURRENT_POSITIONS": 3}

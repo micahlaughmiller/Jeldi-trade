@@ -252,14 +252,15 @@ def test_f_exit_row_csv_and_close_card(bot, data, caplog):
     assert (row["strategy"], row["key"], row["ticker"], row["expiration"], row["root"]) == ("F", "F:TSLA", "TSLA", EXP.isoformat(), "TSLA")
     assert (row["exit_reason"], row["exit_price"], row["exit_slippage"]) == ("STOP_LOSS", 1.32, pytest.approx(0.02))
     assert (row["mfe"], row["mae"], row["scanner_score"], row["direction_match"]) == (pytest.approx(0.10), pytest.approx(0.50), 80.0, True)
-    assert row["pnl"] == pytest.approx(-52.0) and bot.pm.positions == {} and bot.broker.close_roots[-1] == "TSLA"
+    assert row["pnl"] == pytest.approx(10.0) and bot.pm.positions == {} and bot.broker.close_roots[-1] == "TSLA"
+    assert row["pnl_actual_fill"] == pytest.approx(-52.0)
     assert option_legs(bot.broker.get_positions()) == []
     line = bot.journal.trades_path.read_text().splitlines()[1]
     assert line.startswith("2026-09-17,F,") and ",TSLA," in line and line.endswith(",0.1,0.5,80.0")
     s = bot.risk.state.for_strategy("F")
-    assert s.trades_today == 1 and s.consecutive_losses == 1 and s.realized_pnl == pytest.approx(-52.0)
+    assert s.trades_today == 1 and s.consecutive_losses == 0 and s.realized_pnl == pytest.approx(10.0)
     card = next(r.getMessage() for r in caplog.records if "STRATEGY F - STOCK ORB TSLA" in r.getMessage() and " CLOSE" in r.getMessage())
-    assert "P/L today F     -$52.00" in card and "MFE / MAE       +0.10 / -0.50" in card and "Slippage" in card
+    assert "P/L today F     +$10.00" in card and "MFE / MAE       +0.10 / -0.50" in card and "Slippage" in card
     assert "Underlying      TSLA  expires 2026-09-19" in card              # the spread's expiration, not the close date
     assert bot.f.watch[0].reentry_from == et(9, 57)
     exit_ev = events(bot, "EXIT")[-1]
@@ -285,9 +286,9 @@ def test_partial_runner_fill_resolves_by_key(bot, data, caplog):
 
 # ----------------------------------------------------------------------------------- risk
 
-def test_ten_entries_per_day_counts_open_positions_and_recorded_entries(bot, data):
+def test_five_entries_per_day_counts_open_positions_and_recorded_entries(bot, data):
     rank(bot, data)
-    for _ in range(8):
+    for _ in range(3):
         bot.risk.record_trade("F", 10.0)
     bot.pm.open(f_spread("AMZN"))
     bot.pm.open(f_spread("META"))
@@ -295,19 +296,20 @@ def test_ten_entries_per_day_counts_open_positions_and_recorded_entries(bot, dat
     bot.f.step(et(9, 55, 10))
     assert "F:TSLA" not in bot.pm.positions and bot.f.pending == []
     skipped = events(bot, "F_SKIPPED")
-    assert [s["ticker"] for s in skipped] == ["TSLA", "PFE"] and all(s["reason"] == "F: MAX_TRADES_PER_DAY (10)" for s in skipped)
+    assert [s["ticker"] for s in skipped] == ["TSLA", "PFE"] and all(s["reason"] == "F: MAX_TRADES_PER_DAY (5)" for s in skipped)
     assert bot.risk.trading_allowed("A", 10_000.0) == (True, "OK")
     fresh = RiskManager(10_000.0)
-    for _ in range(10):
+    for _ in range(5):
         fresh.record_entry("F")
-    assert fresh.trading_allowed("F")[1] == "F: MAX_TRADES_PER_DAY (10)"
+    assert fresh.trading_allowed("F")[1] == "F: MAX_TRADES_PER_DAY (5)"
     assert fresh.trading_allowed("F", open_count=2)[0] is False
     assert RiskManager(10_000.0).trading_allowed("F", open_count=3) == (True, "OK")
 
 
 def test_seven_consecutive_f_losses_block_only_f(bot, data):
-    for _ in range(7):
-        bot.risk.record_trade("F", -50.0)
+    # set the streak directly (not via record_trade) so it isolates MAX_CONSECUTIVE_LOSSES (7) from
+    # the now much lower MAX_TRADES_PER_DAY (5), which 7 recorded trades would trip first.
+    bot.risk.state.for_strategy("F").consecutive_losses = 7
     ok, reason = bot.risk.trading_allowed("F")
     assert ok is False and reason == "F: MAX_CONSECUTIVE_LOSSES (7)"
     assert bot.risk.trading_allowed("A") == (True, "OK") and bot.risk.trading_allowed("B") == (True, "OK")
@@ -579,7 +581,7 @@ def test_report_start_has_f_line_and_prewarm_runs_pre_open(bot, data, caplog):
     bot.report_start(et(9, 0), bot.broker.get_account(), [])
     f_line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Strategy F:"))
     assert "universe 4 names (A:2, B:1, C:1)" in f_line and "rank at 09:45 +45s" in f_line
-    assert "min score 60" in f_line and "watch top 5" in f_line and "max open 3" in f_line and "limits 10/day 7 losses" in f_line
+    assert "min score 60" in f_line and "watch top 5" in f_line and "max open 3" in f_line and "limits 5/day 7 losses" in f_line
     assert "exits 6%/10% of width (floor $0.05)" in f_line and "DTE 0-7" in f_line
     bot.f.step(et(9, 19, 59))
     assert data.calls["bars"] == []

@@ -67,10 +67,11 @@ def test_invalid_spread_returns_zero():
 def test_consecutive_loss_stop_is_per_strategy():
     rm = RiskManager(10_000)
     assert rm.trading_allowed("B") == (True, "OK")
-    for _ in range(limit("B", "MAX_CONSECUTIVE_LOSSES") - 1):
-        rm.record_trade("B", -60.0)
+    # set the streak directly (not via record_trade) so it isolates MAX_CONSECUTIVE_LOSSES from the
+    # now much lower MAX_TRADES_PER_DAY, which looping record_trade this many times would trip first.
+    rm.state.for_strategy("B").consecutive_losses = limit("B", "MAX_CONSECUTIVE_LOSSES") - 1
     assert rm.trading_allowed("B")[0] is True
-    rm.record_trade("B", -60.0)
+    rm.state.for_strategy("B").consecutive_losses += 1
     ok, reason = rm.trading_allowed("B")
     assert ok is False and "CONSECUTIVE" in reason and reason.startswith("B:")
     assert rm.trading_allowed("A") == (True, "OK")
@@ -89,14 +90,15 @@ def test_a_limits_are_tighter_than_b():
     assert (limit("A", "MAX_TRADES_PER_DAY"), limit("A", "MAX_CONSECUTIVE_LOSSES"), limit("A", "COOLDOWN_MIN")) == (5, 5, 30)
     from strategy import exit_setting
     assert exit_setting("A", "STOP_CONFIRM_SECONDS", 0) == 30 and exit_setting("B", "STOP_CONFIRM_SECONDS", 0) == 0
-    assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (20, 5, 0)
+    # 2026-10-01: every strategy narrowed to the same 5 trades/day cap; A's remaining tighter trait is COOLDOWN_MIN.
+    assert (limit("B", "MAX_TRADES_PER_DAY"), limit("B", "MAX_CONSECUTIVE_LOSSES"), limit("B", "COOLDOWN_MIN", 0)) == (5, 5, 0)
     rm = RiskManager(10_000)
     for _ in range(5):
         rm.record_trade("A", 10.0)
         rm.record_trade("B", 10.0)
     ok, reason = rm.trading_allowed("A")
     assert ok is False and reason == "A: MAX_TRADES_PER_DAY (5)"
-    assert rm.trading_allowed("B") == (True, "OK")
+    assert rm.trading_allowed("B") == (False, "B: MAX_TRADES_PER_DAY (5)")
     rm2 = RiskManager(10_000)
     for _ in range(5):
         rm2.record_trade("A", -10.0)
@@ -184,7 +186,7 @@ def test_cooldown_setup_survives_state_roundtrip():
 # ------------------------------------------------------------ Strategy F: entry-counted cap, exempt P/L
 
 def test_f_limits():
-    assert (limit("F", "MAX_TRADES_PER_DAY"), limit("F", "MAX_CONSECUTIVE_LOSSES"), limit("F", "COOLDOWN_MIN", 0)) == (10, 7, 0)
+    assert (limit("F", "MAX_TRADES_PER_DAY"), limit("F", "MAX_CONSECUTIVE_LOSSES"), limit("F", "COOLDOWN_MIN", 0)) == (5, 7, 0)
     assert limit("F", "MAX_CONCURRENT_POSITIONS", 1) == 3 and limit("A", "MAX_CONCURRENT_POSITIONS", 1) == 1
     assert limit("B", "MAX_CONCURRENT_POSITIONS", config.MAX_CONCURRENT_POSITIONS) == 1
 
@@ -192,17 +194,17 @@ def test_f_limits():
 def test_entries_cap_counts_recorded_entries_and_open_positions():
     rm = RiskManager(10_000)
     assert rm.record_entry("F") == 1 and rm.state.for_strategy("F").entries_today == 1
-    for _ in range(8):
+    for _ in range(3):
         rm.record_entry("F")
-    assert rm.trading_allowed("F") == (True, "OK")                                  # 9 entries
-    assert rm.trading_allowed("F", open_count=1) == (True, "OK")                    # 0 closed + 1 open < 9 recorded
+    assert rm.trading_allowed("F") == (True, "OK")                                  # 4 entries
+    assert rm.trading_allowed("F", open_count=1) == (True, "OK")                    # 0 closed + 1 open < 4 recorded
     rm.record_entry("F")
-    assert rm.trading_allowed("F") == (False, "F: MAX_TRADES_PER_DAY (10)")
+    assert rm.trading_allowed("F") == (False, "F: MAX_TRADES_PER_DAY (5)")
     rm2 = RiskManager(10_000)
-    for _ in range(7):
+    for _ in range(3):
         rm2.record_trade("F", 5.0)
-    assert rm2.trading_allowed("F", open_count=2) == (True, "OK")
-    assert rm2.trading_allowed("F", open_count=3) == (False, "F: MAX_TRADES_PER_DAY (10)")
+    assert rm2.trading_allowed("F", open_count=1) == (True, "OK")
+    assert rm2.trading_allowed("F", open_count=2) == (False, "F: MAX_TRADES_PER_DAY (5)")
     assert rm2.trading_allowed("A", open_count=3) == (True, "OK")                   # A-E never pass open_count
     assert rm2.state.for_strategy("A").entries_today == 0
 

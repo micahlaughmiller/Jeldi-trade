@@ -674,32 +674,6 @@ class PositionManager:
         exit_price = order.get("filled_avg_price") if order else None
         exit_price = float(exit_price) if exit_price is not None else spread_price
         fill_qty = p.remaining - left
-        pnl = round((p.entry_credit - exit_price) * 100 * fill_qty, 2)
-        p.closed_qty += fill_qty
-        p.realized_pnl = round(p.realized_pnl + pnl, 2)
-        # Fill quality: positive slippage = the fill cost us relative to the quote mid that triggered it.
-        exit_slippage = round(exit_price - spread_price, 2)
-        entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
-        # 2026-10-01: a second, diagnostic P/L -- what this trade's P/L would have been with a
-        # PERFECT fill exactly at trigger_price (the quote that triggered the exit decision), zero
-        # execution slippage. User's own words: massive slippage between a trigger well in the money
-        # and an actual close in the loss, suspected to be a paper-trading fill-engine artifact rather
-        # than something a real live account would do (a real fill tends to land close to the last
-        # print, not wherever the escalating-limit retry finally catches up). Comparing pnl (real,
-        # broker fill) against pnl_at_trigger (hypothetical, zero-slippage) isolates execution quality
-        # specifically -- if they track closely, the script's DECISION was fine and this is paper-sim
-        # fill behavior; if pnl_at_trigger is consistently much better than the real pnl, the gap is
-        # real exit-order slippage, worth revisiting regardless of paper vs. live.
-        pnl_at_trigger = round((p.entry_credit - spread_price) * 100 * fill_qty, 2)
-        # 2026-10-01: a THIRD diagnostic P/L -- user's own read on real-world execution: closing
-        # (buying back) a credit spread in a real account tends to land close to the last quote plus a
-        # small, realistic premium, not wherever the paper sim's escalating-limit retry happens to
-        # land. realistic_exit_price models that directly: trigger_price + REALISTIC_CLOSE_SLIPPAGE (a
-        # flat add, not direction-aware, since every position here is a credit spread and closing one
-        # is always a buy). This is meant as a cleaner proxy for likely real-world P/L across a day's
-        # strategy performance -- NOT the real pnl/realized_pnl the bot's own risk management tracks.
-        realistic_exit_price = round(spread_price + config.REALISTIC_CLOSE_SLIPPAGE, 2)
-        pnl_realistic = round((p.entry_credit - realistic_exit_price) * 100 * fill_qty, 2)
         # 2026-09-30: diagnostic instrumentation for a live anomaly -- ASTRA's reported price jumped
         # from 5.21 to ~6.10 in the ONE TICK between reporting and exiting, too large a move for that
         # second's real underlying action. prev_price is current_price as of the PRIOR tick (captured
@@ -711,6 +685,27 @@ class PositionManager:
         prev_price = p.prev_price
         prev_tick_pnl = round((p.entry_credit - prev_price) * 100 * fill_qty, 2) if prev_price is not None else None
         prev_tick_jump = round(spread_price - prev_price, 2) if prev_price is not None else None
+        # 2026-10-01, revised same day: the bot's OWN official P/L (pnl, realized_pnl -- everything
+        # downstream: RiskManager.record_trade, daily-loss-limit tracking, consecutive-loss counting,
+        # the cards/CSV) runs on realistic_exit_price = the tick immediately BEFORE the one that
+        # triggered this exit (prev_price), not a flat slippage assumption -- user's explicit call: the
+        # paper sim's actual fills swing wildly and adversely during fast moves, and the tick right
+        # before the trigger is the closest stand-in for "the print before close" a live fill would
+        # realistically land near. Falls back to spread_price itself when there's no prior tick (first
+        # tick after entry, or a force-close). The REAL broker fill is still fully recorded (exit_price,
+        # pnl_actual_fill) for comparison -- it's just no longer what the bot's own risk management
+        # reacts to. This is a genuine, deliberate divergence from the broker's own account equity,
+        # which still reflects the real fill; that gap is the whole point, not a bug.
+        realistic_exit_price = round(prev_price, 2) if prev_price is not None else round(spread_price, 2)
+        pnl = round((p.entry_credit - realistic_exit_price) * 100 * fill_qty, 2)
+        pnl_actual_fill = round((p.entry_credit - exit_price) * 100 * fill_qty, 2)
+        p.closed_qty += fill_qty
+        p.realized_pnl = round(p.realized_pnl + pnl, 2)
+        # Fill quality: positive slippage = the fill cost us relative to the quote mid that triggered it.
+        # (Still measured against the REAL fill -- this is a pure execution-quality diagnostic, separate
+        # from which P/L the bot treats as official.)
+        exit_slippage = round(exit_price - spread_price, 2)
+        entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
         scan = p.scan or {}
         row = {
             "date": now.date().isoformat(), "strategy": p.strategy,
@@ -719,8 +714,8 @@ class PositionManager:
             "short_strike": p.short_strike, "long_strike": p.long_strike, "width": p.width,
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
-            "trigger_price": spread_price, "exit_slippage": exit_slippage, "pnl_at_trigger": pnl_at_trigger,
-            "realistic_exit_price": realistic_exit_price, "pnl_realistic": pnl_realistic,
+            "trigger_price": spread_price, "exit_slippage": exit_slippage,
+            "realistic_exit_price": realistic_exit_price, "pnl_actual_fill": pnl_actual_fill,
             "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
             "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
@@ -729,11 +724,11 @@ class PositionManager:
             "scanner_score": scan.get("score"), "scanner_direction": scan.get("scanner_direction"),
             "direction_match": scan.get("direction_match"),
         }
-        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (at trigger would've been "
-                    "%.2f, realistic %.2f) | prev-tick %.2f (jump %+.2f, pnl would've been %.2f) | "
-                    "position realized %.2f, %d left",
-                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, pnl_at_trigger,
-                    pnl_realistic,
+        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (OFFICIAL, realistic "
+                    "@%.2f) | actual broker fill would've booked %.2f | prev-tick %.2f (jump %+.2f, pnl "
+                    "would've been %.2f) | position realized %.2f, %d left",
+                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, realistic_exit_price,
+                    pnl_actual_fill,
                     prev_price if prev_price is not None else float("nan"),
                     prev_tick_jump if prev_tick_jump is not None else float("nan"),
                     prev_tick_pnl if prev_tick_pnl is not None else float("nan"),

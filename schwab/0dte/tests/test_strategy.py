@@ -207,6 +207,32 @@ def test_orb_rearms_only_after_close_back_inside_range():
     assert feed(s, [(7612, 7626, 7611, 7625), (7625, 7632, 7624, 7630)]) == [None, BULLISH]
 
 
+def test_orb_setup_dict_roundtrip_preserves_every_field():
+    import json
+    s = OrbSetup(ORH, ORL)
+    bars = [
+        (7615, 7625, 7614, 7624),    # break: closes above 7620
+        (7624, 7625, 7619, 7621),    # wicks to 7619 (touches the level) and holds above it
+        (7621, 7623, 7620.5, 7622),  # green candle closing above 7620 -> enter at 7622
+    ]
+    feed(s, bars)   # pullback into DONE, non-trivial state
+    assert s.state == OrbSetup.DONE and s.direction == BULLISH and s.entry_kind == strategy.PULLBACK
+    restored = OrbSetup.from_dict(json.loads(json.dumps(s.to_dict())))
+    assert restored.to_dict() == s.to_dict()
+    assert (restored.or_high, restored.or_low) == (s.or_high, s.or_low)
+    # a restored DONE setup behaves identically to the original on the next candle: a close back
+    # inside the range re-arms it, same as it would have without ever restarting.
+    assert feed(restored, [(7612, 7626, 7611, 7612)]) == [None]
+    assert restored.state == OrbSetup.WAITING
+
+
+def test_orb_setup_dict_roundtrip_from_fresh_waiting_state():
+    import json
+    s = OrbSetup(ORH, ORL)
+    restored = OrbSetup.from_dict(json.loads(json.dumps(s.to_dict())))
+    assert restored.state == OrbSetup.WAITING and restored.direction is None and restored.break_close is None
+
+
 # -------------------------------------------------------------------- strikes
 
 def test_direction_to_spread():
@@ -434,3 +460,14 @@ def test_levels_shift_to_spx_terms():
     shifted = lv.shifted(-25.5)
     assert (shifted.high, shifted.low) == (6474.5, 6424.5)
     assert shifted.established_at == lv.established_at
+
+
+def test_levels_dict_roundtrip_survives_json_string_timestamps():
+    import json
+    lv = strategy.Levels(6500.0, 6450.0, et(9, 30))
+    # save_state runs every value through journal.jsonable(), which turns a datetime into an
+    # isoformat string -- from_dict has to accept that string form, not the live object.
+    from journal import jsonable
+    roundtripped = json.loads(json.dumps(jsonable(lv)))
+    restored = strategy.Levels.from_dict(roundtripped)
+    assert restored == lv

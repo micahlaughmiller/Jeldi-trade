@@ -783,3 +783,204 @@ def test_news_blackout_boundary_resets_breakout_state_machines(bot, monkeypatch)
     monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: pd.DataFrame())
     bot.tick(et(9, 40))   # blackout window has just cleared
     assert bot.orb_setup.state == OrbSetup.WAITING
+
+
+# ------------------------------------------------- restart state persistence (2026-10-01)
+
+def test_save_state_includes_breakout_state(bot):
+    from strategy import Levels, OrbSetup, TwoCandleBreak
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = -12.5
+    bot.orb = Levels(7630.0, 7570.0, et(10, 0))
+    bot.orb_setup = OrbSetup(7630.0, 7570.0)
+    bot.orb_setup.state = OrbSetup.DONE
+    bot.orb_setup.direction = BULLISH
+    bot.orb_setup.break_close = 7635.0
+    bot.on_setup = OrbSetup(7620.0, 7560.0)
+    bot.on_setup_symbol = config.SPX_SYMBOL
+    bot.es_setup = TwoCandleBreak(7620.0, 7560.0)
+    bot.es_setup_symbol = config.ES_SYMBOL
+    bot.last_orb_candle = et(10, 5)
+    bot.last_on_candle = et(9, 40)
+    bot.last_continuation_check = {"ORB": et(10, 10), "ON_BREAK": et(9, 45)}
+    bot.news_blackout_was_active = True
+    bot.save_state()
+    saved = bot.journal.load_state()
+    b = saved["breakouts"]
+    assert b["orb_setup"] == {"or_high": 7630.0, "or_low": 7570.0, "state": "DONE",
+                              "direction": BULLISH, "break_close": 7635.0,
+                              "candles_since_break": 0, "entry_kind": None}
+    assert b["on_setup"]["state"] == "WAITING" and b["es_setup"]["state"] == "WAITING"
+    assert b["on_setup_symbol"] == config.SPX_SYMBOL and b["es_setup_symbol"] == config.ES_SYMBOL
+    assert b["last_orb_candle"] == et(10, 5).isoformat() and b["last_on_candle"] == et(9, 40).isoformat()
+    assert b["last_es_candle"] is None and b["last_de_candle"] is None
+    assert b["last_continuation_check"] == {"ORB": et(10, 10).isoformat(), "ON_BREAK": et(9, 45).isoformat()}
+    assert b["news_blackout_was_active"] is True
+    assert saved["levels"]["overnight"]["high"] == 7620.0 and saved["levels"]["basis"] == -12.5
+
+
+def test_restore_breakout_state_rebuilds_everything_from_a_saved_dict(bot):
+    from strategy import Levels, OrbSetup, TwoCandleBreak
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = -12.5
+    bot.orb = Levels(7630.0, 7570.0, et(10, 0))
+    bot.orb_setup = OrbSetup(7630.0, 7570.0)
+    bot.orb_setup.state = OrbSetup.DONE
+    bot.orb_setup.direction = BULLISH
+    bot.orb_setup.break_close = 7635.0
+    bot.on_setup = OrbSetup(7620.0, 7560.0)
+    bot.on_setup_symbol = config.SPX_SYMBOL
+    bot.es_setup = TwoCandleBreak(7620.0, 7560.0)
+    bot.es_setup.state = TwoCandleBreak.ARMED
+    bot.es_setup.direction = BULLISH
+    bot.es_setup_symbol = config.ES_SYMBOL
+    bot.last_orb_candle = et(10, 5)
+    bot.last_es_candle = et(9, 50)
+    bot.last_continuation_check = {"ORB": et(10, 10)}
+    bot.news_blackout_was_active = True
+    bot.save_state()
+    saved_today = bot.journal.load_state()
+
+    fresh = scheduler.Bot.__new__(scheduler.Bot)   # a brand-new, post-"restart" instance's blank slate
+    fresh.overnight = fresh.basis = fresh.orb = None
+    fresh.orb_setup = fresh.on_setup = fresh.es_setup = None
+    fresh.on_setup_symbol = fresh.es_setup_symbol = None
+    fresh.last_orb_candle = fresh.last_on_candle = fresh.last_es_candle = fresh.last_de_candle = None
+    fresh.last_candle = None
+    fresh.last_continuation_check = {}
+    fresh.news_blackout_was_active = False
+    fresh._restore_breakout_state(saved_today)
+
+    assert fresh.overnight == Levels(7620.0, 7560.0, et(9, 29)) and fresh.basis == -12.5
+    assert fresh.orb == Levels(7630.0, 7570.0, et(10, 0))
+    assert fresh.orb_setup.state == OrbSetup.DONE and fresh.orb_setup.direction == BULLISH
+    assert fresh.orb_setup.break_close == 7635.0
+    assert fresh.on_setup.state == OrbSetup.WAITING and fresh.on_setup_symbol == config.SPX_SYMBOL
+    assert fresh.es_setup.state == TwoCandleBreak.ARMED and fresh.es_setup.direction == BULLISH
+    assert fresh.es_setup_symbol == config.ES_SYMBOL
+    assert fresh.last_orb_candle == et(10, 5) and fresh.last_es_candle == et(9, 50)
+    assert fresh.last_on_candle is None and fresh.last_de_candle is None   # never set -> stays None
+    assert fresh.last_continuation_check == {"ORB": et(10, 10)}
+    assert fresh.news_blackout_was_active is True
+
+
+def test_restore_breakout_state_is_a_no_op_on_a_blank_state_dict(bot):
+    """An older state.json written before this fix (or a day with no breakout activity yet at all)
+    has no "breakouts" key, or one full of nulls -- restoring from it must leave everything None,
+    exactly like a real first start of the day, not raise."""
+    bot._restore_breakout_state({"levels": {}, "breakouts": {}})
+    assert bot.orb_setup is None and bot.on_setup is None and bot.es_setup is None
+    assert bot.last_orb_candle is None and bot.last_continuation_check == {}
+    assert bot.news_blackout_was_active is False
+    bot._restore_breakout_state({})   # no "levels"/"breakouts" key at all
+    assert bot.orb_setup is None and bot.last_continuation_check == {}
+
+
+def test_restore_breakout_state_catches_a_malformed_sub_dict_instead_of_crashing(bot, caplog):
+    """A saved breakouts.orb_setup that's present but missing a required field (an old/future schema,
+    a hand-edited file) must not raise all the way out of start() and take the whole persona process
+    down -- it should log a warning and fall back to a fresh (None) orb_setup, same as a missing key."""
+    caplog.set_level("WARNING")
+    bot._restore_breakout_state({"breakouts": {"orb_setup": {"state": "DONE"}}})   # missing or_high etc.
+    assert bot.orb_setup is None
+    assert any("Could not restore orb_setup" in r.getMessage() for r in caplog.records)
+
+
+def test_restore_breakout_state_catches_a_malformed_levels_dict_instead_of_crashing(bot, caplog):
+    caplog.set_level("WARNING")
+    bot._restore_breakout_state({"levels": {"orb": {"high": 7630.0}}})   # missing low/established_at
+    assert bot.orb is None
+    assert any("Could not restore saved levels" in r.getMessage() for r in caplog.records)
+
+
+def test_try_on_break_entry_rebuilds_on_setup_when_level_source_switches(bot, monkeypatch):
+    """overnight_levels_for_signal() can resolve to a different source (ES vs SPX-terms) on a later
+    call -- e.g. a restart right after a Schwab token refresh makes live ES suddenly available. A
+    restored on_setup built against the OLD source must be rebuilt fresh, not fed candles from the new
+    source's different price scale."""
+    from conftest import make_candles
+    from strategy import Levels, OrbSetup
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bot.on_setup = OrbSetup(7620.0, 7560.0)   # as if restored, built against SPX-terms levels
+    bot.on_setup.state = OrbSetup.BROKEN
+    bot.on_setup.break_close = 7624.0
+    bot.on_setup_symbol = config.SPX_SYMBOL
+    bot.last_on_candle = et(9, 50)
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)   # ES now available
+    bars = [(7615, 7625, 7614, 7624)]
+    bot.try_on_break_entry(et(9, 55), make_candles(et(9, 30), bars))
+    assert bot.on_setup_symbol == config.ES_SYMBOL   # rebuilt against the new source
+    assert bot.on_setup.state == OrbSetup.WAITING     # fresh, not the stale BROKEN state
+    assert bot.last_on_candle is None                 # replay restarts from scratch under the new source
+
+
+def test_try_es_break_entry_rebuilds_es_setup_when_level_source_switches(bot, monkeypatch):
+    """Same fix as the ON_BREAK case above, applied to Strategy C's TwoCandleBreak."""
+    from conftest import make_candles
+    from strategy import Levels, TwoCandleBreak
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bot.es_setup = TwoCandleBreak(7620.0, 7560.0)   # as if restored, built against SPX-terms levels
+    bot.es_setup.state = TwoCandleBreak.ARMED
+    bot.es_setup_symbol = config.SPX_SYMBOL
+    bot.last_es_candle = et(9, 50)
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)   # ES now available
+    bars = [(7615, 7625, 7614, 7624)]
+    bot.try_es_break_entry(et(9, 55), make_candles(et(9, 30), bars))
+    assert bot.es_setup_symbol == config.ES_SYMBOL
+    assert bot.es_setup.state == TwoCandleBreak.WAITING
+    assert bot.last_es_candle is None
+
+
+def test_refresh_levels_does_not_recreate_orb_setup_once_restored(bot, monkeypatch):
+    """The actual 2026-10-01 bug: refresh_levels() used to create a brand-new (WAITING) orb_setup
+    whenever self.orb was freshly fetched, even if a restore had already put a real (e.g. DONE)
+    orb_setup in place a moment earlier in start() -- silently discarding it."""
+    from strategy import Levels, OrbSetup
+    monkeypatch.setattr(scheduler.market_data, "get_opening_range",
+                        lambda now: Levels(7630.0, 7570.0, et(10, 0)))
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))   # already resolved -- only the ORB branch is under test
+    bot.basis = 0.0
+    bot.orb = None   # not yet fetched this run (as if orb wasn't in the saved state either)
+    bot.orb_setup = OrbSetup(7630.0, 7570.0)
+    bot.orb_setup.state = OrbSetup.DONE
+    bot.orb_setup.break_close = 7640.0
+    bot.refresh_levels(et(10, 2))
+    assert bot.orb is not None   # the levels themselves are still (re)fetched normally
+    assert bot.orb_setup.state == OrbSetup.DONE and bot.orb_setup.break_close == 7640.0   # but NOT recreated
+
+
+def test_continuation_reentry_fires_after_simulated_restart(bot, monkeypatch):
+    """The real 2026-10-01 symptom, reproduced directly: ON_BREAK reaches DONE, gets saved, the bot
+    "restarts" (every piece of in-memory breakout state goes back to its __init__ default, exactly
+    like a fresh Bot object), state is restored from the saved file, and continuation re-entry still
+    fires -- before this fix, the restored run would have started from a blank WAITING on_setup and
+    never fired again for the rest of the day."""
+    _done_on_break(bot)
+    bot.last_continuation_check["ON_BREAK"] = et(9, 34)
+    bot.save_state()
+    saved_today = bot.journal.load_state()
+
+    # simulate a restart: every field start() would normally leave at its __init__ default is wiped
+    bot.overnight = bot.basis = bot.orb = None
+    bot.orb_setup = bot.on_setup = bot.es_setup = None
+    bot.last_orb_candle = bot.last_on_candle = bot.last_es_candle = bot.last_de_candle = None
+    bot.last_continuation_check = {}
+
+    bot._restore_breakout_state(saved_today)
+    assert bot.on_setup is not None and bot.on_setup.state == bot.on_setup.DONE
+    assert bot.last_continuation_check.get("ON_BREAK") == et(9, 34)   # the pacing timer survived too
+
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0   # beats the restored 7624.0 break by 5.0, well past the 0.5 margin
+    # 2 min after the RESTORED 9:34 checkpoint, still inside REENTRY_PAUSE_MIN (5 min) -- proves this
+    # fires on the restored timestamp specifically, not merely because on_setup.state == DONE: if
+    # last_continuation_check had failed to restore (stayed {}), this call would fire immediately.
+    bot.check_continuation_reentry(et(9, 36), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == []
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[1:4] == ("ON_BREAK", BULLISH, "MOMENTUM") and kwargs["strategies"] == ("B",)

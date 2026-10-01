@@ -156,6 +156,18 @@ def test_two_candle_break_done_state_resets_only_on_close_inside_range():
     assert tcb.state == strategy.TwoCandleBreak.WAITING
 
 
+def test_two_candle_break_dict_roundtrip_preserves_armed_state():
+    import json
+    tcb = strategy.TwoCandleBreak(level_high=100.0, level_low=90.0)
+    tcb.update(pd.Series({"open": 99.0, "high": 105.0, "low": 98.0, "close": 101.0}))
+    assert tcb.state == strategy.TwoCandleBreak.ARMED and tcb.direction == strategy.BULLISH
+    restored = strategy.TwoCandleBreak.from_dict(json.loads(json.dumps(tcb.to_dict())))
+    assert restored.to_dict() == tcb.to_dict()
+    # a restored ARMED setup still needs the SAME confirming close to fire, exactly like the original.
+    assert restored.update(pd.Series({"open": 101.0, "high": 103.0, "low": 100.5, "close": 102.0})) == strategy.BULLISH
+    assert restored.state == strategy.TwoCandleBreak.DONE
+
+
 # --------------------------------------------------------------------------------- exit_levels C/D/E
 
 def test_exit_levels_cde_default_to_b():

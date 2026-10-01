@@ -56,6 +56,10 @@ class Levels:
     def shifted(self, basis: float) -> "Levels":
         return Levels(self.high + basis, self.low + basis, self.established_at)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Levels":
+        return cls(high=d["high"], low=d["low"], established_at=datetime.fromisoformat(d["established_at"]))
+
 
 @dataclass(frozen=True)
 class Breakout:
@@ -128,6 +132,21 @@ class OrbSetup:
         self.break_close: float | None = None
         self.candles_since_break = 0
         self.entry_kind: str | None = None   # MOMENTUM or PULLBACK for the entry just fired
+
+    def to_dict(self) -> dict:
+        return {"or_high": self.or_high, "or_low": self.or_low, "state": self.state,
+                "direction": self.direction, "break_close": self.break_close,
+                "candles_since_break": self.candles_since_break, "entry_kind": self.entry_kind}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OrbSetup":
+        obj = cls(d["or_high"], d["or_low"])
+        obj.state = d["state"]
+        obj.direction = d["direction"]
+        obj.break_close = d["break_close"]
+        obj.candles_since_break = d["candles_since_break"]
+        obj.entry_kind = d["entry_kind"]
+        return obj
 
     def _reset(self) -> None:
         self.state = self.WAITING
@@ -598,6 +617,17 @@ class TwoCandleBreak:
         self.level_low = level_low
         self.state = self.WAITING
         self.direction: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"level_high": self.level_high, "level_low": self.level_low,
+                "state": self.state, "direction": self.direction}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TwoCandleBreak":
+        obj = cls(d["level_high"], d["level_low"])
+        obj.state = d["state"]
+        obj.direction = d["direction"]
+        return obj
 
     def _reset(self) -> None:
         self.state = self.WAITING

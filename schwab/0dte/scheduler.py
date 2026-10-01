@@ -101,6 +101,13 @@ class Bot:
         self.orb: strategy.Levels | None = None
         self.orb_setup: strategy.OrbSetup | None = None
         self.on_setup: strategy.OrbSetup | None = None       # overnight levels, ORB-style state machine (A)
+        # overnight_levels_for_signal() can resolve to either ES or SPX-terms levels, and can switch
+        # mid-day (live_es_available() is re-evaluated fresh every call) -- tracking which symbol an
+        # existing on_setup/es_setup was built against lets try_on_break_entry/try_es_break_entry detect
+        # a source flip and rebuild fresh instead of feeding candles from the other instrument's price
+        # scale into a state machine calibrated for the old one.
+        self.on_setup_symbol: str | None = None
+        self.es_setup_symbol: str | None = None
         self.last_on_candle: datetime | None = None
         self.last_candle: datetime | None = None
         self.last_orb_candle: datetime | None = None
@@ -159,6 +166,7 @@ class Bot:
             log.info("Restored state for %s: %s", self.today, saved_today["day"])
             if self.f is not None:
                 self.f.restore(saved_today.get("f"), now)
+            self._restore_breakout_state(saved_today)
         else:
             self.risk = RiskManager(acct["equity"])
         positions = self.broker.get_positions()
@@ -174,6 +182,64 @@ class Bot:
         self.broker.record_daily_equity()
         self.save_state()
         self.run(now)
+
+    def _restore_breakout_state(self, saved_today: dict) -> None:
+        """Restore the overnight/opening-range levels, the breakout state machines they drive
+        (orb_setup/on_setup/es_setup), and the last-processed-candle pointers so a restart continues
+        exactly where the previous run left off instead of replaying the whole day from scratch
+        through brand-new (WAITING) state machines. See the 2026-10-01 note in save_state().
+
+        Every reconstruction below is best-effort: a malformed or unexpectedly-shaped saved value (an
+        old schema, a hand-edited file, a future field rename) is logged and skipped rather than raised
+        -- falling back to that one field's normal __init__ default (fresh/unset), exactly the same
+        degraded-but-running outcome a persona had before this method existed, never a crash that takes
+        the whole process down on restart."""
+        levels = saved_today.get("levels") or {}
+        try:
+            if levels.get("overnight"):
+                self.overnight = strategy.Levels.from_dict(levels["overnight"])
+            self.basis = levels.get("basis")
+            if levels.get("orb"):
+                self.orb = strategy.Levels.from_dict(levels["orb"])
+        except (KeyError, TypeError, ValueError) as e:
+            log.warning("Could not restore saved levels (%s: %s) -- will be refetched fresh.",
+                       type(e).__name__, e, extra={"keep": True})
+        breakouts = saved_today.get("breakouts") or {}
+        self.news_blackout_was_active = bool(breakouts.get("news_blackout_was_active", False))
+        for attr, symbol_attr, cls, key in (
+            ("orb_setup", None, strategy.OrbSetup, "orb_setup"),
+            ("on_setup", "on_setup_symbol", strategy.OrbSetup, "on_setup"),
+            ("es_setup", "es_setup_symbol", strategy.TwoCandleBreak, "es_setup"),
+        ):
+            raw = breakouts.get(key)
+            if not raw:
+                continue
+            try:
+                setattr(self, attr, cls.from_dict(raw))
+                if symbol_attr is not None:
+                    setattr(self, symbol_attr, breakouts.get(symbol_attr))
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning("Could not restore %s from saved state (%s: %s) -- starting it fresh instead.",
+                           key, type(e).__name__, e, extra={"keep": True})
+        for attr in ("last_orb_candle", "last_on_candle", "last_es_candle", "last_de_candle", "last_candle"):
+            v = breakouts.get(attr)
+            if not v:
+                continue
+            try:
+                setattr(self, attr, datetime.fromisoformat(v))
+            except (TypeError, ValueError) as e:
+                log.warning("Could not restore %s (%r): %s", attr, v, e, extra={"keep": True})
+        try:
+            self.last_continuation_check = {k: datetime.fromisoformat(v)
+                                            for k, v in (breakouts.get("last_continuation_check") or {}).items()}
+        except (TypeError, ValueError) as e:
+            log.warning("Could not restore last_continuation_check: %s", e, extra={"keep": True})
+            self.last_continuation_check = {}
+        if breakouts:
+            log.info("Restored breakout state: ORB=%s ON_BREAK=%s ES_BREAK=%s",
+                     self.orb_setup.state if self.orb_setup else None,
+                     self.on_setup.state if self.on_setup else None,
+                     self.es_setup.state if self.es_setup else None)
 
     def run(self, now: datetime) -> None:
         if not market_data.is_trading_day(now) and not self.pm.positions:
@@ -281,8 +347,11 @@ class Bot:
         if self.orb is None:
             self.orb = market_data.get_opening_range(now)
             self.log_levels("OPENING RANGE", self.orb)
-            if self.orb is not None:
-                self.orb_setup = strategy.OrbSetup(self.orb.high, self.orb.low)
+        # orb_setup is checked separately from orb itself (not nested in the fetch above) so a restart
+        # that restores orb_setup from saved state never gets it silently overwritten with a fresh
+        # WAITING one just because self.orb was also freshly fetched or restored this same call.
+        if self.orb is not None and self.orb_setup is None:
+            self.orb_setup = strategy.OrbSetup(self.orb.high, self.orb.low)
 
     @staticmethod
     def log_levels(label: str, levels: strategy.Levels | None) -> None:
@@ -357,8 +426,13 @@ class Bot:
         if found is None:
             return
         levels, symbol = found
-        if self.on_setup is None:
+        if self.on_setup is None or self.on_setup_symbol != symbol:
+            if self.on_setup is not None:
+                log.warning("ON_BREAK level source switched %s -> %s: rebuilding on_setup fresh.",
+                           self.on_setup_symbol, symbol, extra={"keep": True})
             self.on_setup = strategy.OrbSetup(levels.high, levels.low)
+            self.on_setup_symbol = symbol
+            self.last_on_candle = None
         candles = spx_candles if symbol == config.SPX_SYMBOL else \
             market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
         candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
@@ -394,8 +468,13 @@ class Bot:
         if found is None:
             return
         levels, symbol = found
-        if self.es_setup is None:
+        if self.es_setup is None or self.es_setup_symbol != symbol:
+            if self.es_setup is not None:
+                log.warning("ES_BREAK level source switched %s -> %s: rebuilding es_setup fresh.",
+                           self.es_setup_symbol, symbol, extra={"keep": True})
             self.es_setup = strategy.TwoCandleBreak(levels.high, levels.low)
+            self.es_setup_symbol = symbol
+            self.last_es_candle = None
         candles = spx_candles if symbol == config.SPX_SYMBOL else \
             market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
         candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
@@ -957,6 +1036,31 @@ class Bot:
             "positions": {key: p.to_dict() for key, p in self.pm.positions.items()},
             "acted": sorted(self.acted),
             "levels": {"overnight": self.overnight, "basis": self.basis, "orb": self.orb},
+            # 2026-10-01: the breakout state machines themselves (plus the last-processed-candle
+            # pointers that keep a restart from re-replaying the whole day through them) were never
+            # persisted here -- only "levels" above was, and even that was never restored in start().
+            # A restart wiped orb_setup/on_setup/es_setup back to fresh WAITING state, silently killing
+            # that setup's entries (including CONTINUATION_REENTRY) for the rest of the day unless a
+            # brand-new breakout happened to form after the restart. Confirmed live on 2026-10-01: all 9
+            # personas restarted at the same 4 timestamps that morning, and only one of them kept firing
+            # continuation re-entries afterward -- the other 8 went silent on that setup for the rest of
+            # the day. Persisting and restoring the real state machine (not just its source levels) and
+            # the last-processed-candle pointers turns a restart into a true continuation instead of a
+            # from-scratch replay.
+            "breakouts": {
+                "orb_setup": self.orb_setup.to_dict() if self.orb_setup is not None else None,
+                "on_setup": self.on_setup.to_dict() if self.on_setup is not None else None,
+                "es_setup": self.es_setup.to_dict() if self.es_setup is not None else None,
+                # which overnight-level source (ES vs SPX-terms) on_setup/es_setup were each built
+                # against, so a restore can detect overnight_levels_for_signal() having since resolved
+                # to a different source and rebuild fresh rather than feed it the wrong price scale.
+                "on_setup_symbol": self.on_setup_symbol, "es_setup_symbol": self.es_setup_symbol,
+                "last_orb_candle": self.last_orb_candle, "last_on_candle": self.last_on_candle,
+                "last_es_candle": self.last_es_candle, "last_de_candle": self.last_de_candle,
+                "last_candle": self.last_candle,
+                "last_continuation_check": dict(self.last_continuation_check),
+                "news_blackout_was_active": self.news_blackout_was_active,
+            },
         }
         if self.f is not None:
             state["f"] = self.f.to_state()

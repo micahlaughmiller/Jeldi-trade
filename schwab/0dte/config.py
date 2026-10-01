@@ -92,6 +92,18 @@ ORB_SETUP_TIMEOUT_CANDLES = 6
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
 
+# 2026-10-01: a real live incident -- the SPX opening range broke hard downside at 10:00 ET and every
+# persona stayed completely silent (no entries, no rejections, nothing in the journal). Root cause:
+# yfinance's yf.download("^GSPC", ...) can come back empty with NO exception raised (Yahoo API
+# throttling/outage; yfinance prints its own "possibly delisted" message internally, which is not the
+# same as our code seeing a Python exception) -- _download's try/except never fires, the empty result
+# gets cached and returned identically to a legitimate read, and orb_signal() silently iterates zero
+# candles forever. Identical to Alpaca/0DTE/config.py -- see that file for the full rationale
+# (market_data._download/_report_feed_health).
+DATA_DOWNLOAD_RETRIES = 2
+DATA_DOWNLOAD_RETRY_SEC = 1.0
+DATA_FEED_REMINDER_SEC = 120
+
 # ES_TO_SPX: ES overnight levels + (SPX - ES) basis, compared against live SPX candles -- or, once
 # market_data.live_es_available() is true (this folder's own Schwab auth already covers it), ES's
 # own candles directly for the real lead-time edge (scheduler.overnight_levels_for_signal).

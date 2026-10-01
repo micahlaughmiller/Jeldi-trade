@@ -18,6 +18,9 @@ log = logging.getLogger(__name__)
 
 _CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
 _COLUMNS = ["open", "high", "low", "close", "volume"]
+# 2026-10-01: per-feed (symbol, interval) health tracking for _download's loud failure logging --
+# {"healthy": bool, "last_notice": monotonic float} -- see config.py's DATA_DOWNLOAD_RETRIES section.
+_FEED_STATE: dict[tuple, dict] = {}
 
 # 2026-09-25: optional real-time ES via a Schwab account with futures data entitlement, reusing the
 # same schwab-py client the Schwab broker folder already authenticates with (cross-broker DATA-only
@@ -102,17 +105,52 @@ def _now(now: datetime | None) -> datetime:
     return now or datetime.now(config.ET)
 
 
+def _report_feed_health(feed_key: tuple, healthy: bool, err: Exception | None) -> None:
+    """Log a feed's up/down transitions loudly (ERROR, bypasses the console's keep-tag filter since
+    ERROR+ always passes) instead of letting a dead data source look identical to a quiet market.
+    Re-announces an ongoing outage at most every DATA_FEED_REMINDER_SEC rather than once per tick."""
+    state = _FEED_STATE.setdefault(feed_key, {"healthy": True, "last_notice": 0.0})
+    mono = _time.monotonic()
+    symbol, interval = feed_key
+    if not healthy:
+        if state["healthy"] or mono - state["last_notice"] >= config.DATA_FEED_REMINDER_SEC:
+            log.error("DATA FEED DOWN: %s %s returned no data after %d attempt(s)%s",
+                     symbol, interval, config.DATA_DOWNLOAD_RETRIES, f" ({err})" if err else "",
+                     extra={"keep": True})
+            state["last_notice"] = mono
+    elif not state["healthy"]:
+        log.warning("DATA FEED RECOVERED: %s %s", symbol, interval, extra={"keep": True})
+    state["healthy"] = healthy
+
+
 def _download(symbol: str, period: str, interval: str, prepost: bool) -> pd.DataFrame:
+    """2026-10-01: yfinance can come back EMPTY with no exception raised at all (Yahoo throttling/
+    outage -- yfinance prints its own "possibly delisted" message internally, which is not the same
+    as a Python exception reaching us), so a plain try/except around yf.download() is not enough to
+    detect a dead feed -- see config.py's DATA_DOWNLOAD_RETRIES section for the real incident this
+    fixes. A short, in-call retry absorbs a one-off blip; if every attempt still comes back empty,
+    _report_feed_health logs it LOUDLY (ERROR, console-visible) instead of silently caching an empty
+    result and moving on as if nothing happened.
+    """
     key = (symbol, period, interval, prepost)
     hit = _CACHE.get(key)
     if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
         return hit[1]
-    try:
-        raw = yf.download(symbol, period=period, interval=interval, prepost=prepost,
-                          auto_adjust=False, progress=False, threads=False)
-    except Exception as e:
-        log.warning("yfinance download failed for %s %s: %s", symbol, interval, e)
+    raw, last_err = None, None
+    for attempt in range(1, config.DATA_DOWNLOAD_RETRIES + 1):
+        try:
+            raw = yf.download(symbol, period=period, interval=interval, prepost=prepost,
+                              auto_adjust=False, progress=False, threads=False)
+        except Exception as e:
+            last_err = e
+            raw = None
+        if raw is not None and not raw.empty:
+            break
+        if attempt < config.DATA_DOWNLOAD_RETRIES:
+            _time.sleep(config.DATA_DOWNLOAD_RETRY_SEC)
+    if raw is None:
         raw = pd.DataFrame()
+    _report_feed_health((symbol, interval), not raw.empty, last_err)
     df = _normalize(raw)
     _CACHE[key] = (_time.monotonic(), df)
     return df

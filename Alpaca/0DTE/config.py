@@ -88,6 +88,25 @@ ORB_SETUP_TIMEOUT_CANDLES = 6
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
 
+# 2026-10-01: a real live incident -- the SPX opening range broke hard downside at 10:00 ET and every
+# persona stayed completely silent (no entries, no rejections, nothing in the journal). Root cause:
+# yfinance's yf.download("^GSPC", ...) can come back empty with NO exception raised (Yahoo API
+# throttling/outage; yfinance prints its own "possibly delisted" message internally, which is not the
+# same as our code seeing a Python exception) -- _download's try/except never fires, the empty result
+# gets cached and returned identically to a legitimate read, and orb_signal() silently iterates zero
+# candles forever. No log line, no journal event, nothing to distinguish "genuinely quiet market" from
+# "the whole data feed is down" -- see market_data._download's DATA FEED DOWN/RECOVERED logging.
+# Retries are immediate (within one _download call, before the result is cached) and short on purpose:
+# TICK_SECONDS=1 means _download runs synchronously in the hot path, and a long retry here would stall
+# every signal check behind it; a feed that's still down after this many quick attempts gets the loud
+# failure logged instead of one process blocking everyone's tick.
+DATA_DOWNLOAD_RETRIES = 2
+DATA_DOWNLOAD_RETRY_SEC = 1.0
+# While a feed stays down, don't repeat the ERROR on every single tick (TICK_SECONDS=1 would spam the
+# console) -- but a one-time log at the moment it broke is easy to scroll past over a 30+ minute
+# outage, so re-announce "still down" at most this often as long as it hasn't recovered.
+DATA_FEED_REMINDER_SEC = 120
+
 BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 
 # Every signal opens two independent spreads: A sells the ITM spread, B sells an OTM spread

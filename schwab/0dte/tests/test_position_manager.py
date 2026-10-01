@@ -209,6 +209,11 @@ def test_exit_row_records_trigger_and_slippage(pm, broker):
     # apart from a real script problem.
     assert row["pnl_at_trigger"] == pytest.approx(-61.00)
     assert row["pnl"] == pytest.approx(-65.00)
+    # 2026-10-01: a third diagnostic P/L -- trigger_price + REALISTIC_CLOSE_SLIPPAGE (0.05), modeling
+    # a realistic real-world close rather than either the zero-slippage ideal or the paper sim's
+    # actual (here, worse) fill: 3.61 + 0.05 = 3.66 -> (3.00-3.66)*100 = -66.00.
+    assert row["realistic_exit_price"] == pytest.approx(3.66)
+    assert row["pnl_realistic"] == pytest.approx(-66.00)
     assert row["entry_mid"] == 3.05 and row["entry_slippage"] == pytest.approx(0.05)
     # 2026-09-30: prev-tick diagnostic fields (a real live anomaly -- a reported price jumped an
     # implausible amount in a single tick right before an exit). prev_tick_price is current_price as
@@ -493,7 +498,8 @@ def test_state_roundtrip_and_trades_csv(pm, broker, journal, monkeypatch):
     journal.trade(fills[0])
     text = journal.trades_path.read_text().splitlines()
     assert text[0].startswith("date,strategy,entry_time,exit_time,direction")
-    assert text[0].endswith("runner,trigger_price,exit_slippage,pnl_at_trigger,entry_mid,entry_slippage,"
+    assert text[0].endswith("runner,trigger_price,exit_slippage,pnl_at_trigger,realistic_exit_price,"
+                           "pnl_realistic,entry_mid,entry_slippage,"
                            "prev_tick_price,prev_tick_pnl,prev_tick_jump,ticker,expiration,mfe,mae,scanner_score")
     assert text[1].startswith("2026-09-17,A,")
     assert "PROFIT_TARGET" in text[1] and ",n," in text[1]

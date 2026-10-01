@@ -13,7 +13,8 @@ TRADE_FIELDS = [
     "date", "strategy", "entry_time", "exit_time", "direction", "setup", "right",
     "short_strike", "long_strike", "width", "qty", "entry_credit", "exit_price",
     "pnl", "exit_reason", "runner",
-    "trigger_price", "exit_slippage", "pnl_at_trigger", "entry_mid", "entry_slippage",
+    "trigger_price", "exit_slippage", "pnl_at_trigger", "realistic_exit_price", "pnl_realistic",
+    "entry_mid", "entry_slippage",
     "prev_tick_price", "prev_tick_pnl", "prev_tick_jump",
     "ticker", "expiration", "mfe", "mae", "scanner_score",
 ]

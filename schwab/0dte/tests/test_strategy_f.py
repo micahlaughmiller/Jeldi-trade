@@ -123,7 +123,7 @@ def test_orb_only_news_mode_admits_stock_orb(monkeypatch):
 def test_only_astra_opts_into_f():
     overrides = getattr(config, "PERSONA_OVERRIDES", {})          # Alpaca personas; the Schwab twin has none
     if overrides:
-        assert overrides["ASTRA"]["STRATEGIES"] == ("A", "B", "F")
+        assert overrides["ASTRA"]["STRATEGIES"] == ("B", "F")   # 2026-10-01: A removed
     assert all("F" not in o.get("STRATEGIES", ()) for name, o in overrides.items() if name != "ASTRA")
     assert config.STOCK_STRATEGIES == ("F",) and config.DAILY_LOSS_LIMIT_EXEMPT == ("F",)
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None

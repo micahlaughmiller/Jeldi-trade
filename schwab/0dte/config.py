@@ -63,6 +63,13 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
+# broker fill swings wildly from the trigger price during fast moves. pnl_realistic
+# (position_manager._close) models a realistic real-world close: entry_credit vs. (trigger_price +
+# REALISTIC_CLOSE_SLIPPAGE), a flat add regardless of direction since every position here is a credit
+# spread and closing one is always a BUY -- diagnostic/reporting only, never the real pnl/realized_pnl
+# the bot's own risk management tracks. Identical to Alpaca/0DTE/config.py.
+REALISTIC_CLOSE_SLIPPAGE = 0.05
 LOG_DIR = "logs"
 
 UNDERLYING = "SPX"
@@ -134,8 +141,11 @@ BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 
 # Every signal opens two independent spreads: A sells the ITM spread, B sells an OTM spread
 # whose short strike sits one expected move (ATM straddle) away from spot.
-# 2026-09-25: STRATEGIES stays the default two (A/B); ALL_STRATEGIES is the full catalog.
-STRATEGIES = ("A", "B")
+# 2026-10-01: Strategy A removed -- 0% win rate across every Alpaca persona and every day of real
+# trading data analyzed (41/41 losses, -$8,660), with no day ever net positive, meeting the user's own
+# explicit bar. A's own code is deliberately left in place, unused, same as OVERNIGHT's retirement --
+# reversible if ever revisited, not deleted. Identical to Alpaca/0DTE/config.py.
+STRATEGIES = ("B",)
 # Strategies that trade single-stock option roots with one position per ticker. They are excluded from
 # every SPX signal fan-out (strategy.spx_strategies) and from SPXW adoption; cards append the ticker.
 # F never runs on Schwab (no persona override here); the shared modules just need the keys.

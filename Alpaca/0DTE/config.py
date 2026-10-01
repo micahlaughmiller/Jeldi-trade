@@ -51,6 +51,16 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
+# broker fill (exit_price) swings wildly from the trigger price during fast moves (confirmed from real
+# data: 26% of all realized losses were pure execution slippage, skewed adverse, concentrated in
+# Strategy A). A real account closing (buying back) a credit spread tends to land close to the last
+# quote plus a small, realistic premium, not wherever the paper sim's escalating-limit retry happens
+# to catch up. pnl_realistic (position_manager._close) models that: entry_credit vs. (trigger_price +
+# REALISTIC_CLOSE_SLIPPAGE), a flat add regardless of direction since every position here is a credit
+# spread and closing one is always a BUY -- a diagnostic/reporting figure only, never the real pnl/
+# realized_pnl the bot's own risk management (daily loss limit, consecutive losses) tracks.
+REALISTIC_CLOSE_SLIPPAGE = 0.05
 LOG_DIR = "logs"
 
 UNDERLYING = "SPX"
@@ -148,11 +158,17 @@ BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 
 # Every signal opens two independent spreads: A sells the ITM spread, B sells an OTM spread
 # whose short strike sits one expected move (ATM straddle) away from spot.
-# 2026-09-25: STRATEGIES stays the default two (A/B) so every existing persona is unaffected;
-# a persona opts into C/D/E by overriding STRATEGIES in PERSONA_OVERRIDES. ALL_STRATEGIES is the
+# 2026-10-01: Strategy A removed from every persona's default active set -- 0% win rate across every
+# persona and every day of real trading data analyzed (41/41 losses, -$8,660), with no day ever net
+# positive, meeting the user's own explicit bar ("if it doesn't return positive, remove it"). A's own
+# code (select_strikes_a, A_BASE_TUNING, A_CREDIT_BIAS_BY_WIDTH, LIMITS_BY_STRATEGY["A"],
+# SETUPS_BY_STRATEGY["A"], etc.) is deliberately left in place, unused, same as OVERNIGHT's retirement
+# on 2026-09-24 -- reversible if ever revisited, not deleted. ALL_STRATEGIES/STRATEGY_LABELS keep A's
+# registry entry for the same reason. A persona opts into C/D/E by overriding STRATEGIES in
+# PERSONA_OVERRIDES (CDE_STRATEGIES below, A also removed from that tuple). ALL_STRATEGIES is the
 # full catalog (used for things that must know about every strategy that exists, not just the
 # ones a given persona is currently running).
-STRATEGIES = ("A", "B")
+STRATEGIES = ("B",)
 # Strategies that trade single-stock option roots with one position per ticker. They are excluded from
 # every SPX signal fan-out (strategy.spx_strategies) and from SPXW adoption; cards append the ticker.
 STOCK_STRATEGIES = ("F",)
@@ -605,11 +621,13 @@ def _a(momentum_only=False, **extra) -> dict:
     return out
 
 
-CDE_STRATEGIES = ("A", "B", "C", "D", "E")
+# 2026-10-01: A removed (see STRATEGIES above) -- CDE_STRATEGIES is now really "BCDE_STRATEGIES" but
+# keeps its name to avoid touching every PERSONA_OVERRIDES line below that references it.
+CDE_STRATEGIES = ("B", "C", "D", "E")
 
 PERSONA_OVERRIDES: dict[str, dict] = {
-    # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. Nothing else about ASTRA changes.
-    "ASTRA":  {"STRATEGIES": ("A", "B", "F")},
+    # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. 2026-10-01: A removed.
+    "ASTRA":  {"STRATEGIES": ("B", "F")},
     # momentum-only for A (one persona from each existing floor/timer method, both width tiers)
     "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
     # 2026-09-25: ELENA and SARAH picked at random (random.sample over every remaining non-ASTRA,

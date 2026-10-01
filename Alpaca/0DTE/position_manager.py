@@ -691,6 +691,15 @@ class PositionManager:
         # fill behavior; if pnl_at_trigger is consistently much better than the real pnl, the gap is
         # real exit-order slippage, worth revisiting regardless of paper vs. live.
         pnl_at_trigger = round((p.entry_credit - spread_price) * 100 * fill_qty, 2)
+        # 2026-10-01: a THIRD diagnostic P/L -- user's own read on real-world execution: closing
+        # (buying back) a credit spread in a real account tends to land close to the last quote plus a
+        # small, realistic premium, not wherever the paper sim's escalating-limit retry happens to
+        # land. realistic_exit_price models that directly: trigger_price + REALISTIC_CLOSE_SLIPPAGE (a
+        # flat add, not direction-aware, since every position here is a credit spread and closing one
+        # is always a buy). This is meant as a cleaner proxy for likely real-world P/L across a day's
+        # strategy performance -- NOT the real pnl/realized_pnl the bot's own risk management tracks.
+        realistic_exit_price = round(spread_price + config.REALISTIC_CLOSE_SLIPPAGE, 2)
+        pnl_realistic = round((p.entry_credit - realistic_exit_price) * 100 * fill_qty, 2)
         # 2026-09-30: diagnostic instrumentation for a live anomaly -- ASTRA's reported price jumped
         # from 5.21 to ~6.10 in the ONE TICK between reporting and exiting, too large a move for that
         # second's real underlying action. prev_price is current_price as of the PRIOR tick (captured
@@ -711,6 +720,7 @@ class PositionManager:
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
             "trigger_price": spread_price, "exit_slippage": exit_slippage, "pnl_at_trigger": pnl_at_trigger,
+            "realistic_exit_price": realistic_exit_price, "pnl_realistic": pnl_realistic,
             "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
             "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
@@ -720,8 +730,10 @@ class PositionManager:
             "direction_match": scan.get("direction_match"),
         }
         log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (at trigger would've been "
-                    "%.2f) | prev-tick %.2f (jump %+.2f, pnl would've been %.2f) | position realized %.2f, %d left",
+                    "%.2f, realistic %.2f) | prev-tick %.2f (jump %+.2f, pnl would've been %.2f) | "
+                    "position realized %.2f, %d left",
                     key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, pnl_at_trigger,
+                    pnl_realistic,
                     prev_price if prev_price is not None else float("nan"),
                     prev_tick_jump if prev_tick_jump is not None else float("nan"),
                     prev_tick_pnl if prev_tick_pnl is not None else float("nan"),

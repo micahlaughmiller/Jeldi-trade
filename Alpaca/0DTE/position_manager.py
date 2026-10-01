@@ -353,6 +353,11 @@ class PositionManager:
         ceiling the current reading is forced through regardless, logged distinctly (QUOTE_JUMP_FORCED)
         so a persistently noisy feed shows up rather than silently degrading protection.
         QUOTE_JUMP_SANITY_PCT=None (or 0) disables the gate entirely for that strategy.
+
+        2026-10-01: an ADVERSE move (price rising -- less profit) on a position that already has
+        profit protection armed (p.stage1_armed/stage2_armed) skips the hold entirely, unconditionally
+        -- see the inline comment above `armed_and_adverse` for why holding would otherwise undermine
+        the very floor/trail the staged exit system depends on to react quickly.
         """
         if p.last_tick_at is None:
             p.last_tick_at = now
@@ -371,7 +376,20 @@ class PositionManager:
         nominal_ticks = max(1.0, min(raw_nominal_ticks, max_nominal_ticks))
         max_jump = max(floor, pct * p.width) * nominal_ticks
         jump = abs(spread_price - p.current_price)
-        if jump <= max_jump:
+        # 2026-10-01: once a position has ANY profit protection armed (stage1/stage2's STAGED_EXIT
+        # fields), an ADVERSE move (spread_price rising -- less profit, more loss) must never be held
+        # for confirmation: a floor/trail exists specifically to react fast to exactly this, and
+        # delaying it works directly against that design. Real live symptom this fixes: a position
+        # 30+ cents in profit (stage2 armed, a $0.25 floor already active) closing for a LOSS 5
+        # seconds to 2 minutes later -- the floor never got a chance to catch the real reversal
+        # because this gate was still holding the tick pending confirmation while real price kept
+        # sliding past the floor (and the raw stop) during the hold. A bad print causing an early,
+        # unnecessary floor/trail exit costs far less than a genuine reversal MISSING the floor it was
+        # supposed to be caught by -- the floor/trail price is already the system's own pre-committed
+        # "this is an acceptable exit" level, unlike the original anomaly this gate was built for (no
+        # protection had armed yet, so a bad-print exit had no floor to fall back on at all).
+        armed_and_adverse = (p.stage1_armed or p.stage2_armed) and spread_price > p.current_price
+        if jump <= max_jump or armed_and_adverse:
             p.pending_quote = None
             p.pending_quote_since = None
             p.stuck_since = None

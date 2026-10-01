@@ -680,6 +680,17 @@ class PositionManager:
         # Fill quality: positive slippage = the fill cost us relative to the quote mid that triggered it.
         exit_slippage = round(exit_price - spread_price, 2)
         entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
+        # 2026-10-01: a second, diagnostic P/L -- what this trade's P/L would have been with a
+        # PERFECT fill exactly at trigger_price (the quote that triggered the exit decision), zero
+        # execution slippage. User's own words: massive slippage between a trigger well in the money
+        # and an actual close in the loss, suspected to be a paper-trading fill-engine artifact rather
+        # than something a real live account would do (a real fill tends to land close to the last
+        # print, not wherever the escalating-limit retry finally catches up). Comparing pnl (real,
+        # broker fill) against pnl_at_trigger (hypothetical, zero-slippage) isolates execution quality
+        # specifically -- if they track closely, the script's DECISION was fine and this is paper-sim
+        # fill behavior; if pnl_at_trigger is consistently much better than the real pnl, the gap is
+        # real exit-order slippage, worth revisiting regardless of paper vs. live.
+        pnl_at_trigger = round((p.entry_credit - spread_price) * 100 * fill_qty, 2)
         # 2026-09-30: diagnostic instrumentation for a live anomaly -- ASTRA's reported price jumped
         # from 5.21 to ~6.10 in the ONE TICK between reporting and exiting, too large a move for that
         # second's real underlying action. prev_price is current_price as of the PRIOR tick (captured
@@ -699,7 +710,7 @@ class PositionManager:
             "short_strike": p.short_strike, "long_strike": p.long_strike, "width": p.width,
             "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
             "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
-            "trigger_price": spread_price, "exit_slippage": exit_slippage,
+            "trigger_price": spread_price, "exit_slippage": exit_slippage, "pnl_at_trigger": pnl_at_trigger,
             "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
             "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
             "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
@@ -708,9 +719,9 @@ class PositionManager:
             "scanner_score": scan.get("score"), "scanner_direction": scan.get("scanner_direction"),
             "direction_match": scan.get("direction_match"),
         }
-        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f | prev-tick %.2f (jump %+.2f, "
-                    "pnl would've been %.2f) | position realized %.2f, %d left",
-                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl,
+        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (at trigger would've been "
+                    "%.2f) | prev-tick %.2f (jump %+.2f, pnl would've been %.2f) | position realized %.2f, %d left",
+                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, pnl_at_trigger,
                     prev_price if prev_price is not None else float("nan"),
                     prev_tick_jump if prev_tick_jump is not None else float("nan"),
                     prev_tick_pnl if prev_tick_pnl is not None else float("nan"),

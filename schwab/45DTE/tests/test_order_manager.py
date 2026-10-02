@@ -463,15 +463,29 @@ class TestTrailFloor:
         om.maintain()
         assert len(om.positions) == 1 and pos["profit_floor_armed"] is False
 
-    def test_no_dte_exit_and_no_max_loss_exit_but_the_breaker_still_counts(self, env):
+    def test_no_dte_exit_and_no_max_loss_exit_and_a_mark_does_not_feed_the_breaker(self, env):
         clock, broker, log, om, tmp = env
         pos = self._open_position(env, credit=1.50, qty=1)
         clock.now = datetime.combine(EXP - timedelta(days=3), datetime.min.time(), tzinfo=ET).replace(hour=10)
         set_chain(broker, 6.00, 1.30)   # price 4.70 -- past the 90%-of-max-loss mark
         om.maintain()
-        assert len(om.positions) == 1 and pos["max_loss_hit"] is True
-        assert om.risk.max_loss_hits == 1
+        assert len(om.positions) == 1 and pos["max_loss_hit"] is True      # flagged for the report ...
+        assert om.risk.max_loss_hits == 0                                  # ... but only a REALIZED loss counts
         assert not any(c[0] == "close_spread_at_market" for c in broker.calls)
+
+    def test_a_spread_that_dips_to_max_loss_and_recovers_never_moves_the_breaker(self, env):
+        clock, broker, log, om, tmp = env
+        for sym in ("AAA", "BBB", "CCC"):                                  # three would have tripped the old mark-based count
+            oid = om.submit_entry(spec(1.50, symbol=sym), 1)
+            broker.fill_order(oid, 1.50)
+            om.poll_entries()
+            set_chain(broker, 6.00, 1.30, symbol=sym)                      # 4.70: at the max-loss line
+        om.maintain()
+        assert len(om.positions) == 3 and om.risk.max_loss_hits == 0 and not om.risk.breaker_tripped
+        for sym in ("AAA", "BBB", "CCC"):
+            set_chain(broker, 2.00, 1.30, symbol=sym)                      # 0.70: recovered (a winner past the target)
+        om.maintain()
+        assert om.risk.max_loss_hits == 0 and not om.risk.breaker_tripped
 
     def test_giveback_that_leaves_under_the_minimum_profit_rides_instead_of_selling(self, env):
         clock, broker, log, om, tmp = env
@@ -578,6 +592,22 @@ class TestExpiredPositions:
                              "expiration": None, "strike": None, "right": None}]
         om.maintain()
         assert om.positions == [] and log.counts["EXPIRED_SHARES"] == 1
+
+    def test_expiry_at_the_max_loss_line_is_a_realized_hit_and_expiry_above_it_is_not(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._expired(env)
+        pos["current_price"], pos["unrealized_pl"] = 4.70, -620.0           # last mark before expiry: past 4.66 (90% of max loss)
+        broker.positions = []
+        om.maintain()
+        assert om.positions == [] and om.risk.max_loss_hits == 1
+
+    def test_expiry_with_a_last_mark_short_of_the_line_does_not_count(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._expired(env)
+        pos["current_price"], pos["unrealized_pl"] = 2.50, -180.0
+        broker.positions = []
+        om.maintain()
+        assert om.positions == [] and om.risk.max_loss_hits == 0
 
     def test_a_broker_error_while_checking_does_not_book_it(self, env):
         clock, broker, log, om, tmp = env

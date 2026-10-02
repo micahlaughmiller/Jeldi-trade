@@ -104,7 +104,7 @@ where you launch from. Ctrl+C saves state and exits.
    max-loss stop** (`EXIT_DTE_ENABLED`/`MAX_LOSS_EXIT` are off): an under-water spread rides to
    the target or to expiration, where the broker settles it (booked `expired`, P&L unknown, with
    the last mark kept as an estimate; shares left by assignment are flagged `EXPIRED_SHARES`).
-   Each max-loss *mark* still counts toward the circuit breaker.
+   Only a *realized* max loss counts toward the circuit breaker (see below).
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -114,11 +114,13 @@ where you launch from. Ctrl+C saves state and exits.
 
 ### Circuit breaker
 
-Three spreads hitting max loss (current price >= credit + 0.9 x (5 - credit), or a
-realized loss >= 90 % of max loss) trip the breaker: no new entries until you restart
-with `--reset-breaker`. Existing positions are still managed. On Schwab (no max-loss stop)
-a hit is recorded when the spread's *mark* first reaches that level, even if it later
-recovers. State persists in `logs/state.json`.
+Three spreads with a **realized** max loss trip the breaker: no new entries until you
+restart with `--reset-breaker`. A realized max loss is a close with a debit >= credit + 0.9 x
+(width - credit), or a spread that expired with its last mark at or beyond that level (the
+exact settlement is the broker's, so the last mark stands in). A spread whose mark merely
+touches that level and then recovers does not count -- on Schwab there is no max-loss stop,
+so a spread can dip there and come back. Existing positions are still managed. State
+persists in `logs/state.json`.
 
 ### Manual overrides (thinkorswim)
 

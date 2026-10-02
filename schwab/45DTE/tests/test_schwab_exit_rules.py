@@ -65,5 +65,5 @@ def test_a_loser_rides_with_no_stop_and_no_dte_exit(env):
     clock.now = datetime.combine(EXP - timedelta(days=2), datetime.min.time(), tzinfo=ET).replace(hour=10)
     set_chain(broker, 6.00, 1.30)    # 4.70: past the 90%-of-max-loss mark, 2 DTE
     om.maintain()
-    assert len(om.positions) == 1 and pos["max_loss_hit"] is True and om.risk.max_loss_hits == 1
+    assert len(om.positions) == 1 and pos["max_loss_hit"] is True and om.risk.max_loss_hits == 0   # a mark is not a loss
     assert not any(c[0] == "close_spread_at_market" for c in broker.calls)

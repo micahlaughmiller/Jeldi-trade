@@ -73,7 +73,7 @@ where you launch from. Ctrl+C saves state and exits.
    mid) for P&L, then apply the exit rules: exit at market when DTE <= 7
    (`EXIT_DTE_ENABLED`), when the spread trades at/beyond 90 % of max loss (`MAX_LOSS_EXIT`),
    or on the profit floor (arms 85 % of the way to the target, then a fixed floor at 30 % of
-   max profit). Each max-loss hit counts toward the circuit breaker.
+   max profit). A max-loss exit whose realized debit is at/beyond that level counts toward the circuit breaker.
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -83,10 +83,11 @@ where you launch from. Ctrl+C saves state and exits.
 
 ### Circuit breaker
 
-Three spreads hitting max loss (current price >= credit + 0.9 x (5 - credit), or a
-realized loss >= 90 % of max loss) trip the breaker: no new entries until you restart
-with `--reset-breaker`. Existing positions are still managed. State persists in
-`logs/state.json`.
+Three spreads with a **realized** max loss (a close with a debit >= credit + 0.9 x
+(width - credit), or a spread that expired with its last mark at or beyond that level) trip the
+breaker: no new entries until you restart with `--reset-breaker`. A mark that merely touches
+that level and recovers does not count. Existing positions are still managed. State persists
+in `logs/state.json`.
 
 ### Manual overrides (thinkorswim)
 

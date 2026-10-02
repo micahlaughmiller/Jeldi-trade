@@ -96,9 +96,10 @@ EXIT_DTE = 7
 # 2026-10-02, Schwab only (the user's call after a position was stopped out at max loss with plenty of
 # time left to recover): the ONLY exits are (1) the GTC close at PROFIT_TARGET_PCT of max profit and
 # (2) the tick trail below. No DTE force-close and no max-loss stop -- a position that is under water
-# rides to the profit target or to expiration. Max-loss hits are still counted toward the circuit
-# breaker (new entries halt after MAX_LOSS_HITS_CIRCUIT_BREAKER of them); they just no longer close
-# the position. Alpaca/45DTE keeps the original rules (EXIT_DTE_ENABLED/MAX_LOSS_EXIT on, fixed floor).
+# rides to the profit target or to expiration. The circuit breaker counts only REALIZED max losses
+# (a close at >= MAX_LOSS_HIT_PCT of max loss, or an expiry whose last mark was at/beyond that line);
+# a mark that dips there and recovers does not count (new entries halt after
+# MAX_LOSS_HITS_CIRCUIT_BREAKER realized ones). Alpaca/45DTE keeps the original rules (EXIT_DTE_ENABLED/MAX_LOSS_EXIT on, fixed floor).
 EXIT_DTE_ENABLED = False
 MAX_LOSS_EXIT = False
 # Profit floor, "trail" mode: once a position gets PROFIT_FLOOR_ARM_PCT_OF_TARGET (40%) of the way to

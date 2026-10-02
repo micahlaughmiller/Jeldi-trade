@@ -464,6 +464,10 @@ class OrderManager:
                                f"shares -- handle manually", spread_id=position["id"], shares=shares)
         position["last_price_before_expiry"] = position.get("current_price")
         position["est_realized_pl"] = position.get("unrealized_pl")
+        # The expiry loss is realized (the position can no longer recover) but its exact size is not knowable
+        # from here, so the last mark stands in: at/beyond the max-loss line counts as a realized max-loss hit.
+        if self.risk.is_max_loss_hit(position["entry_credit"], position.get("current_price"), spread_width(position)):
+            self.risk.record_max_loss_hit(position["id"], self.now_fn())
         self.log.log_event("EXPIRED", f"{position['broker_symbol']}: expired {position['expiration']}; settled at broker "
                            f"(last mark {position['last_price_before_expiry']}, est. P/L {position['est_realized_pl']})",
                            spread_id=position["id"])
@@ -738,9 +742,11 @@ class OrderManager:
                             self.exit_at_market(position, f"profit floor (armed, price {price} >= floor {floor_price})")
                             continue
             if self.risk.is_max_loss_hit(position["entry_credit"], price, spread_width(position)):
-                if not position.get("max_loss_hit"):
-                    position["max_loss_hit"] = True
-                    self.risk.record_max_loss_hit(position["id"], self.now_fn())
+                # Informational only: the MARK has reached the max-loss line. The circuit breaker counts a
+                # REALIZED loss (a close at >= MAX_LOSS_HIT_PCT of max loss in _record_close, or an expiry whose last
+                # mark was at/beyond the line in _resolve_expired) -- a spread that dips there and recovers is
+                # not a loss and must not move the breaker toward halting new entries.
+                position["max_loss_hit"] = True
                 if cfg.MAX_LOSS_EXIT:
                     self.exit_at_market(position, f"max loss hit (price {price})")
         self.save()

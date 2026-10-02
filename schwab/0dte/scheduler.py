@@ -25,7 +25,7 @@ import market_data
 import strategy
 from broker import Broker, BrokerError
 from journal import Journal, format_close_card, format_day_table, format_entry_card
-from position_manager import OpenSpread, PositionManager, occ_root, option_legs
+from position_manager import OpenSpread, PositionManager, occ_expiration, occ_root, option_legs
 from risk_manager import DayState, RiskManager, contracts_for, tier
 from strategy import Phase
 
@@ -118,6 +118,8 @@ class Bot:
         self.last_es_candle: datetime | None = None
         self.last_de_candle: datetime | None = None             # Strategies D/E, MA/Bollinger reversion
         self.news_blackout_was_active: bool = False
+        self._saved_spxw: set[tuple] = set()       # SPXW contracts today's saved state says THIS bot opened
+        self._hold_alert_at: datetime | None = None
         self._f_last_priced: dict[str, float] = {}              # Strategy F chain-mark throttle, per ticker
         self.f: StockOrbTrader | None = None
         if "F" in config.STRATEGIES:
@@ -145,8 +147,28 @@ class Bot:
         to construct still re-adopts, marks and force-closes the stock spreads it left at the broker."""
         tracked = {config.OPTION_ROOT} | {p.root for p in self.pm.positions.values()}
         f_on = "F" in config.STRATEGIES
-        return [leg for leg in option_legs(positions)
-                if occ_root(leg["symbol"]) in tracked or (f_on and self.f_owns_expiration(leg.get("expiration")))]
+
+        def mine(leg: dict) -> bool:
+            root = occ_root(leg["symbol"])
+            if root == config.OPTION_ROOT:
+                # this bot only ever trades SPXW that expires the day it opens it; anything else is the owner's
+                if leg.get("expiration") != self.today:
+                    return False
+                # and on a shared live account even a same-day SPXW leg is only the bot's if the bot opened it
+                # (tracked now, or in today's saved state) -- unless adopting untracked legs is switched on
+                return config.ADOPT_UNTRACKED_SPXW or \
+                    (leg["right"], float(leg["strike"]), leg["expiration"]) in self._known_spxw()
+            return root in tracked or (f_on and self.f_owns_expiration(leg.get("expiration")))
+
+        return [leg for leg in option_legs(positions) if mine(leg)]
+
+    def _known_spxw(self) -> set[tuple]:
+        """(right, strike, expiration) of every SPXW contract this bot opened: tracked now or in today's saved state."""
+        known = set(self._saved_spxw)
+        for p in self.pm.positions.values():
+            if p.root == config.OPTION_ROOT:
+                known |= {(p.right, float(p.short_strike), p.expiration), (p.right, float(p.long_strike), p.expiration)}
+        return known
 
     def foreign_legs(self, positions: list[dict]) -> list[dict]:
         """Option legs in the account that bot_legs() leaves alone."""
@@ -160,6 +182,10 @@ class Bot:
         acct = self.broker.get_account()
         saved = self.journal.load_state()
         saved_today = saved if saved and saved.get("date") == self.today.isoformat() else None
+        self._saved_spxw = {(d["right"], float(d[k]), date.fromisoformat(d["expiration"]))
+                            for d in ((saved_today or {}).get("positions") or {}).values()
+                            if d and d.get("root", config.OPTION_ROOT) == config.OPTION_ROOT
+                            for k in ("short_strike", "long_strike")}
         if saved_today:
             self.risk = RiskManager(acct["equity"], DayState.from_dict(saved_today["day"]))
             self.acted = set(saved_today.get("acted", []))
@@ -178,10 +204,41 @@ class Bot:
         if legs:
             self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING),
                                       saved_today.get("positions") if saved_today else None)
+        self._reconcile_saved_positions(saved_today, positions, now)
         self.report_start(now, acct, positions)
         self.broker.record_daily_equity()
         self.save_state()
         self.run(now)
+
+    def _reconcile_saved_positions(self, saved_today: dict | None, positions: list[dict], now: datetime) -> None:
+        """A position saved before a restart that is no longer at the broker was closed while the bot was down
+        (by hand): book it as EXTERNAL_CLOSE so the day's trades, P/L and the manual-close cool-down are right
+        instead of the position silently vanishing. Needs two reads, both showing it gone."""
+        saved = (saved_today or {}).get("positions") or {}
+        if not saved or not self.pm._sync_active():
+            return
+        tracked = {(p.root, p.right, p.expiration, p.short_strike) for p in self.pm.positions.values()}
+        missing = []
+        for key, d in saved.items():
+            if not d:
+                continue
+            p = OpenSpread.from_dict(d)
+            if p.remaining > 0 and (p.root, p.right, p.expiration, p.short_strike) not in tracked:
+                missing.append((key, p))
+        if not missing:
+            return
+        time.sleep(config.EXTERNAL_PREFLIGHT_RECHECK_SEC)
+        try:
+            again = self.broker.get_positions()
+        except BrokerError:
+            return
+        rows: list[dict] = []
+        for key, p in missing:
+            if self.pm._held_qty(p, positions) == (0, 0) and self.pm._held_qty(p, again) == (0, 0):
+                self.pm.positions[key] = p
+                rows += self.pm._book_external(p, p.remaining, now, "EXTERNAL_CLOSE")
+        if rows:
+            self.record_fills(rows)
 
     def _restore_breakout_state(self, saved_today: dict) -> None:
         """Restore the overnight/opening-range levels, the breakout state machines they drive
@@ -252,7 +309,8 @@ class Bot:
                          config.FORCE_CLOSE_TIME)
                 return
             log.warning("Started after FORCE_CLOSE_TIME with open positions: closing them now.")
-            self.end_of_day(now_et())
+            if self.end_of_day(now_et()) is False:     # MANUAL_HOLD: stay up until it is lifted or the session ends
+                self.loop()
             return
         if ph == Phase.PRE_OPEN:
             self.wait_for_open()
@@ -291,8 +349,8 @@ class Bot:
     def tick(self, now: datetime) -> None:
         ph = strategy.phase(now)
         if ph == Phase.CLOSED:
-            self.end_of_day(now)
-            self.done = True
+            if self.end_of_day(now) is not False:
+                self.done = True
             return
         blackout_now = self.news_blackout_active(now)
         if self.news_blackout_was_active and not blackout_now:
@@ -323,7 +381,9 @@ class Bot:
         if ph in strategy.ENTRY_PHASES:
             if new_candle and ph in strategy.OVERNIGHT_PHASES:
                 self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
-                self.try_es_break_entry(now, candles)   # Strategy C
+            if new_candle and (ph in strategy.OVERNIGHT_PHASES
+                               or strategy.minutes_since_open(now) < config.C_ENTRY_END_MIN):
+                self.try_es_break_entry(now, candles)   # Strategy C (config.C_ENTRY_END_MIN widens its window)
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
             self.check_continuation_reentry(now, ph)
@@ -381,6 +441,9 @@ class Bot:
 
     def entry_possible(self, equity: float, setup: str | None = None,
                        strategies: tuple[str, ...] | None = None) -> bool:
+        if self.pm.manual_hold():
+            log.info("No new entries: MANUAL_HOLD file present")
+            return False
         reasons = []
         exempt_open = self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT)
         for strat in (strategies or strategy.spx_strategies()):
@@ -672,14 +735,19 @@ class Bot:
         spot, ma = float(closes.iloc[-1]), float(ema30.iloc[-1])
         pct_b = strategy.percent_b(spot, float(upper.iloc[-1]), float(lower.iloc[-1]))
         trend = strategy.ema_trend(float(ema9.iloc[-1]), ma, config.D_EMA_CHOP_THRESHOLD_PTS)
-        direction = strategy.mean_reversion_signal(spot, ma, pct_b, trend, config.D_BAND_TOUCH_PCT_B)
-        if direction is None:
+        direction_d = strategy.mean_reversion_signal(spot, ma, pct_b, trend, config.D_BAND_TOUCH_PCT_B)
+        direction_e = direction_d if config.E_USE_TREND_GATE else strategy.mean_reversion_signal(
+            spot, ma, pct_b, trend, config.D_BAND_TOUCH_PCT_B, use_trend_gate=False)
+        if direction_d is None and direction_e is None:
             return
         # E's 2-candle confirmation is same-session-only: "consecutive" has to mean consecutive
         # trading activity, not the prior day's last candle glued to today's first one (the EMA/
         # Bollinger read above is deliberately the opposite -- a rolling multi-day window).
         today_candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
         for strat in eligible:
+            direction = direction_e if strat == "E" else direction_d
+            if direction is None:
+                continue
             if strat == "E" and not strategy.two_candle_confirm(today_candles, direction, config.E_CONFIRM_CANDLES):
                 continue
             setup = "MA_BB_CHOP" if strat == "E" else "MA_BB"
@@ -908,6 +976,14 @@ class Bot:
         return prices
 
     def manage(self, now: datetime, candles: pd.DataFrame) -> None:
+        # 2026-10-02: reconcile with what the broker actually holds first, so a spread closed (or a
+        # contract cut) by hand in the broker UI is booked and dropped here instead of becoming a ghost
+        # the exit rules keep trying to close. Throttled and confirmed inside the position manager.
+        external = self.pm.sync_external(now)
+        if external:
+            self.record_fills(external)
+            if not self.pm.positions:
+                return
         prices = self.spread_prices()
         for key, p in self.pm.positions.items():
             if key in prices:
@@ -926,11 +1002,18 @@ class Bot:
             if row["position_closed"]:
                 self.risk.record_trade(strat, row["position_pnl"], row)
                 remaining = 0
+                if row.get("external") and row.get("setup") in ("ORB", "ON_BREAK"):
+                    # closed by hand: let the continuation re-entry check fire again right when the manual-close
+                    # cool-down ends (not up to REENTRY_PAUSE_MIN later)
+                    self.last_continuation_check[row["setup"]] = (
+                        row["exit_time"] + timedelta(seconds=config.MANUAL_CLOSE_COOLDOWN_SEC)
+                        - timedelta(minutes=config.REENTRY_PAUSE_MIN))
                 day_pnl = s.pnl_by_strategy()
                 if self.f is not None and strat in config.STOCK_STRATEGIES:
                     self.f.on_exit(row["root"], row["exit_time"])
             else:
-                remaining = self.pm.positions[row["key"]].remaining
+                still_open = self.pm.positions.get(row["key"])
+                remaining = still_open.remaining if still_open is not None else 0
                 day_pnl = s.pnl_by_strategy()
                 day_pnl[strat] = round(day_pnl.get(strat, 0.0) + row["position_pnl"], 2)
             card = format_close_card(row, trade_no, day_pnl, s.trades_today, remaining)
@@ -941,11 +1024,53 @@ class Bot:
 
     # ------------------------------------------------------------ end of day
 
-    def end_of_day(self, now: datetime) -> None:
+    def cancel_own_orders(self) -> int:
+        """Cancel the open orders on contracts this bot trades (SPXW expiring today, and F's stock options inside
+        its DTE window on roots it holds) -- not every order in the account: a Schwab account is shared with the
+        45DTE bot's resting GTC closes and with whatever the owner has working by hand in the broker UI. An
+        order whose legs we cannot read is left alone."""
+        stock_roots = {p.root for p in self.pm.positions.values()}
+
+        def mine(order: dict) -> bool:
+            legs = order.get("legs") or []
+            if not legs:
+                return False
+            for leg in legs:
+                root, exp = occ_root(leg["symbol"]), occ_expiration(leg["symbol"])
+                if root == config.OPTION_ROOT:
+                    ok = exp == self.today
+                else:
+                    ok = root in stock_roots and exp is not None and self.f_owns_expiration(exp)
+                if not ok:
+                    return False
+            return True
+
+        cancelled = 0
+        for order in self.broker.get_open_orders():
+            if not mine(order):
+                continue
+            try:
+                self.broker.cancel_order(order["id"])
+                cancelled += 1
+            except BrokerError as e:
+                log.error("Could not cancel order %s: %s", order["id"], e)
+        return cancelled
+
+    def end_of_day(self, now: datetime) -> bool:
+        """Force-close everything and report. Returns False (nothing done) while a MANUAL_HOLD file is present and
+        positions are open before the session ends: the bot stays up and closes them the moment the file goes."""
+        if self.pm.manual_hold() and self.pm.positions and now.time() < config.MARKET_CLOSE:
+            if self._hold_alert_at is None or (now - self._hold_alert_at).total_seconds() >= 60:
+                self._hold_alert_at = now
+                log.critical("MANUAL_HOLD file present at the %s force-close: NOT closing %d position(s). The bot stays "
+                             "up and closes them as soon as the file is deleted (until %s).",
+                             config.FORCE_CLOSE_TIME.strftime("%H:%M"), len(self.pm.positions),
+                             config.MARKET_CLOSE.strftime("%H:%M"), extra={"keep": True})
+            return False
         if self.f is not None:
             self.f.shutdown()
         log.warning("FORCE CLOSE at %s: cancelling orders and closing everything.", now.strftime("%H:%M:%S"))
-        cancelled = self.broker.cancel_all_orders()
+        cancelled = self.cancel_own_orders()
         log.info("Cancelled %d open orders.", cancelled)
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):
             legs = self.bot_legs(self.broker.get_positions())
@@ -961,6 +1086,7 @@ class Bot:
             time.sleep(config.CLOSE_RETRY_SEC)
         self.report_end(now_et())
         self.save_state()
+        return True
 
     # --------------------------------------------------------------- reports
 

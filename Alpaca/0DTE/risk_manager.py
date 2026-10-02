@@ -56,12 +56,13 @@ class StrategyState:
     last_exit: str | None = None
     last_exit_setup: str | None = None
     entries_today: int = 0   # counted at ENTRY by multi-position strategies (F); A-E count closes only
+    manual_cooldown_until: str | None = None   # no new entry before this (iso): set when a position is closed by hand
 
     def record_entry(self) -> int:
         self.entries_today += 1
         return self.entries_today
 
-    def record(self, pnl: float, row: dict | None) -> None:
+    def record(self, pnl: float, row: dict | None, manual_cooldown: bool = True) -> None:
         self.trades_today += 1
         self.realized_pnl = round(self.realized_pnl + pnl, 2)
         self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
@@ -70,6 +71,10 @@ class StrategyState:
             if row.get("exit_time") is not None:
                 self.last_exit = _exit_key(row)
                 self.last_exit_setup = row.get("setup")
+                if row.get("external") and manual_cooldown:
+                    # closed by hand in the broker UI: stand down for MANUAL_CLOSE_COOLDOWN_SEC, then be ready again
+                    self.manual_cooldown_until = (datetime.fromisoformat(self.last_exit)
+                                                  + timedelta(seconds=config.MANUAL_CLOSE_COOLDOWN_SEC)).isoformat()
 
 
 def _fresh_strategies() -> dict[str, StrategyState]:
@@ -127,7 +132,9 @@ class RiskManager:
         self.state = state or DayState(start_equity=start_equity)
 
     def record_trade(self, strat: str, pnl: float, row: dict | None = None) -> None:
-        self.state.for_strategy(strat).record(pnl, row)
+        # a strategy-wide pause would stall every F ticker (F has per-ticker re-entry logic of its own), so the
+        # manual-close cool-down only applies to the SPX strategies
+        self.state.for_strategy(strat).record(pnl, row, manual_cooldown=strat not in config.STOCK_STRATEGIES)
 
     def record_entry(self, strat: str) -> int:
         return self.state.for_strategy(strat).record_entry()
@@ -152,6 +159,10 @@ class RiskManager:
             return False, f"{strat}: MAX_TRADES_PER_DAY ({entries})"
         if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
+        if s.manual_cooldown_until and now is not None:
+            resume = datetime.fromisoformat(s.manual_cooldown_until)
+            if now < resume:
+                return False, f"{strat}: MANUAL_CLOSE cooldown until {resume.astimezone(config.ET).strftime('%H:%M:%S')}"
         cooldown = limit(strat, "COOLDOWN_MIN", 0)
         same_setup = setup is None or s.last_exit_setup is None or setup == s.last_exit_setup
         if cooldown and now is not None and s.last_exit and same_setup:

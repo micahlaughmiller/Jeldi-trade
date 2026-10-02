@@ -21,6 +21,24 @@ def _pin_default_strategies(monkeypatch):
     monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
 
 
+GUARD_MODULES = ("test_alpaca_adoption_rules", "test_schwab_adoption_rules")   # run against the REAL config
+
+
+@pytest.fixture(autouse=True)
+def _pin_adoption_default(request, monkeypatch):
+    """The shared tests describe the Alpaca default (untracked same-day SPXW legs are adopted); Schwab's config
+    turns that off, so pin it -- except in the per-folder guard modules that check each folder's real value."""
+    if request.module.__name__ not in GUARD_MODULES:
+        monkeypatch.setattr(config, "ADOPT_UNTRACKED_SPXW", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_preflight_sleep(monkeypatch):
+    """The preflight re-reads the broker EXTERNAL_PREFLIGHT_RECHECK_SEC seconds after something looks wrong; the
+    tests' fake broker answers instantly, so there is nothing to wait for."""
+    monkeypatch.setattr(config, "EXTERNAL_PREFLIGHT_RECHECK_SEC", 0)
+
+
 def et(h: int, m: int, s: int = 0, day: int = 17) -> datetime:
     return datetime(2026, 9, day, h, m, s, tzinfo=ET)
 

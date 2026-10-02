@@ -192,3 +192,48 @@ def test_in_news_blackout_before_during_after_window():
 
 def test_in_news_blackout_no_events_today():
     assert strategy.in_news_blackout(et(8, 30), [], before_min=5, after_min=5) is False
+
+
+# --------------------------------------------------------------------------------- 2026-10-02 test levers
+
+def test_mean_reversion_signal_without_the_trend_gate_uses_only_the_ma_side_and_the_band():
+    f = strategy.mean_reversion_signal
+    # the gate is ignored entirely -- even a CHOP read can signal
+    assert f(105.0, 100.0, 0.97, "CHOP", 0.95, use_trend_gate=False) == strategy.BEARISH
+    assert f(95.0, 100.0, 0.03, "RISING", 0.95, use_trend_gate=False) == strategy.BULLISH
+    assert f(105.0, 100.0, 0.97, "RISING", 0.95, use_trend_gate=False) == strategy.BEARISH   # gated version: None
+    assert f(105.0, 100.0, 0.97, "RISING", 0.95) is None
+    # still needs the right side of the MA and a real band touch
+    assert f(95.0, 100.0, 0.97, "RISING", 0.95, use_trend_gate=False) is None
+    assert f(105.0, 100.0, 0.50, "RISING", 0.95, use_trend_gate=False) is None
+    assert f(105.0, 100.0, None, "RISING", 0.95, use_trend_gate=False) is None
+
+
+def test_persona_cde_matrix_gives_every_strategy_two_test_variants():
+    import config
+    overrides = getattr(config, "PERSONA_OVERRIDES", {})        # Alpaca personas; the Schwab twin has none
+    if not overrides:
+        return
+    assert config.TRADER_NAMES == ("ASTRA", "ARIA", "DAVID", "ELENA", "JORDAN")
+    assert set(overrides) == set(config.TRADER_NAMES)
+    runs = {s: sorted(n for n, o in overrides.items() if s in o.get("STRATEGIES", ())) for s in "BCDEF"}
+    assert runs == {"B": ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"], "C": ["DAVID", "ELENA", "JORDAN"],
+                    "D": ["ARIA", "ELENA"], "E": ["DAVID", "JORDAN"], "F": ["ASTRA"]}
+    assert all("A" not in o["STRATEGIES"] for o in overrides.values())
+    # D and E variants never share a persona, because the D_* constants are shared by both inside one persona
+    assert not any({"D", "E"} <= set(o["STRATEGIES"]) for o in overrides.values())
+    # E variants run without the trend gate; D variants keep it
+    assert all(overrides[n]["E_USE_TREND_GATE"] is False for n in ("DAVID", "JORDAN"))
+    assert overrides["ELENA"]["C_ENTRY_END_MIN"] == overrides["JORDAN"]["C_ENTRY_END_MIN"] == 60
+    assert "C_ENTRY_END_MIN" not in overrides["DAVID"]            # DAVID is C's spec-window control
+
+
+def test_every_persona_keeps_bs_continuation_reentry():
+    """_a() used to set EXIT_TUNING_BY_STRATEGY['B'] = {} -- turning continuation re-entry off for every persona
+    except ASTRA, which is why only ASTRA kept re-entering the 2026-10-01 breakout."""
+    import config
+    for name, o in getattr(config, "PERSONA_OVERRIDES", {}).items():
+        tuning = o.get("EXIT_TUNING_BY_STRATEGY")
+        if tuning is not None:
+            assert tuning["B"].get("REENTRY_ON_CONTINUATION_ENABLED") is True, name
+    assert config.EXIT_TUNING_BY_STRATEGY["B"].get("REENTRY_ON_CONTINUATION_ENABLED") is True

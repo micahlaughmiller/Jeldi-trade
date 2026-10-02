@@ -691,7 +691,7 @@ def ema_trend(ema_fast: float, ema_slow: float, chop_threshold: float) -> str:
 
 
 def mean_reversion_signal(spot: float, ma: float, pct_b: float | None, trend: str,
-                          band_touch: float) -> str | None:
+                          band_touch: float, use_trend_gate: bool = True) -> str | None:
     """Strategy D/E entry direction, or None if no valid setup right now.
 
     Trend gates direction (rising -> only the bull-side reversion, falling -> only bear-side, chop
@@ -700,8 +700,19 @@ def mean_reversion_signal(spot: float, ma: float, pct_b: float | None, trend: st
     %B for the upper touch, <= 1 - band_touch for the lower touch) -- both conditions from the
     dictated rule ("above MA and near/touching BB is a bear credit spread, below MA near/touching BB
     is bull credit spread"), i.e. a bull-side reversion needs price below the MA and pct_b <= 1-band_touch.
+
+    use_trend_gate=False (Strategy E's test variant, config.E_USE_TREND_GATE) drops the trend gate and the
+    CHOP early-out: only the side of the MA and the band touch decide the direction.
     """
-    if trend == "CHOP" or pct_b is None:
+    if pct_b is None:
+        return None
+    if not use_trend_gate:
+        if spot > ma and pct_b >= band_touch:
+            return BEARISH
+        if spot < ma and pct_b <= (1.0 - band_touch):
+            return BULLISH
+        return None
+    if trend == "CHOP":
         return None
     if trend == "RISING":
         if spot < ma and pct_b <= (1.0 - band_touch):

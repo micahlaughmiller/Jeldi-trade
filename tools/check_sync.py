@@ -24,13 +24,18 @@ BROKER_SPECIFIC = {
     "README.md", "requirements.txt", ".env", ".env.example", "token.json",
 }
 BROKER_SPECIFIC_TESTS = {"test_broker_alpaca.py", "test_broker_schwab.py", "live_smoke_alpaca.py",
-                         "test_alpaca_exit_rules.py", "test_schwab_exit_rules.py"}
+                         "test_alpaca_exit_rules.py", "test_schwab_exit_rules.py",
+                         "test_alpaca_adoption_rules.py", "test_schwab_adoption_rules.py"}
 
 # Deliberate, documented Schwab-vs-Alpaca strategy-config differences:
 # label -> {key: (alpaca value, schwab value, reason)}, values as ast.unparse() prints them. A key only
 # passes when BOTH sides hold exactly these values; anything else (including a "fix" that makes them
 # match, or an edit to just one side) is still reported as drift. main() lists the accepted ones.
 INTENTIONAL_CONFIG_DIVERGENCE = {
+    "0DTE": {
+        "ADOPT_UNTRACKED_SPXW": ("True", "False", "2026-10-02: Schwab's account is shared with the 45DTE bot and the owner's "
+                                 "hand trades, so it never adopts or force-closes SPXW legs it did not open"),
+    },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),
         "MAX_LOSS_EXIT": ("True", "False", "2026-10-02: Schwab does not stop out at max loss (hits still feed the circuit breaker)"),

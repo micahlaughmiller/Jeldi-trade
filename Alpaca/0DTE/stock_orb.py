@@ -692,6 +692,8 @@ class StockOrbTrader:
     def enter(self, now: datetime, sig: StockSignal) -> str:
         """Place one F spread for a confirmed signal. Returns the operator summary."""
         bot, broker, sym = self.bot, self.bot.broker, sig.symbol
+        if bot.pm.manual_hold():
+            return "skip: MANUAL_HOLD file present"
         equity = broker.get_account()["equity"]
         allowed, reason = bot.risk.trading_allowed(
             STRATEGY, equity, now, SETUP, open_count=bot.pm.open_count(STRATEGY),

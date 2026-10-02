@@ -63,6 +63,32 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
+# thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
+# spreads against what the broker actually holds; a position must look wrong on
+# EXTERNAL_SYNC_CONFIRM consecutive syncs (and be older than EXTERNAL_MIN_AGE_SEC) before the bot
+# acts, so a lagging positions API right after a fill can never make it drop a real position.
+EXTERNAL_SYNC_ENABLED = True
+EXTERNAL_SYNC_SEC = 10
+EXTERNAL_SYNC_CONFIRM = 2
+EXTERNAL_MIN_AGE_SEC = 30
+# Before booking a hand-close (or a partial one) at the moment a stop/target/force-close fires, the bot
+# reads the broker a second time this many seconds later and acts only if both reads agree.
+EXTERNAL_PREFLIGHT_RECHECK_SEC = 2
+# Adopt SPXW legs the bot has no record of (crash recovery) into its own books -- and so stop-manage and
+# force-close them at 15:30. True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
+# shared with the 45DTE bot and whatever the owner trades by hand (allow-listed in tools/check_sync.py).
+ADOPT_UNTRACKED_SPXW = False
+# The staged exit's Bollinger-edge reversal check uses this %B level. It used to read D_BAND_TOUCH_PCT_B,
+# the D/E ENTRY threshold, so tuning that for a test persona silently moved every strategy's exits.
+EXIT_BB_TOUCH_PCT_B = 0.95
+# After a position is recognized as closed by hand, that strategy takes no new entry for this long
+# (a deliberate cool-down), then is ready to open again.
+MANUAL_CLOSE_COOLDOWN_SEC = 120
+# Create logs/MANUAL_HOLD (every persona) or logs/MANUAL_HOLD_<NAME> (one persona) and the bot sends
+# NO closes -- stops, targets, floors and the end-of-day force-close all stand down -- until the file
+# is deleted. Hand-closes are still detected and booked. Remember to delete it.
+MANUAL_HOLD_FILE = "MANUAL_HOLD"
 # 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
 # broker fill swings wildly from the trigger price during fast moves. The bot's OWN official
 # pnl/realized_pnl (position_manager._close) now uses realistic_exit_price = the tick immediately
@@ -479,9 +505,20 @@ D_E_CANDLE_INTERVAL = "5m"
 # (~2.75 days) comfortably reaches across a normal overnight gap AND a long weekend (Friday close ->
 # Monday open). D_E_MIN_CANDLES stays as a safety net for a genuine data outage -- it should now
 # essentially always already be satisfied.
-D_E_LOOKBACK_MIN = 4000
+D_E_LOOKBACK_MIN = 6000
 D_E_MIN_CANDLES = 30
 E_CONFIRM_CANDLES = 2
+# 2026-10-02 (C/D/E never fired in the first two trending sessions). Three test levers, all defaulting to
+# the original behavior:
+#   D_E_LOOKBACK_MIN was 4000, which does NOT reach back across a weekend (Fri 15:20 at Monday's open): D/E
+#     had fewer than D_E_MIN_CANDLES bars until ~11:25 every Monday. 6000 (~4.2 days) covers it.
+#   E_USE_TREND_GATE False -> E decides direction from the side of the MA plus the band touch alone (no
+#     RISING/FALLING/CHOP gate). With the gate on, E needs D's exact setup AND two same-colour candles
+#     moving away from the band, which pull %B back inside the band -- it essentially never fires.
+#   C_ENTRY_END_MIN: how many minutes after the open Strategy C may still take an ES-overnight-level break
+#     (30 = only the 09:30-10:00 window, the original behavior; 60 = until 10:30).
+E_USE_TREND_GATE = True
+C_ENTRY_END_MIN = 30
 
 # ------------------------------------------------------ Strategy F: stock opening-range breakout
 # Identical to Alpaca/0DTE/config.py (tools/check_sync.py compares every value). F runs on ASTRA only;

@@ -49,7 +49,7 @@ def open_spread(pm, broker, strategy="B", qty=2, credit=2.00, width=5.0, right="
 
 
 def open_f_spread(pm, broker, root="TSLA", qty=2, credit=0.80, width=3.0) -> OpenSpread:
-    broker.add_spread_position("P", 417.5, 412.5, qty, credit + width, width)
+    broker.add_spread_position("P", 417.5, 412.5, qty, credit + width, width, root=root)
     spread = OpenSpread(strategy="F", direction=BULLISH, setup="STOCK_ORB", right="P", root=root,
                         expiration=TODAY, short_strike=417.5, long_strike=412.5, width=width, qty=qty,
                         entry_credit=credit, entry_time=et(9, 55), current_price=credit, best_price=credit,
@@ -183,7 +183,7 @@ def test_a_and_b_share_identical_staged_thresholds(pm, broker):
     # override of any STAGE*_PCT constant, so A and B (same width/credit) hit every stage at the
     # exact same spread price.
     open_spread(pm, broker, strategy="A", qty=2, credit=2.00, width=5.0)
-    open_spread(pm, broker, strategy="B", qty=2, credit=2.00, width=5.0)
+    open_spread(pm, broker, strategy="B", qty=2, credit=2.00, width=5.0, right="C")   # own contracts (no STRIKE_COLLISION)
     fills = pm.on_tick(et(10, 5), {"A": 1.70, "B": 1.70}, flat())       # both cross the 0.30 target
     assert fills == []
     fills = pm.on_tick(et(10, 6), {"A": 1.75, "B": 1.75}, flat())       # both hit the 0.25 floor

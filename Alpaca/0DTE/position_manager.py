@@ -1,6 +1,8 @@
 """Manages the open credit spreads (SPXW for A-E, one stock root per F position): stop, target, runner, verified closes."""
 
 import logging
+import time
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 
@@ -12,6 +14,7 @@ from broker import BrokerError
 from journal import Journal
 
 log = logging.getLogger(__name__)
+HERE = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -71,6 +74,12 @@ class OpenSpread:
     # completely normal operation, which would make QUOTE_JUMP_MAX_HOLD_SECONDS fire immediately on
     # every single F tick. Cleared the moment a value is accepted (immediate, confirmed, or forced).
     stuck_since: datetime | None = None
+    # 2026-10-02: manual-override safety (see PositionManager.sync_external). manual_attention freezes all
+    # automated closing of a position whose legs at the broker no longer match it (a naked leg after a
+    # hand-closed leg); sync_obs/sync_obs_count count consecutive syncs seeing the same wrong picture.
+    manual_attention: bool = False
+    sync_obs: str | None = None
+    sync_obs_count: int = 0
 
     @property
     def remaining(self) -> int:
@@ -146,6 +155,14 @@ def occ_root(symbol: str) -> str:
     return symbol[:-15] if len(symbol) > 15 else symbol
 
 
+def occ_expiration(symbol: str) -> date | None:
+    """The expiration encoded in an OCC option symbol (root + yymmdd + C/P + 8-digit strike), else None."""
+    try:
+        return datetime.strptime(symbol[-15:-9], "%y%m%d").date()
+    except ValueError:
+        return None
+
+
 def option_legs(positions: list[dict], roots: set[str] | None = None) -> list[dict]:
     """Option legs at the broker whose OCC root is in `roots` (None = every option leg)."""
     return [p for p in positions
@@ -179,6 +196,8 @@ class PositionManager:
         self.broker = broker
         self.journal = journal
         self.positions: dict[str, OpenSpread] = {}
+        self._last_sync: datetime | None = None
+        self._hold_logged: datetime | None = None
 
     def open(self, spread: OpenSpread) -> str:
         key = self._store(spread)
@@ -271,7 +290,10 @@ class PositionManager:
                       and s.get("root", config.OPTION_ROOT) == root and s.get("expiration") == exp.isoformat()), None)
         if match:
             spread = OpenSpread.from_dict(match)
-            spread.qty = qty + spread.closed_qty
+            saved_remaining = max(int(match.get("qty", 0)) - int(match.get("closed_qty", 0)), 0)
+            # the broker may hold MORE than the bot's own saved contracts on these strikes (the owner added some
+            # by hand): the bot only ever re-adopts what it opened itself
+            spread.qty = (min(qty, saved_remaining) if saved_remaining else qty) + spread.closed_qty
             spread.current_price = current
             return spread
         direction = strategy.BULLISH if right == "P" else strategy.BEARISH
@@ -592,7 +614,7 @@ class PositionManager:
             rsi_pts = strategy.exit_setting(p.strategy, "RSI_REVERSAL_PTS", 5.0)
             bb_period = strategy.exit_setting(p.strategy, "EXIT_BB_PERIOD", 20)
             bb_std = strategy.exit_setting(p.strategy, "EXIT_BB_STD", 2.0)
-            band_touch = strategy.exit_setting(p.strategy, "D_BAND_TOUCH_PCT_B", 0.95)
+            band_touch = strategy.exit_setting(p.strategy, "EXIT_BB_TOUCH_PCT_B", 0.95)
             reversing = strategy.momentum_reversing(candles, p.direction, rsi_period, rsi_pts) \
                 or strategy.bb_edge_reversal_risk(candles, p.direction, bb_period, bb_std, band_touch)
             if reversing:
@@ -631,6 +653,157 @@ class PositionManager:
             fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price)
         return fills
 
+    # ----------------------------------------------- manual-override safety (2026-10-02)
+
+    def manual_hold(self) -> bool:
+        """True while the owner has asked the bot to stand down from closing (see config.MANUAL_HOLD_FILE)."""
+        folder = HERE / config.LOG_DIR
+        return (folder / config.MANUAL_HOLD_FILE).exists() or             (folder / f"{config.MANUAL_HOLD_FILE}_{config.TRADER_NAME}").exists()
+
+    def _sync_active(self) -> bool:
+        """Dry-run brokers never hold what the bot "opens", so reconciling against them would read
+        every position as closed outside the bot."""
+        return bool(config.EXTERNAL_SYNC_ENABLED) and not getattr(self.broker, "dry_run", False)
+
+    def _held_qty(self, p: OpenSpread, legs: list[dict]) -> tuple[int, int]:
+        """(short contracts, long contracts) the broker really holds on this spread's two strikes."""
+        short = long = 0
+        for leg in option_legs(legs, {p.root}):
+            if leg["right"] != p.right or leg["expiration"] != p.expiration:
+                continue
+            if leg["strike"] == p.short_strike and leg["qty"] < 0:
+                short = abs(int(leg["qty"]))
+            elif leg["strike"] == p.long_strike and leg["qty"] > 0:
+                long = int(leg["qty"])
+        return short, long
+
+    def _flag_unbalanced(self, key: str, p: OpenSpread, short: int, long: int, now: datetime) -> None:
+        """The two legs at the broker do not match each other (a hand-closed leg, or another spread netting
+        one of our strikes away). Informational: raise a loud alert once. The close path decides what, if
+        anything, can still be closed -- never more than the matched pairs, and nothing when only one leg is held."""
+        if p.manual_attention:
+            return
+        p.manual_attention = True
+        log.critical("[%s] legs at the broker do not match this spread (tracked %d, broker short %d / long %d) -- a leg "
+                     "was closed by hand or netted away by another spread; automated closing can only act on matched "
+                     "pairs, fix the rest by hand", key, p.remaining, short, long)
+        self.journal.event("NAKED_LEG", now, strategy=p.strategy, key=key, tracked=p.remaining,
+                           short_held=short, long_held=long)
+
+    def sync_external(self, now: datetime) -> list[dict]:
+        """Compare every tracked spread with what the broker actually holds (throttled to
+        EXTERNAL_SYNC_SEC) and reconcile what was changed by hand in the broker UI:
+          both legs gone      -> closed outside the bot: book it (last mark) and stop tracking it
+          fewer contracts     -> a partial hand-close: book the difference, keep managing the rest
+          a leg without its partner -> alert; the bot closes only matched pairs and never a spread whose leg is missing
+          more contracts      -> the owner added some on the same strikes: the bot still only manages its own
+        A position must look wrong on EXTERNAL_SYNC_CONFIRM consecutive syncs, and be older than
+        EXTERNAL_MIN_AGE_SEC, before anything is changed. A failed read changes nothing."""
+        if not self.positions or not self._sync_active():
+            return []
+        if self._last_sync is not None and (now - self._last_sync).total_seconds() < config.EXTERNAL_SYNC_SEC:
+            return []
+        self._last_sync = now
+        try:
+            legs = self.broker.get_positions()
+        except BrokerError as e:
+            log.error("EXTERNAL_SYNC could not read positions (nothing changed): %s", e)
+            return []
+        rows: list[dict] = []
+        for key, p in list(self.positions.items()):
+            if (now - p.entry_time).total_seconds() < config.EXTERNAL_MIN_AGE_SEC:
+                continue
+            short, long = self._held_qty(p, legs)
+            if short == long and short >= p.remaining:
+                if p.manual_attention:
+                    p.manual_attention = False
+                    log.warning("[%s] legs at the broker match this spread again -- automated closing resumed", key)
+                if short > p.remaining and p.sync_obs != f"{short}/{long}":
+                    log.warning("[%s] broker holds %d contracts on these strikes, bot tracks %d: managing only its own",
+                                key, short, p.remaining)
+                    p.sync_obs = f"{short}/{long}"
+                elif short == p.remaining:
+                    p.sync_obs = None
+                p.sync_obs_count = 0
+                continue
+            obs = f"{short}/{long}"
+            p.sync_obs_count = p.sync_obs_count + 1 if p.sync_obs == obs else 1
+            p.sync_obs = obs
+            if p.sync_obs_count < config.EXTERNAL_SYNC_CONFIRM:
+                continue
+            if short == 0 and long == 0:
+                rows += self._book_external(p, p.remaining, now, "EXTERNAL_CLOSE")
+            elif short == long:    # fewer than tracked, but a matched pair: a partial hand-close
+                rows += self._book_external(p, p.remaining - short, now, "EXTERNAL_PARTIAL")
+            else:                  # one leg missing or unequal sizes: a naked leg
+                self._flag_unbalanced(key, p, short, long, now)
+        return rows
+
+    def _book_external(self, p: OpenSpread, qty: int, now: datetime, reason: str) -> list[dict]:
+        """Book contracts that left the broker without this bot closing them (closed by hand). Their
+        fill price is unknown, so the last accepted mark stands in; the row says external=True."""
+        key = self.key_of(p)
+        qty = min(qty, p.remaining)
+        if qty <= 0:
+            return []
+        price = round(p.current_price, 2)
+        pnl = round((p.entry_credit - price) * 100 * qty, 2)
+        p.closed_qty += qty
+        p.realized_pnl = round(p.realized_pnl + pnl, 2)
+        p.sync_obs, p.sync_obs_count = None, 0
+        row = self._make_row(p, key, now, qty, reason, exit_price=price, pnl=pnl, pnl_actual_fill=pnl,
+                             trigger_price=price, exit_slippage=0.0, realistic_exit_price=price,
+                             prev_price=None, prev_tick_pnl=None, prev_tick_jump=None)
+        row["external"] = True
+        log.warning("[%s] %s: %d contract(s) no longer at the broker (closed by hand?) -- booked at the last mark "
+                    "%.2f, est. pnl %.2f | position realized %.2f, %d left", key, reason, qty, price, pnl,
+                    p.realized_pnl, p.remaining)
+        self.journal.event("EXIT", now, **row)
+        if p.remaining == 0:
+            del self.positions[key]
+        return [row]
+
+    def _read_held(self, p: OpenSpread) -> tuple[int, int] | None:
+        try:
+            legs = self.broker.get_positions()
+        except BrokerError as e:
+            log.error("[%s] could not read positions (%s)", self.key_of(p), e)
+            return None
+        return self._held_qty(p, legs)
+
+    def _preflight(self, p: OpenSpread, now: datetime) -> tuple[list[dict], int, bool]:
+        """Last look at the broker before sending a close. Returns (rows booked for what was already closed
+        outside the bot, contracts the owner holds on the same strikes beyond ours, stop). A close is never
+        sent for legs that are not held. If anything looks wrong it looks a second time before acting: one
+        read can be empty or stale (Schwab answers [] without an error when its payload has no positions
+        key), and wrongly dropping a live position would drop its stop -- when the two reads disagree the
+        bot acts on neither and sends the close as before (a broker rejects a close for legs it does not hold)."""
+        if not self._sync_active():
+            return [], 0, False
+        held = self._read_held(p)
+        if held is None:
+            return [], 0, False
+        short, long = held
+        if short == long and short >= p.remaining:
+            return [], short - p.remaining, False
+        if config.EXTERNAL_PREFLIGHT_RECHECK_SEC > 0:
+            time.sleep(config.EXTERNAL_PREFLIGHT_RECHECK_SEC)
+        if self._read_held(p) != held:
+            return [], 0, False
+        key = self.key_of(p)
+        if short == 0 and long == 0:
+            if (now - p.entry_time).total_seconds() >= config.EXTERNAL_MIN_AGE_SEC:
+                return self._book_external(p, p.remaining, now, "EXTERNAL_CLOSE"), 0, True
+            return [], 0, False
+        if short != long:
+            self._flag_unbalanced(key, p, short, long, now)
+        pairs = min(short, long)
+        if pairs == 0:
+            return [], 0, True      # one leg only: there is no spread to close, send nothing
+        rows = self._book_external(p, p.remaining - pairs, now, "EXTERNAL_PARTIAL") if pairs < p.remaining else []
+        # whatever the broker holds beyond the pairs we are about to close (an odd leg) is not ours to close either
+        return rows, max(short, long) - min(pairs, p.remaining), False
+
     def _remaining_at_broker(self, p: OpenSpread) -> int:
         legs = [leg for leg in option_legs(self.broker.get_positions(), {p.root})
                 if leg["right"] == p.right and leg["expiration"] == p.expiration
@@ -641,12 +814,31 @@ class PositionManager:
         if qty <= 0:
             return []
         key = self.key_of(p)
-        expected_left = p.remaining - qty
-        log.warning("[%s] CLOSING %d/%d %s (%s) at market, spread mid %.2f",
-                    key, qty, p.remaining, p.right, reason, spread_price)
+        if self.manual_hold():
+            if self._hold_logged is None or (now - self._hold_logged).total_seconds() >= 60:
+                self._hold_logged = now
+                log.warning("[%s] MANUAL_HOLD file present: NOT closing (%s) -- delete logs/%s to resume",
+                            key, reason, config.MANUAL_HOLD_FILE, extra={"keep": True})
+            return []
+        pre_rows: list[dict] = []
         order = None
-        left = expected_left
+        left = p.remaining - qty
+        expected_left = left
+        owner_extra = 0
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):
+            # the preflight runs before EVERY attempt, not just the first: close_spread_at_market can work a
+            # limit order for a long time and the owner may hand-close the position while it does
+            rows, owner_extra, stop = self._preflight(p, now)
+            pre_rows += rows
+            if stop:
+                return pre_rows
+            qty = min(qty, p.remaining)
+            if qty <= 0:
+                return pre_rows
+            expected_left = p.remaining - qty
+            if attempt == 1:
+                log.warning("[%s] CLOSING %d/%d %s (%s) at market, spread mid %.2f",
+                            key, qty, p.remaining, p.right, reason, spread_price)
             try:
                 order = self.broker.close_spread_at_market(
                     p.underlying, p.expiration, p.right, p.short_strike, p.long_strike, qty,
@@ -659,7 +851,7 @@ class PositionManager:
                 continue
             if order.get("status") == "dry_run":
                 break
-            left = self._remaining_at_broker(p)
+            left = max(self._remaining_at_broker(p) - owner_extra, 0)
             if left <= expected_left:
                 break
             log.error("[%s] CLOSE_FAILED attempt %d/%d: broker still shows %d contracts (expected %d)",
@@ -670,7 +862,7 @@ class PositionManager:
         else:
             log.critical("[%s] CLOSE_FAILED: %s legs still open after %d attempts -- MANUAL ACTION REQUIRED",
                          key, p.root, config.CLOSE_MAX_RETRIES)
-            return []
+            return pre_rows
         exit_price = order.get("filled_avg_price") if order else None
         exit_price = float(exit_price) if exit_price is not None else spread_price
         fill_qty = p.remaining - left
@@ -706,24 +898,11 @@ class PositionManager:
         # from which P/L the bot treats as official.)
         exit_slippage = round(exit_price - spread_price, 2)
         entry_slippage = round(p.entry_mid - p.entry_credit, 2) if p.entry_mid is not None else None
-        scan = p.scan or {}
-        row = {
-            "date": now.date().isoformat(), "strategy": p.strategy,
-            "entry_time": p.entry_time, "exit_time": now,
-            "direction": p.direction, "setup": p.setup, "right": p.right,
-            "short_strike": p.short_strike, "long_strike": p.long_strike, "width": p.width,
-            "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
-            "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
-            "trigger_price": spread_price, "exit_slippage": exit_slippage,
-            "realistic_exit_price": realistic_exit_price, "pnl_actual_fill": pnl_actual_fill,
-            "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
-            "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
-            "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
-            "total_qty": p.qty, "root": p.root, "key": key, "ticker": p.ticker,
-            "expiration": p.expiration.isoformat(), "mfe": p.mfe, "mae": p.mae,
-            "scanner_score": scan.get("score"), "scanner_direction": scan.get("scanner_direction"),
-            "direction_match": scan.get("direction_match"),
-        }
+        row = self._make_row(p, key, now, fill_qty, reason, exit_price=exit_price, pnl=pnl,
+                             pnl_actual_fill=pnl_actual_fill, trigger_price=spread_price,
+                             exit_slippage=exit_slippage, realistic_exit_price=realistic_exit_price,
+                             prev_price=prev_price, prev_tick_pnl=prev_tick_pnl, prev_tick_jump=prev_tick_jump,
+                             entry_slippage=entry_slippage)
         log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (OFFICIAL, realistic "
                     "@%.2f) | actual broker fill would've booked %.2f | prev-tick %.2f (jump %+.2f, pnl "
                     "would've been %.2f) | position realized %.2f, %d left",
@@ -736,4 +915,31 @@ class PositionManager:
         self.journal.event("EXIT", now, **row)
         if p.remaining == 0:
             del self.positions[key]
-        return [row]
+        return pre_rows + [row]
+
+    def _make_row(self, p: OpenSpread, key: str, now: datetime, fill_qty: int, reason: str, *, exit_price: float,
+                  pnl: float, pnl_actual_fill: float, trigger_price: float, exit_slippage: float,
+                  realistic_exit_price: float, prev_price: float | None, prev_tick_pnl: float | None,
+                  prev_tick_jump: float | None, entry_slippage: float | None = None) -> dict:
+        """The EXIT row every close path (the bot's own and externally detected ones) hands to the journal,
+        the CSV, the cards and the risk manager -- call after p.closed_qty / p.realized_pnl are updated."""
+        scan = p.scan or {}
+        if entry_slippage is None and p.entry_mid is not None:
+            entry_slippage = round(p.entry_mid - p.entry_credit, 2)
+        return {
+            "date": now.date().isoformat(), "strategy": p.strategy,
+            "entry_time": p.entry_time, "exit_time": now,
+            "direction": p.direction, "setup": p.setup, "right": p.right,
+            "short_strike": p.short_strike, "long_strike": p.long_strike, "width": p.width,
+            "qty": fill_qty, "entry_credit": p.entry_credit, "exit_price": exit_price,
+            "pnl": pnl, "exit_reason": reason, "runner": "y" if p.runner else "n",
+            "trigger_price": trigger_price, "exit_slippage": exit_slippage,
+            "realistic_exit_price": realistic_exit_price, "pnl_actual_fill": pnl_actual_fill,
+            "prev_tick_price": prev_price, "prev_tick_pnl": prev_tick_pnl, "prev_tick_jump": prev_tick_jump,
+            "entry_mid": p.entry_mid, "entry_slippage": entry_slippage,
+            "position_closed": p.remaining == 0, "position_pnl": p.realized_pnl,
+            "total_qty": p.qty, "root": p.root, "key": key, "ticker": p.ticker,
+            "expiration": p.expiration.isoformat(), "mfe": p.mfe, "mae": p.mae,
+            "scanner_score": scan.get("score"), "scanner_direction": scan.get("scanner_direction"),
+            "direction_match": scan.get("direction_match"),
+        }

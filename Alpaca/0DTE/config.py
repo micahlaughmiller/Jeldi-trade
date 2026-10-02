@@ -17,8 +17,10 @@ ET = ZoneInfo("US/Eastern")
 
 # The selected persona determines both the Alpaca credentials and the names of
 # all local state/log files. Run one process per persona/account.
+# 2026-10-02: cut from nine personas to these five (CLAUDE, JAMES, SARAH, MARCUS dropped; their
+# override entries were removed from PERSONA_OVERRIDES below -- see git history to restore one).
 TRADER_NAMES = (
-    "ASTRA", "CLAUDE", "JAMES", "SARAH", "MARCUS", "ELENA", "DAVID", "ARIA", "JORDAN",
+    "ASTRA", "ARIA", "DAVID", "ELENA", "JORDAN",
 )
 ACTIVE_TRADER = os.getenv("ACTIVE_TRADER", "ASTRA").strip().upper()
 if ACTIVE_TRADER not in TRADER_NAMES:
@@ -51,6 +53,32 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
+# thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
+# spreads against what the broker actually holds; a position must look wrong on
+# EXTERNAL_SYNC_CONFIRM consecutive syncs (and be older than EXTERNAL_MIN_AGE_SEC) before the bot
+# acts, so a lagging positions API right after a fill can never make it drop a real position.
+EXTERNAL_SYNC_ENABLED = True
+EXTERNAL_SYNC_SEC = 10
+EXTERNAL_SYNC_CONFIRM = 2
+EXTERNAL_MIN_AGE_SEC = 30
+# Before booking a hand-close (or a partial one) at the moment a stop/target/force-close fires, the bot
+# reads the broker a second time this many seconds later and acts only if both reads agree.
+EXTERNAL_PREFLIGHT_RECHECK_SEC = 2
+# Adopt SPXW legs the bot has no record of (crash recovery) into its own books -- and so stop-manage and
+# force-close them at 15:30. True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
+# shared with the 45DTE bot and whatever the owner trades by hand (allow-listed in tools/check_sync.py).
+ADOPT_UNTRACKED_SPXW = True
+# The staged exit's Bollinger-edge reversal check uses this %B level. It used to read D_BAND_TOUCH_PCT_B,
+# the D/E ENTRY threshold, so tuning that for a test persona silently moved every strategy's exits.
+EXIT_BB_TOUCH_PCT_B = 0.95
+# After a position is recognized as closed by hand, that strategy takes no new entry for this long
+# (a deliberate cool-down), then is ready to open again.
+MANUAL_CLOSE_COOLDOWN_SEC = 120
+# Create logs/MANUAL_HOLD (every persona) or logs/MANUAL_HOLD_<NAME> (one persona) and the bot sends
+# NO closes -- stops, targets, floors and the end-of-day force-close all stand down -- until the file
+# is deleted. Hand-closes are still detected and booked. Remember to delete it.
+MANUAL_HOLD_FILE = "MANUAL_HOLD"
 # 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
 # broker fill (exit_price) swings wildly from the trigger price during fast moves (confirmed from real
 # data: 26% of all realized losses were pure execution slippage, skewed adverse, concentrated in
@@ -530,13 +558,24 @@ D_E_CANDLE_INTERVAL = "5m"
 # NOT reset at the open and rebuild from zero each session (that was a bug, not a design choice: D/E
 # should be able to fire any time during the day, same as D, using the prior session's tail candles
 # to fill the window early in a new day, not sitting out until today alone has accumulated 30 bars).
-# 4000 minutes (~2.75 days) comfortably reaches across a normal overnight gap AND a long weekend
-# (Friday close -> Monday open), so the window is realistically always full except right at the very
+# 6000 minutes (~4.2 days) reaches across a normal overnight gap AND a normal weekend (Friday close ->
+# Monday open; the old 4000 did not -- see below), so the window is realistically always full except right at the very
 # start of the bot's very first day ever running. D_E_MIN_CANDLES stays as a safety net for that
 # edge case (or a genuine data outage) -- it should now essentially always already be satisfied.
-D_E_LOOKBACK_MIN = 4000
+D_E_LOOKBACK_MIN = 6000
 D_E_MIN_CANDLES = 30
 E_CONFIRM_CANDLES = 2
+# 2026-10-02 (C/D/E never fired in the first two trending sessions). Three test levers, all defaulting to
+# the original behavior:
+#   D_E_LOOKBACK_MIN was 4000, which does NOT reach back across a weekend (Fri 15:20 at Monday's open): D/E
+#     had fewer than D_E_MIN_CANDLES bars until ~11:25 every Monday. 6000 (~4.2 days) covers it.
+#   E_USE_TREND_GATE False -> E decides direction from the side of the MA plus the band touch alone (no
+#     RISING/FALLING/CHOP gate). With the gate on, E needs D's exact setup AND two same-colour candles
+#     moving away from the band, which pull %B back inside the band -- it essentially never fires.
+#   C_ENTRY_END_MIN: how many minutes after the open Strategy C may still take an ES-overnight-level break
+#     (30 = only the 09:30-10:00 window, the original behavior; 60 = until 10:30).
+E_USE_TREND_GATE = True
+C_ENTRY_END_MIN = 30
 
 # ------------------------------------------------------ Strategy F: stock opening-range breakout
 # ASTRA only (PERSONA_OVERRIDES). The 30 names in data/orb_universe.json are scored by orb_scanner
@@ -604,8 +643,8 @@ TESTING_MAX_CONTRACTS = 6
 TESTING_HALF_SIZE_MAX_CONTRACTS = 3
 
 # ------------------------------------------------------------------ persona experiments
-# Nine personas firing on the same signal are one experiment run nine times. Give each one a different
-# parameter set here and every session yields nine comparisons. Keys are any UPPERCASE name defined
+# Personas firing on the same signal are one experiment run once per persona. Give each one a different
+# parameter set here and every session yields that many comparisons. Keys are any UPPERCASE name defined
 # above; the dict for ACTIVE_TRADER is applied on import, everyone else runs the defaults.
 # 2026-09-22 exit-floor experiment (Strategy A only; B untouched). ASTRA = control.
 #   method 1  bracket at the first step, runner keeps going: $10-wide arms at +0.20 with a +0.15 floor,
@@ -613,7 +652,11 @@ TESTING_HALF_SIZE_MAX_CONTRACTS = 3
 #   method 2  break-even lock: arms at +0.10, floor +0.05, both widths
 #   method 3  5-minute stale timer: no target yet but in profit -> floor at +0.05
 def _a(momentum_only=False, **extra) -> dict:
-    out = {"EXIT_TUNING_BY_STRATEGY": {**EXIT_TUNING_BY_STRATEGY, "A": {**A_BASE_TUNING, **extra}, "B": {}}}
+    # 2026-10-02: B's tuning (B_BASE_TUNING: REENTRY_ON_CONTINUATION_ENABLED) must survive. This used to set
+    # "B": {} -- which silently turned continuation re-entry OFF for every persona that used _a() (everyone but
+    # ASTRA) and is why only ASTRA kept re-entering the 10/1 breakout while the others took one trade.
+    out = {"EXIT_TUNING_BY_STRATEGY": {**EXIT_TUNING_BY_STRATEGY, "A": {**A_BASE_TUNING, **extra},
+                                       "B": dict(EXIT_TUNING_BY_STRATEGY.get("B", {}))}}
     if momentum_only:
         # 2026-09-24: A's day-type analysis flagged PULLBACK entries as the weaker of the two ORB/
         # ON_BREAK entry kinds (the one confirmed 2026-09-23 ORB loss was PULLBACK-tagged). Half the
@@ -622,39 +665,32 @@ def _a(momentum_only=False, **extra) -> dict:
     return out
 
 
-# 2026-10-01: A removed (see STRATEGIES above) -- CDE_STRATEGIES is now really "BCDE_STRATEGIES" but
-# keeps its name to avoid touching every PERSONA_OVERRIDES line below that references it.
-CDE_STRATEGIES = ("B", "C", "D", "E")
-
+# 2026-10-02: five personas, and C/D/E need to actually FIRE so they can be tested. The first two
+# sessions (both strong trend days) produced zero C/D/E signals; the investigation found the shipped
+# thresholds almost never allow one (D ~5% of days, E ~0%, C ~20-30%). So each strategy now has two
+# deliberately different test variants running side by side, and every variant is a plain config
+# override (the dict for ACTIVE_TRADER is applied on import, so any UPPERCASE constant can differ):
+#   C  DAVID spec window (09:30-10:00)          ELENA / JORDAN window extended to 10:30 (C_ENTRY_END_MIN 60)
+#   D  ARIA  BB 1.5 std, %B 0.85, chop 1.0      ELENA BB 1.0 std, %B 0.90, chop 1.0  (spec: 2.0 / 0.95 / 2.0)
+#   E  DAVID no trend gate, %B 0.95             JORDAN no trend gate, %B 0.85
+# D_* constants are shared by D and E inside one persona, which is why D and E variants live on
+# different personas. B is unchanged everywhere; F stays on ASTRA only.
 PERSONA_OVERRIDES: dict[str, dict] = {
     # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. 2026-10-01: A removed.
     "ASTRA":  {"STRATEGIES": ("B", "F")},
-    # momentum-only for A (one persona from each existing floor/timer method, both width tiers)
-    "ARIA":   _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
-    # 2026-09-25: ELENA and SARAH picked at random (random.sample over every remaining non-ASTRA,
-    # non-JAMES persona) as 2 of 4 additional personas to live-test Strategies C/D/E -- momentum-only
-    # tuning for A is preserved on both, unrelated to the new strategies.
+    "ARIA":   {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
+              "STRATEGIES": ("B", "D"),
+              "D_BB_STD": 1.5, "D_BAND_TOUCH_PCT_B": 0.85, "D_EMA_CHOP_THRESHOLD_PTS": 1.0},
     "ELENA":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}, momentum_only=True),  # method 2, $10-wide
-              "STRATEGIES": CDE_STRATEGIES},
-    "MARCUS": _a(STALE_TIMER_MIN=5, momentum_only=True),                                          # method 3, $5-wide
-    "SARAH":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),  # method 1, $5-wide
-              "STRATEGIES": CDE_STRATEGIES},
-    # both entry kinds for A, unchanged (ASTRA is the pure control: base tuning, both kinds, no floor/timer)
-    # 2026-09-25: JAMES picked at random (random.choice over every non-ASTRA persona) to live-test
-    # the brand-new Strategies C/D/E alongside A/B -- first real-money-shaped data for all three.
-    "JAMES":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}),  # method 2, $5-wide
-              "STRATEGIES": CDE_STRATEGIES},
-    # 2026-09-25: CLAUDE picked at random alongside ELENA/SARAH/JORDAN as 2nd-4th of 4 additional
-    # C/D/E personas.
-    "CLAUDE": {**_a(STALE_TIMER_MIN=5), "STRATEGIES": CDE_STRATEGIES},           # method 3, $5-wide
-    # 2026-09-24: 4-day factorial backtest sweep (144 combos) found the day-type gate (Kaufman ER >=
-    # 0.15, entry-only) was the single differentiator in every net-positive result -- it would have
-    # blocked exactly one A entry (09/24 12:25, ER read 0.13 vs 0.46 at the day's first signal) and
-    # that one skip is the entire swing from the committed build's backtested loss to a backtested
-    # gain. Testing it live on two personas, layered on top of their existing floor/timer method
-    # rather than isolated, since floor/timer is already a validated axis and the gate only touches
-    # entry (never exit), so the two effects can't interact.
-    "DAVID":  _a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, DAY_GATE_ENABLED=True),  # method 1, $10-wide + day-gate
-    "JORDAN": {**_a(STALE_TIMER_MIN=5, DAY_GATE_ENABLED=True), "STRATEGIES": CDE_STRATEGIES},         # method 3, $10-wide + day-gate
+              "STRATEGIES": ("B", "C", "D"), "C_ENTRY_END_MIN": 60,
+              "D_BB_STD": 1.0, "D_BAND_TOUCH_PCT_B": 0.90, "D_EMA_CHOP_THRESHOLD_PTS": 1.0},
+    # 2026-09-24: the day-type gate (Kaufman ER >= 0.15) was tested on DAVID/JORDAN for Strategy A; with A
+    # removed that gate is inert (it only ever lived in A's tuning), kept here only so their exit method
+    # labels stay as they were.
+    "DAVID":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, DAY_GATE_ENABLED=True),  # method 1, $10-wide
+              "STRATEGIES": ("B", "C", "E"), "E_USE_TREND_GATE": False},
+    "JORDAN": {**_a(STALE_TIMER_MIN=5, DAY_GATE_ENABLED=True),                                         # method 3, $10-wide
+              "STRATEGIES": ("B", "C", "E"), "C_ENTRY_END_MIN": 60,
+              "E_USE_TREND_GATE": False, "D_BAND_TOUCH_PCT_B": 0.85},
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

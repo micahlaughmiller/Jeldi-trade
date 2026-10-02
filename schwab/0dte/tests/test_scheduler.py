@@ -984,3 +984,50 @@ def test_continuation_reentry_fires_after_simulated_restart(bot, monkeypatch):
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args[1:4] == ("ON_BREAK", BULLISH, "MOMENTUM") and kwargs["strategies"] == ("B",)
+
+
+# ------------------------------------------------------------ C/D/E test levers (2026-10-02)
+
+def _gated_only(*a, use_trend_gate=True, **k):
+    """Stands in for mean_reversion_signal: no setup while the trend gate is on, a bullish one with it off."""
+    return None if use_trend_gate else "BULLISH"
+
+
+def test_e_without_the_trend_gate_fires_where_the_gated_signal_does_not(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
+    monkeypatch.setattr(config, "E_USE_TREND_GATE", False)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", _gated_only)
+    monkeypatch.setattr(scheduler.strategy, "two_candle_confirm", lambda *a, **k: True)
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert set(bot.pm.positions) == {"E"}          # D stays on its gate and sits out
+
+
+def test_e_keeps_the_trend_gate_by_default(bot, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIES", ("D", "E"))
+    assert config.E_USE_TREND_GATE is True
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles())
+    monkeypatch.setattr(scheduler.strategy, "mean_reversion_signal", _gated_only)
+    monkeypatch.setattr(scheduler.strategy, "two_candle_confirm", lambda *a, **k: True)
+    bot.check_mean_reversion_entry(et(12, 30), scheduler.Phase.ORB_ONLY)
+    assert bot.pm.positions == {}
+
+
+def test_c_runs_past_the_overnight_window_only_when_c_entry_end_min_allows(bot, monkeypatch):
+    from conftest import make_candles
+    calls = []
+    bot.refresh_levels = lambda now: None
+    monkeypatch.setattr(bot, "try_es_break_entry", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(bot, "try_on_break_entry", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler.market_data, "get_candles",
+                        lambda *a, **k: make_candles(et(10, 0), [(7600.0, 7601.0, 7599.0, 7600.0)], minutes=2))
+    assert config.C_ENTRY_END_MIN == 30
+    bot.tick(et(10, 15))                             # ORB_ONLY phase, 45 min after the open
+    assert calls == []
+    bot.last_candle = None
+    monkeypatch.setattr(config, "C_ENTRY_END_MIN", 60)
+    bot.tick(et(10, 15))
+    assert calls == [1]
+    bot.last_candle = None
+    bot.tick(et(10, 35))                             # 65 min after the open: past even the extended window
+    assert calls == [1]

@@ -342,12 +342,74 @@ class OrderManager:
     def dte(self, position: dict[str, Any]) -> int:
         return (_exp(position["expiration"]) - self.now_fn().date()).days
 
+    def _resolve_expired(self, position: dict[str, Any]) -> None:
+        """A position past its expiration date (only reachable when EXIT_DTE_ENABLED is off and it was
+        left to ride): the broker settles the legs itself, so there is nothing left to manage or close.
+        Once the legs are gone, book the record as expired. The realized P/L is not knowable from here
+        (cash settlement / assignment is the broker's), so exit_debit and realized_pl stay None -- but the
+        last mark before expiry and the unrealized P/L at that mark are kept on the record as an estimate
+        (last_price_before_expiry / est_realized_pl) for analysis. Equity options settle physically, so
+        shares of the underlying showing up at the broker (assignment or exercise) are flagged loudly;
+        this bot never manages them. Legs still showing keep the position untouched and re-alert daily."""
+        try:
+            legs = self.broker.get_positions()
+        except BrokerError as exc:
+            self.log.log_event("POLL_ERROR", f"{position['broker_symbol']} expired-position check: {exc}",
+                               spread_id=position["id"])
+            return
+        today = self.now_fn().date().isoformat()
+        if self._legs_still_open(position, legs):
+            if position.get("expired_alerted_on") != today:
+                position["expired_alerted_on"] = today
+                self.log.log_event("EXPIRED_STILL_OPEN", f"{position['broker_symbol']}: expired {position['expiration']} "
+                                   f"but legs still at broker; needs manual attention", spread_id=position["id"])
+            return
+        shares = sum(int(leg["qty"]) for leg in legs
+                     if leg.get("asset_class") != "option"
+                     and str(leg.get("underlying") or leg.get("symbol", "")).upper() == position["broker_symbol"].upper())
+        if shares:
+            self.log.log_event("EXPIRED_SHARES", f"{position['broker_symbol']}: {shares:+d} shares at the broker after "
+                               f"{position['expiration']} expiry (assignment/exercise?); the bot does not manage "
+                               f"shares -- handle manually", spread_id=position["id"], shares=shares)
+        position["last_price_before_expiry"] = position.get("current_price")
+        position["est_realized_pl"] = position.get("unrealized_pl")
+        self.log.log_event("EXPIRED", f"{position['broker_symbol']}: expired {position['expiration']}; settled at broker "
+                           f"(last mark {position['last_price_before_expiry']}, est. P/L {position['est_realized_pl']})",
+                           spread_id=position["id"])
+        self._record_close(position, None, "expired (settled at broker; exit price unknown)",
+                           position.get("close_order_id"))
+
+    def _profit_floor_trail_exit(self, position: dict[str, Any], price: float) -> bool:
+        """PROFIT_FLOOR_MODE "trail": once armed, track the best (lowest) spread price seen and exit at
+        market on the first PROFIT_FLOOR_TRAIL_TICK give-back from it -- but only if the mid price still shows
+        at least PROFIT_FLOOR_MIN_PROFIT of profit (a market close fills up to a half-spread worse). If the
+        move reversed through entry before the exit could fire, do not sell the loss: disarm, and let the position ride to the profit target or
+        expiration, re-arming only if it again reaches the arm level. Returns True if it exited."""
+        cfg = self.config
+        best = min(position.get("profit_floor_best", price), price)
+        position["profit_floor_best"] = best
+        if price - best < cfg.PROFIT_FLOOR_TRAIL_TICK - 1e-9:
+            return False
+        if price <= position["entry_credit"] - cfg.PROFIT_FLOOR_MIN_PROFIT + 1e-9:
+            return self.exit_at_market(
+                position, f"profit floor trail (armed, price {price} gave back {cfg.PROFIT_FLOOR_TRAIL_TICK:g} "
+                          f"from best {best})")
+        position["profit_floor_armed"] = False
+        position.pop("profit_floor_best", None)
+        self.log.log_event(
+            "PROFIT_FLOOR_DISARMED", f"{position['broker_symbol']}: reversed to {price} (entry {position['entry_credit']}) "
+            f"before the trail exit could book a profit; riding", spread_id=position["id"])
+        return False
+
     def maintain(self) -> None:
         cfg = self.config
         for position in list(self.state["positions"].values()):
             if self._check_close_filled(position):
                 continue
-            if self.dte(position) <= cfg.EXIT_DTE:
+            if self.dte(position) < 0:
+                self._resolve_expired(position)
+                continue
+            if cfg.EXIT_DTE_ENABLED and self.dte(position) <= cfg.EXIT_DTE:
                 self.exit_at_market(position, f"DTE {self.dte(position)} <= {cfg.EXIT_DTE}")
                 continue
             self._ensure_close_order(position)
@@ -356,14 +418,19 @@ class OrderManager:
                 arm_price = self._profit_floor_arm_price(position["entry_credit"])
                 if not position.get("profit_floor_armed") and price <= arm_price:
                     position["profit_floor_armed"] = True
+                    position["profit_floor_best"] = price
                     self.log.log_event(
                         "PROFIT_FLOOR_ARMED", f"{position['broker_symbol']}: armed at price {price} (arm level {arm_price})",
                         spread_id=position["id"])
                 if position.get("profit_floor_armed"):
-                    floor_price = self._profit_floor_price(position["entry_credit"])
-                    if price >= floor_price:
-                        self.exit_at_market(position, f"profit floor (armed, price {price} >= floor {floor_price})")
-                        continue
+                    if cfg.PROFIT_FLOOR_MODE == "trail":
+                        if self._profit_floor_trail_exit(position, price):
+                            continue
+                    else:
+                        floor_price = self._profit_floor_price(position["entry_credit"])
+                        if price >= floor_price:
+                            self.exit_at_market(position, f"profit floor (armed, price {price} >= floor {floor_price})")
+                            continue
             if self.risk.is_max_loss_hit(position["entry_credit"], price, spread_width(position)):
                 if not position.get("max_loss_hit"):
                     position["max_loss_hit"] = True
@@ -404,11 +471,12 @@ class OrderManager:
         self._record_close(position, order.get("filled_avg_price"), reason, order["id"])
         return True
 
-    def _legs_still_open(self, position: dict[str, Any]) -> list[str]:
-        try:
-            legs = self.broker.get_positions()
-        except BrokerError:
-            return []
+    def _legs_still_open(self, position: dict[str, Any], legs: list[dict[str, Any]] | None = None) -> list[str]:
+        if legs is None:
+            try:
+                legs = self.broker.get_positions()
+            except BrokerError:
+                return []
         exp = _exp(position["expiration"])
         return [
             leg["symbol"] for leg in legs

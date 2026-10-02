@@ -15,7 +15,9 @@ filled against live Schwab quotes (paper_sim.py), `dry_run` only logs order
 payloads, and `live` sends real orders -- but only when SCHWAB_LIVE_ORDERS=true is
 also set; otherwise live is forced back to dry-run.
 Strategy parameters below are identical to Alpaca/45DTE/config_45dte.py; only
-the broker section differs. Run tools/check_sync.py to confirm.
+the broker section differs -- except the exit rules (EXIT_DTE_ENABLED, MAX_LOSS_EXIT,
+PROFIT_FLOOR_MODE/_ARM_PCT_OF_TARGET/_TRAIL_TICK), which are deliberately Schwab-only
+and are allow-listed in tools/check_sync.py. Run tools/check_sync.py to confirm.
 """
 
 import os
@@ -91,17 +93,29 @@ DAILY_LOSS_ALERT_PCT = 0.03
 
 PROFIT_TARGET_PCT = 0.50
 EXIT_DTE = 7
-MAX_LOSS_EXIT = True
-# 2026-09-25: motivated by a real trade that reached 0.48 (40% of max profit, entry 0.80, target
-# 0.40 = 50% of max) then reversed straight through entry to 0.95 -- a near-winner that round-
-# tripped to a loss with no giveback protection at all. Once a position reaches
-# PROFIT_FLOOR_ARM_PCT_OF_TARGET of the way to the profit target (0.85 * 50% = 42.5% of max profit),
-# it arms a HARD FLOOR at PROFIT_FLOOR_PCT_OF_MAX of max profit (30%) -- a fixed level, not a trail
-# off the best price seen, so an armed position that gives back everything still exits with at
-# least 30% rather than riding all the way back through entry.
+# 2026-10-02, Schwab only (the user's call after a position was stopped out at max loss with plenty of
+# time left to recover): the ONLY exits are (1) the GTC close at PROFIT_TARGET_PCT of max profit and
+# (2) the tick trail below. No DTE force-close and no max-loss stop -- a position that is under water
+# rides to the profit target or to expiration. Max-loss hits are still counted toward the circuit
+# breaker (new entries halt after MAX_LOSS_HITS_CIRCUIT_BREAKER of them); they just no longer close
+# the position. Alpaca/45DTE keeps the original rules (EXIT_DTE_ENABLED/MAX_LOSS_EXIT on, fixed floor).
+EXIT_DTE_ENABLED = False
+MAX_LOSS_EXIT = False
+# Profit floor, "trail" mode: once a position gets PROFIT_FLOOR_ARM_PCT_OF_TARGET (40%) of the way to
+# the profit target (40% of a 50%-of-max target = 20% of max profit; entry 1.60 arms at 1.30), the next
+# PROFIT_FLOOR_TRAIL_TICK (5 cents) give-back from the best price seen exits at market for whatever
+# profit that is. If the price reverses through entry before that exit can fire (unrealized P/L not
+# positive), nothing is sold: the floor disarms and the position rides, re-arming if it gets back to
+# the arm level. (Original 2026-09-25 background: a real trade reached 0.48 on a 0.80 entry, then
+# reversed through entry with no giveback protection at all.)
 PROFIT_FLOOR_ENABLED = True
-PROFIT_FLOOR_ARM_PCT_OF_TARGET = 0.85
-PROFIT_FLOOR_PCT_OF_MAX = 0.30
+PROFIT_FLOOR_MODE = "trail"
+PROFIT_FLOOR_TRAIL_TICK = 0.05
+# The trail only sells when the mid price still shows at least this much profit (a market close fills
+# at the natural price, up to a half-spread worse than the mid); otherwise it disarms and rides.
+PROFIT_FLOOR_MIN_PROFIT = 0.05
+PROFIT_FLOOR_ARM_PCT_OF_TARGET = 0.40
+PROFIT_FLOOR_PCT_OF_MAX = 0.30   # only used by PROFIT_FLOOR_MODE "fixed"
 ENTRY_TIME_IN_FORCE = "day"
 PRICE_REDUCTION_INTERVAL_MIN = 60
 PRICE_REDUCTION_AMOUNT = 0.02

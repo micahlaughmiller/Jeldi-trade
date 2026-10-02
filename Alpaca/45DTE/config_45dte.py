@@ -78,6 +78,18 @@ MAX_LOSS_EXIT = True
 PROFIT_FLOOR_ENABLED = True
 PROFIT_FLOOR_ARM_PCT_OF_TARGET = 0.85
 PROFIT_FLOOR_PCT_OF_MAX = 0.30
+# 2026-10-02 exit-rule selectors (the Schwab folder overrides them; see its config_45dte.py). The
+# defaults below reproduce the original behavior exactly.
+#   EXIT_DTE_ENABLED False  -> never force-close on DTE; positions ride to expiration.
+#   PROFIT_FLOOR_MODE "fixed" -> the hard floor at PROFIT_FLOOR_PCT_OF_MAX described above.
+#   PROFIT_FLOOR_MODE "trail" -> once armed, exit at market on the first PROFIT_FLOOR_TRAIL_TICK
+#     give-back from the best price seen, if that still books a profit (else disarm and ride).
+EXIT_DTE_ENABLED = True
+PROFIT_FLOOR_MODE = "fixed"
+PROFIT_FLOOR_TRAIL_TICK = 0.05
+# "trail" mode only sells when the mid price still shows at least this much profit (a market close
+# fills at the natural price, up to a half-spread worse than the mid); otherwise it disarms and rides.
+PROFIT_FLOOR_MIN_PROFIT = 0.05
 ENTRY_TIME_IN_FORCE = "day"
 PRICE_REDUCTION_INTERVAL_MIN = 60
 PRICE_REDUCTION_AMOUNT = 0.02

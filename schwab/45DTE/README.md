@@ -94,8 +94,15 @@ where you launch from. Ctrl+C saves state and exits.
    get a close for the filled size; the close is replaced when the rest fills.
 6. **Maintenance** every 60 s: detect fills, price reductions, re-create any close order
    that went missing/canceled/rejected/expired, refresh spread price (short mid - long
-   mid) for P&L, exit at market when DTE <= 7 or when the spread trades at/beyond 90 %
-   of max loss (`MAX_LOSS_EXIT`). Each max-loss hit counts toward the circuit breaker.
+   mid) for P&L, then apply the exit rules. **Schwab's only exits** are the GTC close at
+   50 % of max profit and the profit-floor trail: once the spread is 40 % of the way to that
+   target (20 % of max profit) the first 5-cent give-back from the best price exits at market
+   -- if it still shows at least `PROFIT_FLOOR_MIN_PROFIT` of profit; if it reversed through
+   entry first, the floor disarms and the position rides. There is **no DTE force-exit and no
+   max-loss stop** (`EXIT_DTE_ENABLED`/`MAX_LOSS_EXIT` are off): an under-water spread rides to
+   the target or to expiration, where the broker settles it (booked `expired`, P&L unknown, with
+   the last mark kept as an estimate; shares left by assignment are flagged `EXPIRED_SHARES`).
+   Each max-loss *mark* still counts toward the circuit breaker.
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -107,8 +114,9 @@ where you launch from. Ctrl+C saves state and exits.
 
 Three spreads hitting max loss (current price >= credit + 0.9 x (5 - credit), or a
 realized loss >= 90 % of max loss) trip the breaker: no new entries until you restart
-with `--reset-breaker`. Existing positions are still managed. State persists in
-`logs/state.json`.
+with `--reset-breaker`. Existing positions are still managed. On Schwab (no max-loss stop)
+a hit is recorded when the spread's *mark* first reaches that level, even if it later
+recovers. State persists in `logs/state.json`.
 
 ## Files written to `logs/`
 
@@ -164,8 +172,11 @@ touch the network. `tests/test_broker_schwab.py` covers the Schwab broker with a
 | `MAX_LOSS_HIT_PCT` | `0.90` | fraction of max loss that counts as a hit / triggers exit |
 | `DAILY_LOSS_ALERT_PCT` | `0.03` | equity drop from day start that logs `DAILY_LOSS_ALERT` |
 | `PROFIT_TARGET_PCT` | `0.50` | GTC close debit = credit x (1 - this), rounded to $0.05 |
-| `EXIT_DTE` | `7` | close at market at or below this DTE |
-| `MAX_LOSS_EXIT` | `True` | close at market when a max-loss hit is detected |
+| `EXIT_DTE` | `7` | close at market at or below this DTE (only when `EXIT_DTE_ENABLED`) |
+| `EXIT_DTE_ENABLED` | `False` (Schwab) | `False` = never force-close on DTE; positions ride to expiration |
+| `MAX_LOSS_EXIT` | `False` (Schwab) | `True` = close at market on a max-loss hit; hits are counted toward the breaker either way |
+| `PROFIT_FLOOR_ENABLED` / `_ARM_PCT_OF_TARGET` | `True` / `0.40` (Schwab) | floor arms 40% of the way to the target (20% of max profit) |
+| `PROFIT_FLOOR_MODE` / `PROFIT_FLOOR_TRAIL_TICK` | `trail` / `0.05` (Schwab) | once armed, exit at market on the first 5-cent give-back from the best price if that still books a profit; if it reversed through entry first, disarm and ride |
 | `ENTRY_TIME_IN_FORCE` | `day` | entry orders; closes are always `gtc` |
 | `PRICE_REDUCTION_INTERVAL_MIN` / `PRICE_REDUCTION_AMOUNT` | `60` / `0.02` | entry limit walk-down |
 | `CANCEL_UNFILLED_AT` | `15:55` | cancel working entries; no new entries after this |

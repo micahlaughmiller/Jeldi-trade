@@ -68,8 +68,10 @@ where you launch from. Ctrl+C saves state and exits.
    get a close for the filled size; the close is replaced when the rest fills.
 6. **Maintenance** every 60 s: detect fills, price reductions, re-create any close order
    that went missing/canceled/rejected/expired, refresh spread price (short mid - long
-   mid) for P&L, exit at market when DTE <= 7 or when the spread trades at/beyond 90 %
-   of max loss (`MAX_LOSS_EXIT`). Each max-loss hit counts toward the circuit breaker.
+   mid) for P&L, then apply the exit rules: exit at market when DTE <= 7
+   (`EXIT_DTE_ENABLED`), when the spread trades at/beyond 90 % of max loss (`MAX_LOSS_EXIT`),
+   or on the profit floor (arms 85 % of the way to the target, then a fixed floor at 30 % of
+   max profit). Each max-loss hit counts toward the circuit breaker.
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -137,6 +139,9 @@ touch the network. `tests/live_smoke_alpaca.py` is the broker author's live smok
 | `PROFIT_TARGET_PCT` | `0.50` | GTC close debit = credit x (1 - this), rounded to $0.05 |
 | `EXIT_DTE` | `7` | close at market at or below this DTE |
 | `MAX_LOSS_EXIT` | `True` | close at market when a max-loss hit is detected |
+| `EXIT_DTE_ENABLED` | `True` | `False` = never force-close on DTE; positions ride to expiration |
+| `PROFIT_FLOOR_ENABLED` / `_ARM_PCT_OF_TARGET` / `_PCT_OF_MAX` | `True` / `0.85` / `0.30` | profit floor: arms 85% of the way to the target, then a fixed floor at 30% of max profit |
+| `PROFIT_FLOOR_MODE` / `PROFIT_FLOOR_TRAIL_TICK` | `fixed` / `0.05` | `trail` = once armed, exit at market on the first tick give-back from the best price if still profitable |
 | `ENTRY_TIME_IN_FORCE` | `day` | entry orders; closes are always `gtc` |
 | `PRICE_REDUCTION_INTERVAL_MIN` / `PRICE_REDUCTION_AMOUNT` | `60` / `0.02` | entry limit walk-down |
 | `CANCEL_UNFILLED_AT` | `15:55` | cancel working entries; no new entries after this |

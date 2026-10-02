@@ -12,6 +12,28 @@ from order_manager import OrderManager, spread_id
 ET = ZoneInfo("US/Eastern")
 EXP = date(2026, 11, 6)
 
+ORIGINAL_EXIT_RULES = dict(EXIT_DTE_ENABLED=True, MAX_LOSS_EXIT=True, PROFIT_FLOOR_ENABLED=True,
+                           PROFIT_FLOOR_MODE="fixed", PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.85,
+                           PROFIT_FLOOR_PCT_OF_MAX=0.30, PROFIT_FLOOR_TRAIL_TICK=0.05,
+                           PROFIT_FLOOR_MIN_PROFIT=0.05)
+TRAIL_EXIT_RULES = dict(EXIT_DTE_ENABLED=False, MAX_LOSS_EXIT=False, PROFIT_FLOOR_ENABLED=True,
+                        PROFIT_FLOOR_MODE="trail", PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.40,
+                        PROFIT_FLOOR_TRAIL_TICK=0.05, PROFIT_FLOOR_MIN_PROFIT=0.05)
+
+
+@pytest.fixture(autouse=True)
+def _original_exit_rules(monkeypatch):
+    """Pin the original exit rules so the tests below mean the same thing in every broker folder (the
+    Schwab folder's own config overrides several of them); the trail-mode tests opt in explicitly."""
+    for key, value in ORIGINAL_EXIT_RULES.items():
+        monkeypatch.setattr(config_45dte, key, value)
+
+
+@pytest.fixture
+def trail_rules(monkeypatch):
+    for key, value in TRAIL_EXIT_RULES.items():
+        monkeypatch.setattr(config_45dte, key, value)
+
 
 class Clock:
     def __init__(self, start: datetime) -> None:
@@ -349,6 +371,216 @@ class TestProfitFloor:
         set_chain(broker, 0.60, 0.30)    # price 0.30 -- would have armed if enabled
         om.maintain()
         assert not pos.get("profit_floor_armed") and len(om.positions) == 1
+
+
+class TestTrailFloor:
+    """Schwab's rules: no DTE exit, no max-loss exit, floor arms 40% of the way to the 50% target.
+    entry_credit=1.60 -> target 0.80, arm level 1.30 (20% of max profit); then the first 0.05 give-back
+    from the best price exits at market -- but only if that still books a profit."""
+
+    @pytest.fixture(autouse=True)
+    def _trail(self, trail_rules):
+        pass
+
+    def _open_position(self, env, credit=1.60, qty=2):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(credit), qty)
+        broker.fill_order(oid, credit)
+        om.poll_entries()
+        return om.positions[0]
+
+    def test_arms_at_forty_percent_of_target_and_not_before(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.55, 0.20)   # price 1.35 -- short of the 1.30 arm level
+        om.maintain()
+        assert not pos.get("profit_floor_armed")
+        set_chain(broker, 1.50, 0.20)   # price 1.30 -- exactly the arm level
+        om.maintain()
+        assert pos["profit_floor_armed"] is True and pos["profit_floor_best"] == 1.30
+        assert len(om.positions) == 1
+
+    def test_first_nickel_giveback_exits_for_a_profit(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        close_id = pos["close_order_id"]
+        set_chain(broker, 1.50, 0.30)   # price 1.20: arms, nothing to give back yet
+        om.maintain()
+        assert pos["profit_floor_armed"] is True and len(om.positions) == 1
+        set_chain(broker, 1.55, 0.30)   # price 1.25: +0.05 off the 1.20 best
+        om.maintain()
+        assert om.positions == []
+        assert broker.orders[close_id]["status"] == "canceled"
+        closed = om.state["closed"][-1]
+        assert closed["exit_debit"] == 1.25 and "profit floor trail" in closed["close_reason"]
+        assert closed["realized_pl"] == pytest.approx((1.60 - 1.25) * 100 * 2)
+
+    def test_trail_follows_new_lows_and_ignores_smaller_wobbles(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        for short_mid, expect_best in ((1.50, 1.20), (1.40, 1.10), (1.43, 1.10), (1.44, 1.10)):
+            set_chain(broker, short_mid, 0.30)
+            om.maintain()
+            assert pos["profit_floor_best"] == expect_best and len(om.positions) == 1   # +0.03/+0.04: held
+        set_chain(broker, 1.45, 0.30)   # price 1.15: exactly 0.05 off the 1.10 best
+        om.maintain()
+        assert om.positions == [] and om.state["closed"][-1]["exit_debit"] == 1.15
+
+    def test_unarmed_position_never_exits_on_a_giveback(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        for short_mid in (1.55, 1.60, 1.70, 1.52):   # prices 1.35/1.40/1.50/1.32: all above the 1.30 arm level
+            set_chain(broker, short_mid, 0.20)
+            om.maintain()
+        assert len(om.positions) == 1 and not pos.get("profit_floor_armed")
+
+    def test_reversal_through_entry_disarms_instead_of_selling_a_loss_then_rearms(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.50, 0.30)   # price 1.20: arms
+        om.maintain()
+        set_chain(broker, 2.00, 0.30)   # price 1.70 -- through entry (1.60) before the exit could fire
+        om.maintain()
+        assert len(om.positions) == 1 and pos["profit_floor_armed"] is False
+        assert "profit_floor_best" not in pos
+        set_chain(broker, 1.55, 0.30)   # back to 1.25: re-arms
+        om.maintain()
+        assert pos["profit_floor_armed"] is True and pos["profit_floor_best"] == 1.25
+        set_chain(broker, 1.60, 0.30)   # 1.30: +0.05 off best, still a profit
+        om.maintain()
+        assert om.positions == [] and om.state["closed"][-1]["exit_debit"] == 1.30
+
+    def test_giveback_to_exactly_entry_is_not_a_profit_so_it_rides(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.50, 0.30)
+        om.maintain()
+        set_chain(broker, 1.90, 0.30)   # price 1.60 == entry credit: zero P/L
+        om.maintain()
+        assert len(om.positions) == 1 and pos["profit_floor_armed"] is False
+
+    def test_no_dte_exit_and_no_max_loss_exit_but_the_breaker_still_counts(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env, credit=1.50, qty=1)
+        clock.now = datetime.combine(EXP - timedelta(days=3), datetime.min.time(), tzinfo=ET).replace(hour=10)
+        set_chain(broker, 6.00, 1.30)   # price 4.70 -- past the 90%-of-max-loss mark
+        om.maintain()
+        assert len(om.positions) == 1 and pos["max_loss_hit"] is True
+        assert om.risk.max_loss_hits == 1
+        assert not any(c[0] == "close_spread_at_market" for c in broker.calls)
+
+    def test_giveback_that_leaves_under_the_minimum_profit_rides_instead_of_selling(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.50, 0.30)   # 1.20: arms
+        om.maintain()
+        set_chain(broker, 1.87, 0.30)   # 1.57: still 0.03 of mid profit, but a market fill could land at a loss
+        om.maintain()
+        assert len(om.positions) == 1 and pos["profit_floor_armed"] is False
+        assert not any(c[0] == "close_spread_at_market" for c in broker.calls)
+
+    def test_exit_error_while_armed_keeps_it_armed_and_retries_next_poll(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.50, 0.30)   # 1.20: arms
+        om.maintain()
+        set_chain(broker, 1.55, 0.30)   # 1.25: trips
+        broker.fail_on.add("close_spread_at_market")
+        om.maintain()
+        assert len(om.positions) == 1 and pos["profit_floor_armed"] is True and pos["close_order_id"] is None
+        broker.fail_on.discard("close_spread_at_market")
+        om.maintain()
+        assert om.positions == [] and om.state["closed"][-1]["exit_debit"] == 1.25
+
+    def test_armed_state_survives_a_restart_and_a_missing_best_reseeds_from_the_current_price(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        set_chain(broker, 1.50, 0.30)   # 1.20: arms, best 1.20
+        om.maintain()
+        om2 = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp / "state.json")
+        reloaded = om2.positions[0]
+        assert reloaded["profit_floor_armed"] is True and reloaded["profit_floor_best"] == 1.20
+        # an armed position with no recorded best (armed under "fixed" mode, then switched) reseeds
+        del reloaded["profit_floor_best"]
+        set_chain(broker, 1.45, 0.30)   # 1.15
+        om2.maintain()
+        assert reloaded["profit_floor_best"] == 1.15 and len(om2.positions) == 1
+
+    def test_trail_mode_with_the_max_loss_stop_re_enabled_still_stops_out_after_a_disarm(self, env, monkeypatch):
+        clock, broker, log, om, tmp = env
+        monkeypatch.setattr(config_45dte, "MAX_LOSS_EXIT", True)
+        pos = self._open_position(env, credit=1.50, qty=1)
+        set_chain(broker, 1.40, 0.30)    # 1.10: arms
+        om.maintain()
+        set_chain(broker, 2.00, 0.30)    # 1.70: through entry -> disarms (no exit)
+        om.maintain()
+        assert len(om.positions) == 1 and pos["profit_floor_armed"] is False
+        set_chain(broker, 6.00, 1.30)    # 4.70: max loss -> the re-enabled stop fires
+        om.maintain()
+        assert om.positions == [] and "max loss" in om.state["closed"][-1]["close_reason"]
+
+    def test_gtc_profit_target_order_still_rests_at_half_the_credit(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._open_position(env)
+        assert broker.orders[pos["close_order_id"]]["limit_price"] == 0.80
+
+
+class TestExpiredPositions:
+    """With the DTE exit off a position can reach expiration; the broker settles it, not the bot."""
+
+    @pytest.fixture(autouse=True)
+    def _trail(self, trail_rules):
+        pass
+
+    def _expired(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 2)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        clock.now = datetime.combine(EXP + timedelta(days=1), datetime.min.time(), tzinfo=ET).replace(hour=10)
+        return om.positions[0]
+
+    def test_settled_legs_book_the_record_as_expired_without_placing_any_order(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._expired(env)
+        pos["current_price"], pos["unrealized_pl"] = 3.10, -300.0   # the last mark before expiry
+        broker.positions = []   # the broker settled both legs
+        calls_before = len(broker.calls)
+        om.maintain()
+        assert om.positions == []
+        closed = om.state["closed"][-1]
+        assert "expired" in closed["close_reason"] and closed["exit_debit"] is None and closed["realized_pl"] is None
+        assert closed["last_price_before_expiry"] == 3.10 and closed["est_realized_pl"] == -300.0
+        assert log.counts["EXPIRED_SHARES"] == 0
+        new_calls = [c[0] for c in broker.calls[calls_before:]]
+        assert "place_close_spread" not in new_calls and "close_spread_at_market" not in new_calls
+
+    def test_legs_still_at_the_broker_leave_the_position_untouched(self, env):
+        clock, broker, log, om, tmp = env
+        pos = self._expired(env)
+        om.maintain()
+        om.maintain()
+        assert len(om.positions) == 1 and log.counts["EXPIRED_STILL_OPEN"] == 1   # once per day, not per poll
+        first_day = pos["expired_alerted_on"]
+        clock.advance(days=1)
+        om.maintain()
+        assert pos["expired_alerted_on"] != first_day and log.counts["EXPIRED_STILL_OPEN"] == 1   # again, next day
+        assert not any(c[0] == "close_spread_at_market" for c in broker.calls)
+
+    def test_shares_left_by_assignment_are_flagged_loudly(self, env):
+        clock, broker, log, om, tmp = env
+        self._expired(env)
+        broker.positions = [{"symbol": "XYZ", "underlying": "XYZ", "qty": 200, "asset_class": "stock",
+                             "expiration": None, "strike": None, "right": None}]
+        om.maintain()
+        assert om.positions == [] and log.counts["EXPIRED_SHARES"] == 1
+
+    def test_a_broker_error_while_checking_does_not_book_it(self, env):
+        clock, broker, log, om, tmp = env
+        self._expired(env)
+        broker.fail_on.add("get_positions")
+        om.maintain()
+        assert len(om.positions) == 1
 
 
 class TestAdoptAndReconcile:

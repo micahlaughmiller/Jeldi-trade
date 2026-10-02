@@ -16,6 +16,8 @@ ORIGINAL_EXIT_RULES = dict(EXIT_DTE_ENABLED=True, MAX_LOSS_EXIT=True, PROFIT_FLO
                            PROFIT_FLOOR_MODE="fixed", PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.85,
                            PROFIT_FLOOR_PCT_OF_MAX=0.30, PROFIT_FLOOR_TRAIL_TICK=0.05,
                            PROFIT_FLOOR_MIN_PROFIT=0.05)
+MANUAL_OVERRIDE_RULES = dict(EXTERNAL_EXIT_RECHECK_SEC=0, EXTERNAL_SYNC_ENABLED=True, EXTERNAL_SYNC_CONFIRM_CYCLES=2,
+                             EXTERNAL_SYNC_MIN_AGE_SEC=120, MANUAL_CLOSE_COOLDOWN_SEC=120)
 TRAIL_EXIT_RULES = dict(EXIT_DTE_ENABLED=False, MAX_LOSS_EXIT=False, PROFIT_FLOOR_ENABLED=True,
                         PROFIT_FLOOR_MODE="trail", PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.40,
                         PROFIT_FLOOR_TRAIL_TICK=0.05, PROFIT_FLOOR_MIN_PROFIT=0.05)
@@ -23,9 +25,10 @@ TRAIL_EXIT_RULES = dict(EXIT_DTE_ENABLED=False, MAX_LOSS_EXIT=False, PROFIT_FLOO
 
 @pytest.fixture(autouse=True)
 def _original_exit_rules(monkeypatch):
-    """Pin the original exit rules so the tests below mean the same thing in every broker folder (the
-    Schwab folder's own config overrides several of them); the trail-mode tests opt in explicitly."""
-    for key, value in ORIGINAL_EXIT_RULES.items():
+    """Pin the original exit rules (and the manual-override sync settings) so the tests below mean the same
+    thing in every broker folder (the Schwab folder's own config overrides several of the exit rules); the
+    trail-mode tests opt in explicitly."""
+    for key, value in {**ORIGINAL_EXIT_RULES, **MANUAL_OVERRIDE_RULES}.items():
         monkeypatch.setattr(config_45dte, key, value)
 
 
@@ -222,12 +225,13 @@ class TestMaintenance:
         om.poll_entries()
         return om.positions[0]
 
-    def test_recreates_canceled_close_order(self, env):
+    def test_recreates_rejected_close_order(self, env):
+        # ('canceled' / 'replaced' are owner actions in thinkorswim and are NOT re-created: see TestOwnerCloseOrderChanges)
         clock, broker, log, om, tmp = env
         pos = self._open_position(env)
         set_chain(broker, 2.50, 1.20)
         old = pos["close_order_id"]
-        broker.orders[old]["status"] = "canceled"
+        broker.orders[old]["status"] = "rejected"
         om.maintain()
         assert pos["close_order_id"] != old
         assert broker.orders[pos["close_order_id"]]["status"] == "accepted"
@@ -673,6 +677,645 @@ class TestAdoptAndReconcile:
         assert any(e["type"] == "RECONCILE_MISMATCH" for e in events)
 
 
+# =============================================================================================
+# Manual overrides: the owner closes / cancels / edits things by hand in thinkorswim and the bot
+# must follow the broker's reality instead of fighting it. `broker.positions` (a plain list) and
+# `broker.orders` are edited directly below to simulate what happens in TOS.
+# =============================================================================================
+
+
+def events(tmp, kind=None):
+    out = []
+    for path in sorted(tmp.glob("session_*.jsonl")):
+        out += [json.loads(line) for line in path.read_text().splitlines()]
+    return [e for e in out if kind is None or e["type"] == kind]
+
+
+def open_position(env, credit=1.60, qty=2, aged=True, symbol="XYZ"):
+    """Entry filled and tracked. `aged` moves the clock past EXTERNAL_SYNC_MIN_AGE_SEC so the sync looks at it."""
+    clock, broker, log, om, tmp = env
+    oid = om.submit_entry(spec(credit, symbol=symbol), qty)
+    broker.fill_order(oid, credit)
+    om.poll_entries()
+    if aged:
+        clock.advance(seconds=config_45dte.EXTERNAL_SYNC_MIN_AGE_SEC + 10)
+    return next(p for p in om.positions if p["broker_symbol"] == symbol)
+
+
+def drop_leg(broker, strike):
+    broker.positions = [p for p in broker.positions if p["strike"] != strike]
+
+
+def set_held(broker, strike, qty):
+    next(p for p in broker.positions if p["strike"] == strike)["qty"] = qty
+
+
+def cycles(clock, om, n=1, seconds=60):
+    for _ in range(n):
+        clock.advance(seconds=seconds)
+        om.maintain()
+
+
+def calls(broker, name, since=0):
+    return [c for c in broker.calls[since:] if c[0] == name]
+
+
+def dte_7(clock):
+    clock.now = datetime.combine(EXP - timedelta(days=7), datetime.min.time(), tzinfo=ET).replace(hour=10)
+
+
+class TestExternalSync:
+    def test_a_single_absent_cycle_does_nothing(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        close_id = pos["close_order_id"]
+        saved = [dict(p) for p in broker.positions]
+        broker.positions = []                    # closed by hand in TOS... seen once (a lagging read looks the same)
+        n = len(broker.calls)
+        cycles(clock, om)
+        assert len(om.positions) == 1 and pos["ext_obs"]["n"] == 1
+        assert broker.orders[close_id]["status"] == "accepted"
+        assert not calls(broker, "cancel_order", n) and not calls(broker, "place_close_spread", n)
+        broker.positions = saved                 # the next read shows the legs again: the counter resets
+        cycles(clock, om)
+        assert "ext_obs" not in pos and len(om.positions) == 1
+        broker.positions = []
+        cycles(clock, om)                        # absent once more, but the count restarted from zero
+        assert len(om.positions) == 1 and pos["ext_obs"]["n"] == 1 and log.counts["EXTERNAL_CLOSE"] == 0
+
+    def test_both_legs_gone_for_the_confirm_cycles_books_a_manual_close(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        set_chain(broker, 2.50, 1.20)            # mark 1.30
+        cycles(clock, om)
+        assert pos["current_price"] == 1.30
+        close_id = pos["close_order_id"]
+        broker.positions = []
+        n = len(broker.calls)
+        cycles(clock, om)
+        assert len(om.positions) == 1            # first absent read: only an observation
+        cycles(clock, om)
+        assert om.positions == []
+        closed = om.state["closed"][-1]
+        assert closed["close_reason"] == "closed outside the bot (manual)"
+        assert closed["exit_debit"] is None and closed["realized_pl"] is None
+        assert closed["last_price_before_exit"] == 1.30
+        assert closed["est_realized_pl"] == pytest.approx((1.60 - 1.30) * 100 * 2)
+        assert broker.orders[close_id]["status"] == "canceled"
+        assert log.counts["EXTERNAL_CLOSE"] == 1 and log.counts["CLOSE_ERROR"] == 0 and om.risk.max_loss_hits == 0
+        assert not calls(broker, "close_spread_at_market", n) and not calls(broker, "place_close_spread", n)
+        assert json.loads((tmp / "state.json").read_text())["positions"] == {}
+        cycles(clock, om)                        # nothing left to look at: no ghost, no errors
+        assert log.counts["CLOSE_ERROR"] == 0 and om.blocked_symbols == set()
+
+    def test_a_ghost_cannot_feed_the_breaker_through_a_max_loss_mark(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, credit=1.50, qty=1)
+        broker.positions = []
+        set_chain(broker, 6.00, 1.30)            # the quote now says max loss (4.70) for a spread that no longer exists
+        cycles(clock, om, 3)
+        assert om.positions == [] and om.risk.max_loss_hits == 0 and not om.risk.breaker_tripped
+        assert om.state["closed"][-1]["exit_debit"] is None
+        assert not calls(broker, "close_spread_at_market")
+
+    def test_a_fresh_position_is_not_checked_until_the_min_age(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, aged=False)
+        broker.positions = []
+        n = len(broker.calls)
+        cycles(clock, om, 3, seconds=30)         # 30 / 60 / 90 seconds old: too young to judge
+        assert len(om.positions) == 1 and not calls(broker, "get_positions", n)
+        cycles(clock, om, 1, seconds=40)         # 130 s: first observation
+        assert len(om.positions) == 1 and pos["ext_obs"]["n"] == 1
+        cycles(clock, om)
+        assert om.positions == []
+
+    def test_a_fresh_fill_restarts_the_min_age(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 4)
+        broker.fill_order(oid, 1.60, qty=2)
+        om.poll_entries()
+        clock.advance(seconds=600)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        pos = om.positions[0]
+        assert pos["qty"] == 4
+        set_held(broker, 95.0, -2)               # the positions API still shows only the first two
+        set_held(broker, 90.0, 2)
+        cycles(clock, om, 3, seconds=30)         # < 120 s since the second fill: not judged
+        assert pos["qty"] == 4 and log.counts["EXTERNAL_PARTIAL_CLOSE"] == 0
+        set_held(broker, 95.0, -4)               # and the API catches up
+        set_held(broker, 90.0, 4)
+        cycles(clock, om, 4)
+        assert pos["qty"] == 4 and log.counts["EXTERNAL_PARTIAL_CLOSE"] == 0
+
+    def test_a_failed_positions_read_is_logged_and_never_acted_on(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.positions = []
+        broker.fail_on.add("get_positions")
+        cycles(clock, om, 3)
+        assert len(om.positions) == 1 and log.counts["POLL_ERROR"] >= 3 and "ext_obs" not in pos
+        broker.fail_on.discard("get_positions")
+        cycles(clock, om)                        # first good read: an observation, nothing more
+        assert len(om.positions) == 1
+        cycles(clock, om)
+        assert om.positions == []
+
+    def test_the_observation_counter_survives_a_restart(self, env):
+        clock, broker, log, om, tmp = env
+        open_position(env)
+        broker.positions = []
+        cycles(clock, om)
+        om2 = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp / "state.json")
+        assert om2.positions[0]["ext_obs"]["n"] == 1
+        clock.advance(seconds=60)
+        om2.maintain()
+        assert om2.positions == [] and om2.state["closed"][-1]["close_reason"] == "closed outside the bot (manual)"
+
+    def test_disabled_sync_never_reads_positions_or_acts(self, env, monkeypatch):
+        clock, broker, log, om, tmp = env
+        monkeypatch.setattr(config_45dte, "EXTERNAL_SYNC_ENABLED", False)
+        pos = open_position(env)
+        broker.positions = []
+        n = len(broker.calls)
+        cycles(clock, om, 4)
+        assert len(om.positions) == 1 and not calls(broker, "get_positions", n) and "ext_obs" not in pos
+
+    def test_dry_run_brokers_are_never_synced(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.dry_run = True                    # a dry-run broker holds no real legs, so absence means nothing
+        broker.positions = []
+        n = len(broker.calls)
+        cycles(clock, om, 4)
+        assert len(om.positions) == 1 and not calls(broker, "get_positions", n)
+
+    def test_the_bots_own_gtc_fill_is_never_booked_as_a_manual_close(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.fill_order(pos["close_order_id"], 0.80)   # our profit target filled: legs gone
+        om.sync_external()
+        om.sync_external()                       # confirmed absent -- but the close order explains it
+        assert om.positions == [] and om.state["closed"][-1]["close_reason"] == "profit target"
+        assert log.counts["EXTERNAL_CLOSE"] == 0 and om.state["manual_cooldown_until"] is None
+
+    def test_manual_partial_close_shrinks_and_replaces_the_gtc_at_the_new_size(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=4)
+        old = pos["close_order_id"]
+        set_held(broker, 95.0, -2)               # the owner closed 2 of the 4 contracts
+        set_held(broker, 90.0, 2)
+        cycles(clock, om)
+        assert pos["qty"] == 4                   # one observation: not yet
+        cycles(clock, om)
+        assert pos["qty"] == 2 and pos["external_closed_qty"] == 2 and len(om.positions) == 1
+        assert broker.orders[old]["status"] == "canceled"
+        new = broker.orders[pos["close_order_id"]]
+        assert new["id"] != old and new["qty"] == 2 and new["limit_price"] == 0.80 and new["status"] == "accepted"
+        assert log.counts["EXTERNAL_PARTIAL_CLOSE"] == 1 and pos["max_loss"] == 3.40
+        assert om.open_risk_dollars() == pytest.approx(2 * 3.40 * 100)
+        n = len(broker.calls)
+        cycles(clock, om, 3)                     # stable afterwards
+        assert pos["close_order_id"] == new["id"] and not calls(broker, "place_close_spread", n)
+        assert log.counts["EXTERNAL_PARTIAL_CLOSE"] == 1
+        assert om.state["manual_cooldown_until"] is None   # a partial close is not a full close
+
+    def test_a_later_fill_of_the_same_entry_does_not_resurrect_manually_closed_contracts(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 4)
+        broker.fill_order(oid, 1.60, qty=2)
+        om.poll_entries()
+        pos = om.positions[0]
+        clock.advance(seconds=200)
+        set_held(broker, 95.0, -1)               # the owner closes one of the two filled contracts
+        set_held(broker, 90.0, 1)
+        cycles(clock, om, 2)
+        assert pos["qty"] == 1
+        broker.fill_order(oid, 1.60)             # the other two fill later: held is 1 + 2
+        om.poll_entries()
+        assert pos["qty"] == 3
+
+    def test_the_bots_own_gtc_part_filling_is_not_taken_for_a_manual_close(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        close_id = pos["close_order_id"]
+        broker.fill_order(close_id, 0.80, qty=1)        # our GTC part-fills: 1 of 2 contracts is out
+        cycles(clock, om, 3)
+        assert pos["qty"] == 2 and log.counts["EXTERNAL_PARTIAL_CLOSE"] == 0
+        assert pos["close_order_id"] == close_id and broker.orders[close_id]["status"] == "partially_filled"
+
+    def test_a_naked_leg_freezes_all_order_activity_until_the_legs_are_consistent(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, credit=1.50, qty=1)
+        old = pos["close_order_id"]
+        drop_leg(broker, 90.0)                   # the owner closed the long by hand: only the short is left
+        cycles(clock, om)
+        assert not pos.get("manual_attention")   # one observation is not enough
+        cycles(clock, om)
+        assert pos["manual_attention"] is True
+        alert = events(tmp, "NAKED_LEG")
+        assert len(alert) == 1 and alert[0]["kind"] == "naked" and alert[0]["short_held"] == 1 and alert[0]["long_held"] == 0
+        assert "MANUAL ATTENTION" in om.position_report(25_000.0)
+
+        n = len(broker.calls)
+        broker.orders[old]["status"] = "rejected"        # normally re-created within a cycle
+        set_chain(broker, 6.00, 1.30)                    # and this mark says max loss
+        cycles(clock, om, 3)
+        for name in ("place_close_spread", "close_spread_at_market", "cancel_order", "replace_order_price"):
+            assert not calls(broker, name, n), name
+        assert pos["max_loss_hit"] is False and om.risk.max_loss_hits == 0 and len(om.positions) == 1
+        assert len(events(tmp, "NAKED_LEG")) == 1        # same day: no re-alert
+        clock.advance(days=1)
+        cycles(clock, om)
+        assert len(events(tmp, "NAKED_LEG")) == 2        # re-alerts once the next day
+
+        broker.add_position("XYZ", EXP, "P", 90.0, 1, 0.50)   # the owner puts the long back
+        cycles(clock, om)
+        assert pos["manual_attention"] is True           # consistent once: still frozen
+        cycles(clock, om)
+        assert len(events(tmp, "MANUAL_ATTENTION_CLEARED")) == 1
+        # managed normally again (original rules: the rejected GTC is re-created, then the max-loss stop fires)
+        assert om.positions == [] and "max loss" in om.state["closed"][-1]["close_reason"]
+        assert calls(broker, "close_spread_at_market", n)
+
+    def test_a_frozen_spread_whose_other_leg_then_goes_is_booked_as_closed(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=1)
+        drop_leg(broker, 90.0)
+        cycles(clock, om, 2)
+        assert pos["manual_attention"] is True
+        drop_leg(broker, 95.0)
+        cycles(clock, om)
+        assert len(om.positions) == 1
+        cycles(clock, om)
+        assert om.positions == [] and om.state["closed"][-1]["close_reason"] == "closed outside the bot (manual)"
+        assert not events(tmp, "MANUAL_ATTENTION_CLEARED")
+
+    def test_a_naked_short_leg_alone_is_just_as_frozen(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=1)
+        drop_leg(broker, 95.0)                   # the short was bought back by hand, the long is left
+        cycles(clock, om, 2)
+        assert pos["manual_attention"] is True and events(tmp, "NAKED_LEG")[0]["short_held"] == 0
+
+    def test_unbalanced_legs_are_frozen_not_shrunk_into_an_unmanaged_naked_contract(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        set_held(broker, 90.0, 1)                # one of the two long contracts is gone; the short is still 2
+        cycles(clock, om, 2)
+        assert pos["manual_attention"] is True and pos["qty"] == 2
+        assert events(tmp, "NAKED_LEG")[0]["kind"] == "unbalanced" and log.counts["EXTERNAL_PARTIAL_CLOSE"] == 0
+
+    def test_extra_owner_contracts_on_the_same_strikes_are_left_alone(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        set_held(broker, 95.0, -5)
+        set_held(broker, 90.0, 5)
+        n = len(broker.calls)
+        cycles(clock, om, 4)
+        assert pos["qty"] == 2 and len(om.positions) == 1 and not pos.get("manual_attention")
+        assert len(events(tmp, "EXTERNAL_EXTRA_CONTRACTS")) == 1
+        for name in ("place_close_spread", "cancel_order", "close_spread_at_market"):
+            assert not calls(broker, name, n), name
+
+    def test_extra_owner_contracts_do_not_block_an_exit_and_are_not_closed(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        set_held(broker, 95.0, -5)
+        set_held(broker, 90.0, 5)
+        set_chain(broker, 1.00, 0.60)
+        dte_7(clock)
+        om.maintain()
+        assert om.positions == []
+        closes = calls(broker, "close_spread_at_market")
+        assert len(closes) == 1 and closes[0][1][5] == 2             # only our 2 contracts
+        assert {p["strike"]: p["qty"] for p in broker.positions} == {95.0: -3, 90.0: 3}
+        assert log.counts["EXIT_VERIFY_FAILED"] == 0 and "DTE 7" in om.state["closed"][-1]["close_reason"]
+
+    def test_exit_with_both_legs_already_gone_books_a_manual_close_and_sends_nothing(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        close_id = pos["close_order_id"]
+        pos["current_price"], pos["unrealized_pl"] = 1.30, 60.0
+        broker.positions = []
+        n = len(broker.calls)
+        assert om.exit_at_market(pos, "test exit") is True
+        assert not calls(broker, "close_spread_at_market", n) and not calls(broker, "place_close_spread", n)
+        closed = om.state["closed"][-1]
+        assert closed["close_reason"] == "closed outside the bot (manual)" and closed["exit_debit"] is None
+        assert closed["last_price_before_exit"] == 1.30 and closed["est_realized_pl"] == 60.0
+        assert broker.orders[close_id]["status"] == "canceled"
+        assert om.positions == [] and om.risk.max_loss_hits == 0
+        assert log.counts["EXIT_SKIPPED"] == 1 and log.counts["EXTERNAL_CLOSE"] == 1
+
+    def test_the_exit_preflight_catches_it_through_maintain_when_the_sync_is_off(self, env, monkeypatch):
+        clock, broker, log, om, tmp = env
+        monkeypatch.setattr(config_45dte, "EXTERNAL_SYNC_ENABLED", False)
+        pos = open_position(env)
+        set_chain(broker, 1.00, 0.60)
+        broker.positions = []
+        dte_7(clock)
+        om.maintain()
+        assert om.positions == [] and not calls(broker, "close_spread_at_market")
+        assert om.state["closed"][-1]["close_reason"] == "closed outside the bot (manual)"
+
+    def test_exit_with_one_leg_gone_freezes_and_sends_nothing(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        drop_leg(broker, 90.0)
+        n = len(broker.calls)
+        assert om.exit_at_market(pos, "test exit") is False
+        assert pos["manual_attention"] is True and len(om.positions) == 1 and log.counts["NAKED_LEG"] == 1
+        assert om.exit_at_market(pos, "again") is False    # frozen: refuses outright
+        for name in ("close_spread_at_market", "place_close_spread", "cancel_order"):
+            assert not calls(broker, name, n), name
+
+    def test_exit_does_not_trust_a_missing_read_on_a_brand_new_position(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, aged=False)
+        broker.positions = []
+        n = len(broker.calls)
+        assert om.exit_at_market(pos, "test exit") is False
+        assert len(om.positions) == 1 and log.counts["EXIT_DEFERRED"] == 1
+        assert not calls(broker, "close_spread_at_market", n) and not calls(broker, "cancel_order", n)
+
+    def test_exit_closes_only_the_contracts_still_held(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=4)
+        set_held(broker, 95.0, -2)               # the owner already closed 2 of the 4
+        set_held(broker, 90.0, 2)
+        set_chain(broker, 1.00, 0.60)            # price 0.40
+        assert om.exit_at_market(pos, "test exit") is True
+        assert calls(broker, "close_spread_at_market")[0][1][5] == 2
+        closed = om.state["closed"][-1]
+        assert closed["qty"] == 2 and closed["realized_pl"] == pytest.approx((1.60 - 0.40) * 100 * 2)
+        assert broker.positions == []
+
+    def test_exit_is_not_booked_when_the_held_count_does_not_drop(self, env, monkeypatch):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2)
+        monkeypatch.setattr(broker, "close_spread_at_market",
+                            lambda *a, **k: {"id": "X1", "status": "filled", "filled_avg_price": 1.0})
+        assert om.exit_at_market(pos, "test exit") is False
+        assert len(om.positions) == 1 and log.counts["EXIT_VERIFY_FAILED"] == 1 and pos["close_order_id"] is None
+
+    def test_exit_does_not_send_when_the_preflight_read_fails(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        close_id = pos["close_order_id"]
+        broker.fail_on.add("get_positions")
+        assert om.exit_at_market(pos, "test exit") is False
+        assert not calls(broker, "close_spread_at_market") and broker.orders[close_id]["status"] == "accepted"
+        assert len(om.positions) == 1
+
+    def test_dotted_tickers_the_broker_spells_differently_are_not_mistaken_for_closed(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, symbol="BRK.B")
+        for p in broker.positions:               # the broker reports the OCC root without the dot
+            p["symbol"] = p["symbol"].replace("BRK.B", "BRKB")
+            p["underlying"] = "BRKB"
+        cycles(clock, om, 4)
+        assert len(om.positions) == 1 and log.counts["EXTERNAL_CLOSE"] == 0 and "ext_obs" not in pos
+
+
+class TestOwnerCloseOrderChanges:
+    def test_owner_cancel_sets_manual_hold_and_the_gtc_is_never_recreated(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        old = pos["close_order_id"]
+        broker.cancel_order(old)                 # the owner cancels it in thinkorswim
+        n = len(broker.calls)
+        cycles(clock, om, 4, seconds=10)
+        assert pos["manual_hold"] is True and pos["close_order_id"] is None
+        assert len(events(tmp, "CLOSE_ORDER_CANCELED_BY_OWNER")) == 1
+        assert not calls(broker, "place_close_spread", n) and len(close_orders(broker)) == 1
+        assert len(om.positions) == 1 and "canceled by owner" in om.position_report(25_000.0)
+
+    def test_the_profit_floor_trail_keeps_running_while_the_gtc_is_held_off(self, env, trail_rules):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.cancel_order(pos["close_order_id"])
+        set_chain(broker, 1.50, 0.30)            # 1.20: arms
+        om.maintain()
+        assert pos["manual_hold"] is True and pos["profit_floor_armed"] is True
+        set_chain(broker, 1.55, 0.30)            # 1.25: first nickel back -> exit
+        om.maintain()
+        assert om.positions == [] and "profit floor trail" in om.state["closed"][-1]["close_reason"]
+
+    def test_an_owner_edit_replaced_plus_a_new_open_order_is_adopted(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        old = pos["close_order_id"]
+        edited = broker.replace_order_price(old, 0.95)   # what an edit in TOS looks like: old 'replaced', new id
+        n = len(broker.calls)
+        cycles(clock, om)
+        assert broker.orders[old]["status"] == "replaced"
+        assert pos["close_order_id"] == edited["id"] and pos["close_limit"] == 0.95 and not pos.get("manual_hold")
+        assert log.counts["CLOSE_ORDER_ADOPTED"] == 1 and not calls(broker, "place_close_spread", n)
+        cycles(clock, om, 2)
+        assert pos["close_order_id"] == edited["id"] and len(close_orders(broker)) == 2   # nothing new created
+        broker.fill_order(edited["id"], 0.95)    # and the owner's order is the one that is tracked to its fill
+        cycles(clock, om)
+        assert om.positions == [] and om.state["closed"][-1]["exit_debit"] == 0.95
+
+    def test_replaced_with_no_replacement_open_means_hold(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        old = pos["close_order_id"]
+        broker.orders[old]["status"] = "replaced"
+        n = len(broker.calls)
+        cycles(clock, om, 2)
+        assert pos["manual_hold"] is True and not calls(broker, "place_close_spread", n)
+
+    @pytest.mark.parametrize("status", ["rejected", "expired", "unknown"])
+    def test_a_rejected_expired_or_unknown_gtc_is_still_recreated(self, env, status):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        old = pos["close_order_id"]
+        broker.orders[old]["status"] = status
+        cycles(clock, om)
+        assert pos["close_order_id"] != old and broker.orders[pos["close_order_id"]]["status"] == "accepted"
+        assert not pos.get("manual_hold") and log.counts["CLOSE_ORDER_LOST"] == 1
+
+    def test_a_failed_open_orders_read_decides_nothing(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        old = pos["close_order_id"]
+        broker.cancel_order(old)
+        broker.fail_on.add("get_open_orders")
+        n = len(broker.calls)
+        cycles(clock, om)
+        assert not pos.get("manual_hold") and pos["close_order_id"] == old and not calls(broker, "place_close_spread", n)
+        assert log.counts["POLL_ERROR"] >= 1
+        broker.fail_on.discard("get_open_orders")
+        cycles(clock, om)
+        assert pos["manual_hold"] is True
+
+    def test_a_new_fill_resets_the_hold_and_places_the_close_for_the_new_size(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 4)
+        broker.fill_order(oid, 1.60, qty=1)
+        om.poll_entries()
+        pos = om.positions[0]
+        broker.cancel_order(pos["close_order_id"])
+        om.maintain()
+        assert pos["manual_hold"] is True
+        broker.fill_order(oid, 1.60)             # the rest of the entry fills
+        om.poll_entries()
+        assert "manual_hold" not in pos and pos["qty"] == 4 and log.counts["MANUAL_HOLD_CLEARED"] == 1
+        new = broker.orders[pos["close_order_id"]]
+        assert new["qty"] == 4 and new["status"] == "accepted"
+
+    def test_a_manual_partial_close_does_not_put_back_a_gtc_the_owner_removed(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=4)
+        broker.cancel_order(pos["close_order_id"])
+        cycles(clock, om)
+        assert pos["manual_hold"] is True
+        set_held(broker, 95.0, -2)
+        set_held(broker, 90.0, 2)
+        n = len(broker.calls)
+        cycles(clock, om, 2)
+        assert pos["qty"] == 2 and pos["manual_hold"] is True and not calls(broker, "place_close_spread", n)
+
+    def test_manual_hold_survives_a_restart(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.cancel_order(pos["close_order_id"])
+        cycles(clock, om)
+        om2 = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp / "state.json")
+        assert om2.positions[0]["manual_hold"] is True
+        n = len(broker.calls)
+        clock.advance(seconds=60)
+        om2.maintain()
+        assert not calls(broker, "place_close_spread", n)
+
+    def test_a_failed_replacement_after_our_own_cancel_is_not_mistaken_for_an_owner_cancel(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 2)
+        broker.fill_order(oid, 1.60, qty=1)
+        om.poll_entries()
+        pos = om.positions[0]
+        broker.fail_on.add("place_close_spread")
+        broker.fill_order(oid, 1.60)             # the position grows: we cancel the old close, the new one fails
+        om.poll_entries()
+        assert pos["close_order_id"] is None and log.counts["CLOSE_ERROR"] == 1
+        broker.fail_on.discard("place_close_spread")
+        om.maintain()
+        assert not pos.get("manual_hold")
+        assert broker.orders[pos["close_order_id"]]["qty"] == 2 and broker.orders[pos["close_order_id"]]["status"] == "accepted"
+
+
+class TestAdoptWithManualOverrides:
+    def test_a_vanished_position_cancels_its_leftover_close_order(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, symbol="AAPL")
+        old = pos["close_order_id"]
+        broker.positions = []                    # the legs are gone (closed by hand while the bot was off)
+        om.adopt()
+        assert om.positions == [] and om.state["closed"][-1]["close_reason"] == "vanished at broker"
+        assert broker.orders[old]["status"] == "canceled" and om.working_entries == []
+
+    def test_a_vanished_positions_already_dead_close_order_is_not_cancelled_again(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, symbol="AAPL")
+        broker.cancel_order(pos["close_order_id"])
+        broker.positions = []
+        n = len(broker.calls)
+        om.adopt()
+        assert om.positions == [] and not calls(broker, "cancel_order", n)
+
+    def test_a_closing_order_is_never_adopted_as_an_entry(self, env):
+        clock, broker, log, om, tmp = env
+        put_close = broker.place_close_spread("AAPL", EXP, "P", 95.0, 90.0, 2, limit_debit=0.80)    # buy 95P, sell 90P
+        call_close = broker.place_close_spread("AAPL", EXP, "C", 100.0, 105.0, 2, limit_debit=0.80)  # buy 100C, sell 105C
+        call_entry = broker.place_credit_spread("AAPL", EXP, "C", 100.0, 105.0, 1, limit_credit=1.55, time_in_force="day")
+        om.adopt()
+        assert [e["order_id"] for e in om.working_entries] == [call_entry["id"]]   # the real credit spread is still adopted
+        assert {put_close["id"], call_close["id"]} <= {e["order_id"] for e in events(tmp, "UNKNOWN_OPEN_ORDER")}
+
+    def test_a_tracked_spread_next_to_an_owner_leg_is_not_written_off_as_vanished(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=2, aged=False)
+        close_id = pos["close_order_id"]
+        broker.add_position("XYZ", EXP, "P", 85.0, -1, 0.40)   # the owner's own leg: same underlying/expiry/right
+        summary = om.adopt()
+        assert len(om.positions) == 1 and om.state["closed"] == []
+        assert om.blocked_symbols == {"XYZ"} and summary["unpaired"] == ["XYZ"]
+        assert broker.orders[close_id]["status"] == "accepted"
+
+    def test_a_tracked_spread_that_lost_a_leg_while_offline_stays_tracked_and_is_flagged(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=1)
+        drop_leg(broker, 90.0)
+        om.adopt()
+        assert len(om.positions) == 1 and om.state["closed"] == [] and om.blocked_symbols == {"XYZ"}
+        cycles(clock, om, 2)
+        assert pos["manual_attention"] is True
+
+
+class TestManualCloseCooldown:
+    def test_starts_on_an_external_close_and_ends_at_the_configured_time(self, env):
+        clock, broker, log, om, tmp = env
+        open_position(env)
+        assert om.state["manual_cooldown_until"] is None and not om.entries_paused()
+        broker.positions = []
+        cycles(clock, om, 2)
+        booked = clock.now
+        assert om.state["closed"][-1]["close_reason"] == "closed outside the bot (manual)"
+        assert datetime.fromisoformat(om.state["manual_cooldown_until"]) == booked + timedelta(seconds=120)
+        assert om.entries_paused() and om.entries_paused(booked + timedelta(seconds=119))
+        assert not om.entries_paused(booked + timedelta(seconds=120)) and not om.entries_paused(booked + timedelta(seconds=300))
+        assert om.blocked_symbols == set() and om.positions == []   # nothing left behind to block the symbol
+
+    def test_the_exit_preflight_booking_starts_it_too(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env)
+        broker.positions = []
+        assert om.exit_at_market(pos, "test exit") is True
+        assert om.entries_paused()
+
+    def test_survives_a_restart_and_old_state_files_load(self, env):
+        clock, broker, log, om, tmp = env
+        open_position(env)
+        broker.positions = []
+        cycles(clock, om, 2)
+        om2 = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp / "state.json")
+        assert om2.entries_paused()
+        state = json.loads((tmp / "state.json").read_text())
+        state.pop("manual_cooldown_until")
+        (tmp / "state.json").write_text(json.dumps(state))
+        om3 = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp / "state.json")
+        assert not om3.entries_paused() and om3.state["manual_cooldown_until"] is None
+
+    def test_not_triggered_by_the_bots_own_exits(self, env):
+        clock, broker, log, om, tmp = env
+        open_position(env)
+        set_chain(broker, 1.00, 0.60)
+        dte_7(clock)
+        om.maintain()                            # DTE exit at market
+        assert om.positions == [] and om.state["manual_cooldown_until"] is None
+        pos = open_position(env, symbol="ABC")
+        broker.fill_order(pos["close_order_id"], 0.80)   # profit target fills
+        om.maintain()
+        assert om.positions == [] and om.state["manual_cooldown_until"] is None
+
+    def test_not_triggered_by_partial_closes_naked_legs_or_vanished_bookings(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, qty=4)
+        set_held(broker, 95.0, -2)
+        set_held(broker, 90.0, 2)
+        cycles(clock, om, 2)
+        assert pos["qty"] == 2 and om.state["manual_cooldown_until"] is None
+        drop_leg(broker, 90.0)
+        cycles(clock, om, 2)
+        assert pos["manual_attention"] is True and om.state["manual_cooldown_until"] is None
+        broker.positions = []
+        om.adopt()                               # startup reconciliation: "vanished at broker"
+        assert om.positions == [] and om.state["manual_cooldown_until"] is None
+
+
 def test_position_report_renders(env):
     clock, broker, log, om, tmp = env
     oid = om.submit_entry(spec(1.60), 2)
@@ -682,3 +1325,46 @@ def test_position_report_renders(env):
     om.maintain()
     text = om.position_report(25_000.0)
     assert "XYZ" in text and "95/90" in text and "portfolio risk $680" in text
+
+
+
+class TestExitPreflightNeedsTwoAgreeingReads:
+    """An empty/stale positions response at the moment an exit fires must not make the bot drop a live position."""
+
+    class Flaky(FakeBroker):
+        script: list = []
+
+        def get_positions(self):
+            if self.script:
+                return self.script.pop(0)
+            return super().get_positions()
+
+    def _armed_position(self, tmp_path):
+        clock = Clock(datetime(2026, 9, 17, 10, 0, tzinfo=ET))
+        broker = self.Flaky(now=clock.now)
+        broker.script = []
+        log = TradingLogger(tmp_path, now_fn=clock, echo=False)
+        om = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp_path / "state.json")
+        om.roll_day(25_000.0)
+        oid = om.submit_entry(spec(1.60), 2)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        clock.advance(hours=1)                                   # old enough to be past the minimum age
+        return clock, broker, om
+
+    def test_one_empty_read_does_not_book_the_position_as_closed(self, tmp_path):
+        clock, broker, om = self._armed_position(tmp_path)
+        pos = om.positions[0]
+        broker.script = [[]]                                     # the first read is empty, the next is the truth
+        assert om.exit_at_market(pos, "test exit") is False      # deferred, nothing booked, nothing sent
+        assert len(om.positions) == 1 and not any(c[0] == "close_spread_at_market" for c in broker.calls)
+        assert om.exit_at_market(pos, "test exit") is True       # next cycle the truth is read and it closes normally
+        assert om.positions == [] and "closed outside" not in om.state["closed"][-1]["close_reason"]
+
+    def test_two_empty_reads_do_book_it_as_closed_by_hand(self, tmp_path):
+        clock, broker, om = self._armed_position(tmp_path)
+        pos = om.positions[0]
+        broker.script = [[], []]
+        assert om.exit_at_market(pos, "test exit") is True
+        assert om.positions == [] and "manual" in om.state["closed"][-1]["close_reason"]
+        assert not any(c[0] == "close_spread_at_market" for c in broker.calls)

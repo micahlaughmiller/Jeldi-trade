@@ -90,6 +90,21 @@ PROFIT_FLOOR_TRAIL_TICK = 0.05
 # "trail" mode only sells when the mid price still shows at least this much profit (a market close
 # fills at the natural price, up to a half-spread worse than the mid); otherwise it disarms and rides.
 PROFIT_FLOOR_MIN_PROFIT = 0.05
+# Manual overrides (thinkorswim). The owner may close or cancel positions by hand at any time, so every
+# maintenance cycle the bot compares its tracked spreads with broker.get_positions() (sync_external) and
+# follows what the broker really holds instead of fighting it. An inconsistent picture must repeat
+# identically for EXTERNAL_SYNC_CONFIRM_CYCLES consecutive cycles before the bot acts on it (a positions API
+# that lags a fill must never make it drop a real position); spreads younger than EXTERNAL_SYNC_MIN_AGE_SEC
+# (since opened / last filled) are not checked. After a spread is found fully closed by hand, no NEW entry is
+# submitted for MANUAL_CLOSE_COOLDOWN_SEC (the owner is mid-action), then trading resumes normally.
+EXTERNAL_SYNC_ENABLED = True
+EXTERNAL_SYNC_CONFIRM_CYCLES = 2
+EXTERNAL_SYNC_MIN_AGE_SEC = 120
+# Before an exit books a position as already closed by hand (or flags a naked leg), the bot reads the
+# broker a second time this many seconds later and acts only if both reads agree -- one read can be
+# empty or stale, and wrongly dropping a live position would drop its exit management.
+EXTERNAL_EXIT_RECHECK_SEC = 2
+MANUAL_CLOSE_COOLDOWN_SEC = 120
 ENTRY_TIME_IN_FORCE = "day"
 PRICE_REDUCTION_INTERVAL_MIN = 60
 PRICE_REDUCTION_AMOUNT = 0.02

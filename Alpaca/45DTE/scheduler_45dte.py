@@ -59,6 +59,7 @@ class Scheduler:
         self.eod_done_for: date | None = None
         self.equity: float | None = None
         self._skip_logged: set[tuple[date, str]] = set()
+        self._cooldown_logged = False   # the manual-close cool-down is reported once per scan, not once per signal
         self.orders.on_position_change = self.print_report
 
     # ---------------------------------------------------------------- reports
@@ -111,6 +112,7 @@ class Scheduler:
     # ------------------------------------------------------------------- scan
 
     def run_scan(self) -> None:
+        self._cooldown_logged = False
         result = market_data_handler.scan(log=self.log, config=self.config)
         for row in result.signals:
             self.log.signal(row)
@@ -128,6 +130,15 @@ class Scheduler:
         symbol = row["broker_symbol"]
         if self.risk.breaker_tripped:
             self.log.risk_check(symbol, False, 0, "circuit breaker tripped (run with --reset-breaker to clear)")
+            return
+        paused_until = self.orders.manual_cooldown_until(self.now_fn())
+        if paused_until is not None:
+            # A position was just closed by hand in the broker's platform: the owner is mid-action, so no NEW entry
+            # until the short cool-down has passed. Nothing is blocked -- the next scan after it enters normally.
+            if not self._cooldown_logged:
+                self._cooldown_logged = True
+                self.log.risk_check(symbol, False, 0, f"manual-close cooldown until {paused_until:%H:%M:%S}",
+                                    cooldown_until=paused_until.isoformat())
             return
         if symbol in self.orders.blocked_symbols:
             self.log.risk_check(symbol, False, 0, "symbol blocked: unpaired option leg at broker, fix manually")

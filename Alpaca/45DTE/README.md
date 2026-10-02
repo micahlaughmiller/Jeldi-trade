@@ -66,8 +66,10 @@ where you launch from. Ctrl+C saves state and exits.
 5. **Fill -> GTC close.** On fill the actual `filled_avg_price` becomes the entry
    credit and a GTC close is submitted at `round_to_0.05(credit x 0.50)`. Partial fills
    get a close for the filled size; the close is replaced when the rest fills.
-6. **Maintenance** every 60 s: detect fills, price reductions, re-create any close order
-   that went missing/canceled/rejected/expired, refresh spread price (short mid - long
+6. **Maintenance** every 60 s: detect fills, price reductions, sync with manual changes made in
+   the broker platform (see Manual overrides), re-create any close order
+   that went missing/rejected/expired (one you cancelled or edited yourself is respected, see
+   Manual overrides), refresh spread price (short mid - long
    mid) for P&L, then apply the exit rules: exit at market when DTE <= 7
    (`EXIT_DTE_ENABLED`), when the spread trades at/beyond 90 % of max loss (`MAX_LOSS_EXIT`),
    or on the profit floor (arms 85 % of the way to the target, then a fixed floor at 30 % of
@@ -85,6 +87,42 @@ Three spreads hitting max loss (current price >= credit + 0.9 x (5 - credit), or
 realized loss >= 90 % of max loss) trip the breaker: no new entries until you restart
 with `--reset-breaker`. Existing positions are still managed. State persists in
 `logs/state.json`.
+
+### Manual overrides (thinkorswim)
+
+You can close or cancel things by hand in thinkorswim at any time. Every maintenance cycle
+(60 s) the bot makes one `get_positions()` read (`sync_external`, the first thing
+`maintain()` does) and follows what the broker really holds instead of fighting it. A
+mismatch must show up **identically on `EXTERNAL_SYNC_CONFIRM_CYCLES` consecutive cycles**
+before the bot acts (so expect it to notice 1-2 minutes after you act; while a mismatch is
+unconfirmed it places nothing for that spread), spreads opened or last filled less than
+`EXTERNAL_SYNC_MIN_AGE_SEC` ago are not checked (a positions feed that lags a fill can never
+make it drop a real position), and a failed read is logged (`POLL_ERROR`) and skipped.
+Skipped entirely when `EXTERNAL_SYNC_ENABLED` is False or the broker is in dry-run.
+
+| What you do in thinkorswim | What the bot does |
+| --- | --- |
+| Close the whole spread (both legs gone) | Cancels its own GTC close (best effort), books the position as `closed outside the bot (manual)` with unknown exit (the last mark is kept as `last_price_before_exit` / `est_realized_pl`), logs `EXTERNAL_CLOSE`. **Not** counted toward the circuit breaker. Starts a `MANUAL_CLOSE_COOLDOWN_SEC` pause on NEW entries (nothing is blocked; the symbol is free and the next signal after the cool-down enters normally). If our own GTC target filled instead, it is booked as a normal profit-target fill. |
+| Close part of it (both legs reduced equally) | Shrinks the tracked qty to what is held (`EXTERNAL_PARTIAL_CLOSE`) and re-places the GTC close at the new size. No cool-down. (If the bot's own GTC part-fills, that is recognised and left alone.) |
+| Close one leg only, or leave unequal legs | Loud `NAKED_LEG` alert (re-alerted at most once a day) and the spread is marked manual-attention: **no order activity at all** (no GTC re-creation, no exits, no max-loss/trail logic, no cancels) until the legs are consistent again (`MANUAL_ATTENTION_CLEARED`) or both are gone (booked as a manual close). The bot's own resting GTC is left as it is -- check it in thinkorswim. |
+| Hold extra contracts on the same strikes | `EXTERNAL_EXTRA_CONTRACTS` is logged and the extras are ignored: the bot only ever manages and closes its own qty, and its exit verification is a count check, so your contracts are never mistaken for a failed close. |
+| Cancel the bot's GTC close | `CLOSE_ORDER_CANCELED_BY_OWNER`; the spread is put on manual hold and the GTC is **never re-created** (the profit-floor trail and other exits keep running). A genuinely new fill of the same entry clears the hold and places the close for the new size. |
+| Edit the GTC close (thinkorswim replaces it: old order `replaced`, new order id) | The new open order for the same legs is adopted (`CLOSE_ORDER_ADOPTED`) and tracked to its fill. |
+| (Bot-side) a close that was rejected, expired or went missing | Re-created as before. |
+
+When the bot itself exits at market it first re-reads the positions: both legs already gone
+-> nothing is sent and it is booked as a manual close; one leg -> frozen as above; otherwise
+it closes `min(its qty, what is held)` and verifies by contract count. On restart, `adopt`
+keeps a tracked spread whose legs sit next to other legs of yours (the underlying stays
+blocked until you fix it), cancels the leftover close order of a position that vanished, and
+never adopts an open order shaped like a closing order (put sold strike below bought strike /
+call sold above bought) as an entry.
+
+**Stopping the bot is still the safest way to take over** (Ctrl+C saves state; the next start
+re-adopts whatever the broker holds). Known limits: extra contracts of yours on the bot's
+strikes are absorbed into the tracked qty if the bot is restarted (`QTY_MISMATCH` "using
+broker"); how thinkorswim reports a cancelled vs an edited order is mapped from Schwab's
+`CANCELED` / `REPLACED` order statuses and has not been exercised against a live account.
 
 ## Files written to `logs/`
 
@@ -142,6 +180,10 @@ touch the network. `tests/live_smoke_alpaca.py` is the broker author's live smok
 | `EXIT_DTE_ENABLED` | `True` | `False` = never force-close on DTE; positions ride to expiration |
 | `PROFIT_FLOOR_ENABLED` / `_ARM_PCT_OF_TARGET` / `_PCT_OF_MAX` | `True` / `0.85` / `0.30` | profit floor: arms 85% of the way to the target, then a fixed floor at 30% of max profit |
 | `PROFIT_FLOOR_MODE` / `PROFIT_FLOOR_TRAIL_TICK` | `fixed` / `0.05` | `trail` = once armed, exit at market on the first tick give-back from the best price if still profitable |
+| `EXTERNAL_SYNC_ENABLED` | `True` | each maintenance cycle compare tracked spreads with `get_positions()` and follow manual changes (see Manual overrides) |
+| `EXTERNAL_SYNC_CONFIRM_CYCLES` | `2` | identical inconsistent observations required in a row before the bot acts on a manual change |
+| `EXTERNAL_SYNC_MIN_AGE_SEC` | `120` | spreads opened / last filled more recently than this are not synced (positions-feed lag) |
+| `MANUAL_CLOSE_COOLDOWN_SEC` | `120` | no NEW entry for this long after a spread is found fully closed by hand |
 | `ENTRY_TIME_IN_FORCE` | `day` | entry orders; closes are always `gtc` |
 | `PRICE_REDUCTION_INTERVAL_MIN` / `PRICE_REDUCTION_AMOUNT` | `60` / `0.02` | entry limit walk-down |
 | `CANCEL_UNFILLED_AT` | `15:55` | cancel working entries; no new entries after this |

@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -113,3 +114,90 @@ def test_unfilled_entries_canceled_at_1555(tmp_path, monkeypatch):
     clock.now = clock.now.replace(minute=55)
     scheduler.tick()
     assert om.working_entries == []
+
+
+# ------------------------------------------------------------------ manual-close cool-down
+
+TRADE = {
+    "symbol": "XYZ", "broker_symbol": "XYZ", "right": "P", "expiration": date(2026, 11, 6), "short_strike": 95.0,
+    "long_strike": 90.0, "credit": 1.60, "bid_side": 1.40, "max_loss": 3.40, "width": 5.0, "strong": False,
+    "min_credit": 1.50, "dte": 50, "short_delta": -0.30, "dte_out_of_range": False, "accepted": True, "reason": "",
+}
+
+
+def fake_build_trade(broker, row, today=None, config=None):
+    return {**TRADE, "symbol": row["symbol"], "broker_symbol": row["broker_symbol"]}
+
+
+def signal_row(symbol="XYZ"):
+    return {"symbol": symbol, "broker_symbol": symbol, "signal": "oversold", "strong": False, "rsi14": 25.0,
+            "rsi28": 28.0, "close": 100.0}
+
+
+def closed_by_hand(tmp_path, monkeypatch):
+    """A scheduler whose only position was closed by hand in the broker's platform and has just been booked."""
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 0, tzinfo=ET), monkeypatch)
+    for key, value in dict(EXTERNAL_SYNC_ENABLED=True, EXTERNAL_SYNC_CONFIRM_CYCLES=2, EXTERNAL_SYNC_MIN_AGE_SEC=120,
+                           MANUAL_CLOSE_COOLDOWN_SEC=120).items():
+        monkeypatch.setattr(config_45dte, key, value)
+    monkeypatch.setattr(sch, "build_trade", fake_build_trade)
+    scheduler.refresh_account()
+    om.roll_day(scheduler.equity)
+    oid = om.submit_entry(dict(TRADE), 2)
+    broker.fill_order(oid, 1.60)
+    om.poll_entries()
+    assert len(om.positions) == 1
+    broker.positions = []
+    for seconds in (130, 60):   # past the min age -> first absent read, then the confirming one
+        clock.now += timedelta(seconds=seconds)
+        om.maintain()
+    assert om.positions == [] and om.state["closed"][-1]["close_reason"] == "closed outside the bot (manual)"
+    return clock, broker, om, scheduler
+
+
+def entry_submissions(broker):
+    return [c for c in broker.calls if c[0] == "place_credit_spread"]
+
+
+def risk_checks(tmp_path, needle="manual-close cooldown"):
+    lines = (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()
+    return [e for e in map(json.loads, lines) if e["type"] == "RISK_CHECK" and needle in e["message"]]
+
+
+def test_manual_close_cooldown_blocks_entries_for_two_minutes_then_resumes(tmp_path, monkeypatch):
+    clock, broker, om, scheduler = closed_by_hand(tmp_path, monkeypatch)
+    booked = clock.now
+    assert om.blocked_symbols == set() and om.entries_paused()      # nothing blocked: only paused
+    scheduler.try_enter(signal_row(), booked.date())
+    assert om.working_entries == [] and len(entry_submissions(broker)) == 1     # only the original entry
+    (event,) = risk_checks(tmp_path)
+    assert event["allowed"] is False and event["message"].endswith(f"until {booked + timedelta(seconds=120):%H:%M:%S}")
+    clock.now = booked + timedelta(seconds=119)
+    scheduler.try_enter(signal_row(), clock.now.date())
+    assert om.working_entries == [] and len(entry_submissions(broker)) == 1
+    clock.now = booked + timedelta(seconds=120)                     # at 120 s the cool-down is over
+    scheduler.try_enter(signal_row(), clock.now.date())
+    assert [e["broker_symbol"] for e in om.working_entries] == ["XYZ"] and len(entry_submissions(broker)) == 2
+
+
+def test_manual_close_cooldown_is_reported_once_per_scan(tmp_path, monkeypatch):
+    clock, broker, om, scheduler = closed_by_hand(tmp_path, monkeypatch)
+    rows = [signal_row("XYZ"), signal_row("ABC")]
+    monkeypatch.setattr(mdh, "scan", lambda log=None, config=None: mdh.ScanResult(results=rows))
+    scheduler.run_scan()
+    assert len(risk_checks(tmp_path)) == 1 and om.working_entries == []     # two signals, one line, no entries
+    clock.now += timedelta(seconds=30)
+    scheduler.run_scan()
+    assert len(risk_checks(tmp_path)) == 2                                  # the next scan reports it again
+    clock.now += timedelta(seconds=100)                                     # >= 120 s after the booking
+    scheduler.run_scan()
+    assert len(risk_checks(tmp_path)) == 2 and sorted(e["broker_symbol"] for e in om.working_entries) == ["ABC", "XYZ"]
+
+
+def test_no_cooldown_without_a_manual_close(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 0, tzinfo=ET), monkeypatch)
+    monkeypatch.setattr(sch, "build_trade", fake_build_trade)
+    scheduler.refresh_account()
+    om.roll_day(scheduler.equity)
+    scheduler.try_enter(signal_row(), clock.now.date())
+    assert [e["broker_symbol"] for e in om.working_entries] == ["XYZ"] and not risk_checks(tmp_path)

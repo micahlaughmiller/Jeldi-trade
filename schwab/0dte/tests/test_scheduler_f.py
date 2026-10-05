@@ -537,7 +537,7 @@ def test_a_broken_stock_orb_import_costs_only_the_f_persona_its_f(tmp_path, monk
 # ------------------------------------------------------------------------------ phases / reports
 
 
-def test_f_frames_refresh_in_every_phase_and_after_a_self_disable(bot, data, monkeypatch):
+def test_f_frames_refresh_in_every_phase_and_after_a_self_disable(bot, data, monkeypatch, wind_down_times):
     enter_f(bot, data)                                                      # 09:55:10: TSLA frame cached through 09:50
     assert list(bot.f.candles_by_key()["F:TSLA"].index.strftime("%H:%M"))[-1] == "09:50"
     bot.refresh_levels = lambda now: None
@@ -558,7 +558,7 @@ def test_f_frames_refresh_in_every_phase_and_after_a_self_disable(bot, data, mon
     assert list(seen[-1]["F:TSLA"].index.strftime("%H:%M"))[-1] == "10:00" and "F:TSLA" in bot.pm.positions
     assert events(bot, "F_ERROR") == []
 
-def test_news_blackout_and_no_new_entries_phase_hold_f(bot, data, monkeypatch):
+def test_news_blackout_and_no_new_entries_phase_hold_f(bot, data, monkeypatch, wind_down_times):
     calls = []
     monkeypatch.setattr(bot.f, "step", lambda now: calls.append(now))
     bot.refresh_levels = lambda now: None

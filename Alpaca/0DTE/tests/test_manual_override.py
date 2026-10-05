@@ -491,7 +491,8 @@ def test_a_saved_position_that_is_still_at_the_broker_is_not_booked_on_restart(b
     assert bot.risk.state.for_strategy("B").trades_today == 0
 
 
-def test_manual_hold_blocks_new_entries_and_keeps_the_bot_up_at_the_forced_close(bot, hold_dir):
+def test_manual_hold_blocks_new_entries_and_keeps_the_bot_up_at_the_forced_close(bot, hold_dir, monkeypatch):
+    monkeypatch.setattr(config, "MANUAL_HOLD_DELAYS_FORCE_CLOSE", True)      # the older, opt-in behaviour
     bot.enter(et(10, 15), "ORB", BULLISH)
     held = set(bot.pm.positions)
     hold = hold_dir / config.MANUAL_HOLD_FILE
@@ -503,3 +504,36 @@ def test_manual_hold_blocks_new_entries_and_keeps_the_bot_up_at_the_forced_close
     hold.unlink()
     assert bot.end_of_day(et(15, 31)) is True and bot.pm.positions == {}
     assert held == {"A", "B"}
+
+
+# ------------------------------------------------- 1:00 pm ET hard stop (2026-10-05)
+
+def test_the_hard_stop_is_one_pm_eastern_and_has_no_wind_down_phase():
+    import strategy
+    from datetime import time as dtime
+    assert config.LAST_ENTRY_TIME == dtime(13, 0) and config.FORCE_CLOSE_TIME == dtime(13, 0)
+    assert config.MANUAL_HOLD_DELAYS_FORCE_CLOSE is False
+    assert strategy.phase(et(12, 59, 59)) == strategy.Phase.ORB_ONLY
+    assert strategy.phase(et(13, 0, 0)) == strategy.Phase.CLOSED
+    assert strategy.Phase.NO_NEW_ENTRIES not in {strategy.phase(et(h, m)) for h in range(9, 17) for m in range(0, 60)}
+
+
+def test_the_hard_stop_closes_everything_even_with_a_manual_hold_file(bot, hold_dir):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert bot.pm.positions
+    (hold_dir / config.MANUAL_HOLD_FILE).write_text("")
+    assert bot.end_of_day(et(13, 0)) is True                     # done: closed anyway, the hold does not delay it
+    assert bot.pm.positions == {}
+    assert any(c for c in bot.broker.close_calls)
+
+
+def test_the_tick_at_one_pm_stops_the_bot_for_the_day(bot, hold_dir):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    (hold_dir / config.MANUAL_HOLD_FILE).write_text("")
+    bot.tick(et(13, 0, 5))
+    assert bot.done is True and bot.pm.positions == {}
+
+
+def test_no_new_entry_is_taken_at_one_pm(bot):
+    bot.tick(et(13, 0, 5))
+    assert bot.pm.positions == {} and bot.done is True

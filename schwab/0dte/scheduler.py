@@ -1119,9 +1119,12 @@ class Bot:
         return cancelled
 
     def end_of_day(self, now: datetime) -> bool:
-        """Force-close everything and report. Returns False (nothing done) while a MANUAL_HOLD file is present and
-        positions are open before the session ends: the bot stays up and closes them the moment the file goes."""
-        if self.pm.manual_hold() and self.pm.positions and now.time() < config.MARKET_CLOSE:
+        """The hard stop (FORCE_CLOSE_TIME): cancel orders, close everything, report, and the bot is done -- a
+        MANUAL_HOLD file does not delay it unless config.MANUAL_HOLD_DELAYS_FORCE_CLOSE. In that older mode it returns
+        False (nothing done) while the file is present and positions are open before the session ends: the bot stays
+        up and closes them the moment the file goes."""
+        hold = self.pm.manual_hold()
+        if hold and config.MANUAL_HOLD_DELAYS_FORCE_CLOSE and self.pm.positions and now.time() < config.MARKET_CLOSE:
             if self._hold_alert_at is None or (now - self._hold_alert_at).total_seconds() >= 60:
                 self._hold_alert_at = now
                 log.critical("MANUAL_HOLD file present at the %s force-close: NOT closing %d position(s). The bot stays "
@@ -1129,6 +1132,11 @@ class Bot:
                              config.FORCE_CLOSE_TIME.strftime("%H:%M"), len(self.pm.positions),
                              config.MARKET_CLOSE.strftime("%H:%M"), extra={"keep": True})
             return False
+        override = hold and not config.MANUAL_HOLD_DELAYS_FORCE_CLOSE
+        if override and self.pm.positions:
+            log.critical("MANUAL_HOLD file present at the %s hard stop: closing %d position(s) anyway "
+                         "(MANUAL_HOLD_DELAYS_FORCE_CLOSE is off).", config.FORCE_CLOSE_TIME.strftime("%H:%M"),
+                         len(self.pm.positions), extra={"keep": True})
         if self.f is not None:
             self.f.shutdown()
         log.warning("FORCE CLOSE at %s: cancelling orders and closing everything.", now.strftime("%H:%M:%S"))
@@ -1139,7 +1147,7 @@ class Bot:
             if legs:
                 self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING))
             if self.pm.positions:
-                self.record_fills(self.pm.force_close(now, self.spread_prices(force=True)))
+                self.record_fills(self.pm.force_close(now, self.spread_prices(force=True), override_hold=override))
             legs = self.bot_legs(self.broker.get_positions())
             if not legs and not self.pm.positions:
                 break

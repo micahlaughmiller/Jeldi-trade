@@ -646,11 +646,13 @@ class PositionManager:
         return self._close(p, p.remaining, reason, now, spread_price)
 
     def force_close(self, now: datetime, prices: dict[str, float | None],
-                    reason: str = "FORCE_CLOSE") -> list[dict]:
+                    reason: str = "FORCE_CLOSE", override_hold: bool = False) -> list[dict]:
+        """Close everything. `override_hold` (the hard stop) closes even while a MANUAL_HOLD file is present."""
         fills: list[dict] = []
         for key, p in list(self.positions.items()):
             price = prices.get(key)
-            fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price)
+            fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price,
+                                 override_hold=override_hold)
         return fills
 
     # ----------------------------------------------- manual-override safety (2026-10-02)
@@ -810,11 +812,12 @@ class PositionManager:
                 and leg["strike"] in (p.short_strike, p.long_strike)]
         return max((abs(leg["qty"]) for leg in legs), default=0)
 
-    def _close(self, p: OpenSpread, qty: int, reason: str, now: datetime, spread_price: float) -> list[dict]:
+    def _close(self, p: OpenSpread, qty: int, reason: str, now: datetime, spread_price: float,
+               override_hold: bool = False) -> list[dict]:
         if qty <= 0:
             return []
         key = self.key_of(p)
-        if self.manual_hold():
+        if self.manual_hold() and not override_hold:
             if self._hold_logged is None or (now - self._hold_logged).total_seconds() >= 60:
                 self._hold_logged = now
                 log.warning("[%s] MANUAL_HOLD file present: NOT closing (%s) -- delete logs/%s to resume",

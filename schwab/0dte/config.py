@@ -76,7 +76,7 @@ EXTERNAL_MIN_AGE_SEC = 30
 # reads the broker a second time this many seconds later and acts only if both reads agree.
 EXTERNAL_PREFLIGHT_RECHECK_SEC = 2
 # Adopt SPXW legs the bot has no record of (crash recovery) into its own books -- and so stop-manage and
-# force-close them at 15:30. True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
+# force-close them at the hard stop (FORCE_CLOSE_TIME). True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
 # shared with the 45DTE bot and whatever the owner trades by hand (allow-listed in tools/check_sync.py).
 ADOPT_UNTRACKED_SPXW = False
 # The staged exit's Bollinger-edge reversal check uses this %B level. It used to read D_BAND_TOUCH_PCT_B,
@@ -86,9 +86,13 @@ EXIT_BB_TOUCH_PCT_B = 0.95
 # (a deliberate cool-down), then is ready to open again.
 MANUAL_CLOSE_COOLDOWN_SEC = 120
 # Create logs/MANUAL_HOLD (every persona) or logs/MANUAL_HOLD_<NAME> (one persona) and the bot sends
-# NO closes -- stops, targets, floors and the end-of-day force-close all stand down -- until the file
-# is deleted. Hand-closes are still detected and booked. Remember to delete it.
+# NO closes -- stops, targets and floors stand down (and the force-close too, if
+# MANUAL_HOLD_DELAYS_FORCE_CLOSE) -- until the file is deleted. Hand-closes are still detected and booked. Remember to delete it.
 MANUAL_HOLD_FILE = "MANUAL_HOLD"
+# False (the 2026-10-05 hard stop): a MANUAL_HOLD file does NOT delay the FORCE_CLOSE_TIME close -- the bot closes
+# what it holds and stops at the hard stop regardless. True restores the older behaviour where the hold also
+# stood the end-of-day close down and kept the bot up until the file was deleted or the session ended.
+MANUAL_HOLD_DELAYS_FORCE_CLOSE = False
 # 2026-10-01: user's own read on the paper-trading fill engine vs real-world execution -- the actual
 # broker fill swings wildly from the trigger price during fast moves. The bot's OWN official
 # pnl/realized_pnl (position_manager._close) now uses realistic_exit_price = the tick immediately
@@ -132,8 +136,11 @@ MARKET_CLOSE = time(16, 0)
 OVERNIGHT_SESSION_START = time(18, 0)
 OPENING_RANGE_MINUTES = 30
 OVERNIGHT_ENTRY_END_MIN = 30
-LAST_ENTRY_TIME = time(15, 0)     # 2:00 pm CST: last new entry
-FORCE_CLOSE_TIME = time(15, 30)   # 2:30 pm CST: everything closed
+# 2026-10-05: HARD STOP at 1:00 pm Eastern (12:00 noon Central), no matter what. No new entry from then,
+# every open spread is closed, every working order is cancelled and the bot exits for the day. It was
+# 15:00 last entry / 15:30 force close. They are the same time now, so there is no wind-down phase.
+LAST_ENTRY_TIME = time(13, 0)     # 12:00 noon Central: last new entry
+FORCE_CLOSE_TIME = time(13, 0)    # 12:00 noon Central: everything closed, bot stops
 
 # 2026-09-25: "as fast as Alpaca will let them" -- tightened from 15s. Watch for rate limiting
 # across concurrent processes (options-chain calls in manage() are the heaviest; yfinance/Schwab

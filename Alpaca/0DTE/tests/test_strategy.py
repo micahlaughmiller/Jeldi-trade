@@ -22,7 +22,7 @@ from strategy import BEARISH, BULLISH, OrbSetup, Phase
     (15, 30, Phase.CLOSED),
     (16, 0, Phase.CLOSED),
 ])
-def test_phase_boundaries(h, m, expected):
+def test_phase_boundaries(h, m, expected, wind_down_times):
     assert strategy.phase(et(h, m)) == expected
 
 

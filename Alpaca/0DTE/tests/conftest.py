@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +19,14 @@ def _pin_default_strategies(monkeypatch):
     """The legacy suite asserts exact A/B key sets; ASTRA's persona override adds F, so every test
     starts from the default two (tests that set STRATEGIES themselves run later and win)."""
     monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
+
+
+@pytest.fixture
+def wind_down_times(monkeypatch):
+    """The session end before the 2026-10-05 hard stop (last entry 15:00, force close 15:30), for the tests that
+    exercise the NO_NEW_ENTRIES phase -- the shipped config has no such phase (both are 13:00)."""
+    monkeypatch.setattr(config, "LAST_ENTRY_TIME", time(15, 0))
+    monkeypatch.setattr(config, "FORCE_CLOSE_TIME", time(15, 30))
 
 
 GUARD_MODULES = ("test_alpaca_adoption_rules", "test_schwab_adoption_rules")   # run against the REAL config

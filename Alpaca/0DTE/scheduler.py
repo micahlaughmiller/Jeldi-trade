@@ -87,6 +87,30 @@ def fmt_money(v: float | None) -> str:
     return "n/a" if v is None else f"${v:,.2f}"
 
 
+# 2026-10-05: SIGNAL_SKIPPED journal events -- one row for every (signal, strategy) pair that did NOT become a
+# trade, with a stable reason_code, so a later strategy ranking can see what the caps/cooldowns/gates turned away
+# and not only the trades that happened. Substring rules first (the summary text carries per-signal detail),
+# otherwise the reason's first word (DAY_GATE, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, B_NO_STRIKE_IN_RANGE, ...).
+_SKIP_CODES = (
+    ("position open", "POSITION_OPEN"),
+    ("setup disabled for", "SETUP_DISABLED"),
+    ("entry disabled for", "ENTRY_KIND_DISABLED"),
+    ("sizing 0 contracts", "SIZING_ZERO"),
+    ("not filled", "NOT_FILLED"),
+    ("broker error", "BROKER_ERROR"),
+    ("MANUAL_CLOSE cooldown", "MANUAL_CLOSE_COOLDOWN"),
+)
+
+
+def skip_code(reason: str) -> str:
+    text = str(reason).strip()
+    for needle, code in _SKIP_CODES:
+        if needle in text:
+            return code
+    words = text.replace(":", " ").replace("(", " ").split()
+    return words[0].upper() if words else "UNKNOWN"
+
+
 class Bot:
     def __init__(self, dry_run: bool, once: bool):
         self.once = once
@@ -112,6 +136,7 @@ class Bot:
         self.last_candle: datetime | None = None
         self.last_orb_candle: datetime | None = None
         self.pending_momentum: dict[str, PendingMomentum] = {}
+        self.last_entry_blocks: dict[str, str] = {}   # strategy -> why entry_possible() refused it (for SIGNAL_SKIPPED)
         self.last_continuation_check: dict[str, datetime] = {}
         self.today: date = now_et().date()
         self.es_setup: strategy.TwoCandleBreak | None = None   # Strategy C, ES-sourced overnight levels
@@ -441,22 +466,39 @@ class Bot:
 
     def entry_possible(self, equity: float, setup: str | None = None,
                        strategies: tuple[str, ...] | None = None) -> bool:
+        self.last_entry_blocks = {}
         if self.pm.manual_hold():
             log.info("No new entries: MANUAL_HOLD file present")
+            self.last_entry_blocks = {s: "MANUAL_HOLD file present" for s in (strategies or strategy.spx_strategies())}
             return False
         reasons = []
+        blocks: dict[str, str] = {}
         exempt_open = self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT)
         for strat in (strategies or strategy.spx_strategies()):
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
+                blocks[strat] = "position open"
                 continue
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
                                                         exempt_open_pnl=exempt_open)
             if allowed:
                 return True
             reasons.append(reason)
+            blocks[strat] = reason
+        self.last_entry_blocks = blocks
         log.info("No new entries: %s", "; ".join(reasons))
         return False
+
+    def signal_skipped(self, now: datetime, strat: str, setup: str, direction: str, kind: str | None, reason: str,
+                       source: str = "SIGNAL", **context) -> None:
+        """Journal one SIGNAL_SKIPPED row: this signal reached `strat` and did not become a trade. `reason` is the
+        raw text (a "skip: " / "B: " prefix is dropped); reason_code is the stable category (see skip_code)."""
+        text = str(reason)
+        for prefix in ("skip: ", f"{strat}: "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        self.journal.event("SIGNAL_SKIPPED", now, strategy=strat, setup=setup, direction=direction, entry_kind=kind,
+                           source=source, reason_code=skip_code(text), reason=text, **context)
 
     def try_overnight_entry(self, now: datetime, spx_candles: pd.DataFrame) -> None:
         if not strategy.setup_allowed("OVERNIGHT", now.date()):
@@ -651,6 +693,9 @@ class Bot:
                              "entry abandoned", setup, t.strftime("%H:%M"), bar.close, p.break_close, beat)
                     self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
                                        at=t, close=float(bar.close), break_close=p.break_close, reason="reversed")
+                    for s in p.strategies:
+                        self.signal_skipped(now, s, setup, p.direction, "MOMENTUM",
+                                            f"MOMENTUM_REVERSED beat {beat:+.2f} < margin {config.MOMENTUM_CONFIRM_MARGIN:g}")
                     del self.pending_momentum[setup]
                     done = True
                     break
@@ -662,6 +707,9 @@ class Bot:
                                  setup, p.direction)
                         self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
                                            break_close=p.break_close, reason="entry window closed")
+                        for s in p.strategies:
+                            self.signal_skipped(now, s, setup, p.direction, "MOMENTUM",
+                                                "MOMENTUM_ENTRY_WINDOW_CLOSED confirmed after the entry window")
                     else:
                         log.info("[%s] MOMENTUM confirmed for %s (%s): entering now", setup, p.direction,
                                  "/".join(p.strategies))
@@ -677,6 +725,9 @@ class Bot:
                          setup, p.direction, config.MOMENTUM_CONFIRM_TIMEOUT_MIN)
                 self.journal.event("MOMENTUM_ABORTED", now, setup=setup, direction=p.direction,
                                    break_close=p.break_close, reason="timeout")
+                for s in p.strategies:
+                    self.signal_skipped(now, s, setup, p.direction, "MOMENTUM",
+                                        f"MOMENTUM_TIMEOUT no confirmation within {config.MOMENTUM_CONFIRM_TIMEOUT_MIN} min")
                 del self.pending_momentum[setup]
 
     def check_continuation_reentry(self, now: datetime, ph: Phase) -> None:
@@ -709,7 +760,7 @@ class Bot:
                      setup, setup_obj.direction, "/".join(eligible), spot, setup_obj.break_close, beat)
             self.journal.event("CONTINUATION_REENTRY", now, setup=setup, direction=setup_obj.direction,
                                break_close=setup_obj.break_close, spot=spot, strategies=list(eligible))
-            self.enter(now, setup, setup_obj.direction, "MOMENTUM", strategies=eligible)
+            self.enter(now, setup, setup_obj.direction, "MOMENTUM", strategies=eligible, source="CONTINUATION")
 
     def check_mean_reversion_entry(self, now: datetime, ph: Phase) -> None:
         """Strategies D (trend-gated MA/Bollinger reversion) and E (D + a 5-min two-candle confirm):
@@ -772,15 +823,23 @@ class Bot:
             now, events, config.NEWS_BLACKOUT_BEFORE_MIN, config.NEWS_BLACKOUT_AFTER_MIN)
 
     def enter(self, now: datetime, setup: str, direction: str, kind: str | None = None,
-             strategies: tuple[str, ...] | None = None) -> None:
+             strategies: tuple[str, ...] | None = None, source: str = "SIGNAL") -> None:
+        every = strategies or strategy.spx_strategies()
         if self.news_blackout_active(now):
             log.info("No new entries: NEWS_BLACKOUT active at %s", now.strftime("%H:%M:%S"))
+            for strat in every:
+                self.signal_skipped(now, strat, setup, direction, kind, "NEWS_BLACKOUT active", source)
             return
         equity = self.broker.get_account()["equity"]
         if not self.entry_possible(equity, setup, strategies):
+            for strat in every:
+                self.signal_skipped(now, strat, setup, direction, kind,
+                                    self.last_entry_blocks.get(strat, "ENTRY_BLOCKED"), source)
             return
         if self.today not in self.broker.get_expirations(config.UNDERLYING, 0, 1):
             log.warning("No SPXW expiration for today %s: no trade.", self.today)
+            for strat in every:
+                self.signal_skipped(now, strat, setup, direction, kind, "NO_EXPIRATION no SPXW expiration today", source)
             return
         spot = self.broker.get_spot(config.UNDERLYING)
         width = strategy.width_for_tier(tier(equity))
@@ -810,6 +869,9 @@ class Bot:
                 log.error("[%s] broker error during entry: %s", strat, e)
                 self.journal.event("BROKER_ERROR", now, strategy=strat, error=str(e))
                 summaries[strat], added = f"broker error {e}", 0.0
+            if added <= 0:    # skipped, rejected, sized to zero, unfilled or errored: no trade came of this signal
+                self.signal_skipped(now, strat, setup, direction, kind, summaries[strat], source, spot=spot, em=em,
+                                    day_er=day_er, width=width, attempted=summaries[strat].startswith("not filled"))
             open_risk += added
         log.warning("SIGNAL %s %s at %s -- %s", setup, direction, now.strftime("%H:%M:%S"),
                     " | ".join(f"{s}: {summaries[s]}" for s in strategies))

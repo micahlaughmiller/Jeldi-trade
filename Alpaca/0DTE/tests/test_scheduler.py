@@ -1031,3 +1031,132 @@ def test_c_runs_past_the_overnight_window_only_when_c_entry_end_min_allows(bot, 
     bot.last_candle = None
     bot.tick(et(10, 35))                             # 65 min after the open: past even the extended window
     assert calls == [1]
+
+
+# ------------------------------------------------- SIGNAL_SKIPPED journal events (2026-10-05)
+
+def skipped(bot, strat=None):
+    rows = events(bot, "SIGNAL_SKIPPED")
+    return [r for r in rows if strat is None or r["strategy"] == strat]
+
+
+def test_skip_code_maps_reasons_to_stable_codes():
+    cases = {
+        "position open": "POSITION_OPEN", "ORB setup disabled for C": "SETUP_DISABLED",
+        "ORB MOMENTUM entry disabled for D": "ENTRY_KIND_DISABLED", "sizing 0 contracts EM 42.00": "SIZING_ZERO",
+        "not filled (canceled) EM 42.00": "NOT_FILLED", "broker error boom": "BROKER_ERROR",
+        "MAX_TRADES_PER_DAY (5)": "MAX_TRADES_PER_DAY", "MAX_CONSECUTIVE_LOSSES (3)": "MAX_CONSECUTIVE_LOSSES",
+        "COOLDOWN until 10:30": "COOLDOWN", "MANUAL_CLOSE cooldown until 10:22:15": "MANUAL_CLOSE_COOLDOWN",
+        "DAILY_LOSS_LIMIT realized=-1000.00": "DAILY_LOSS_LIMIT", "DAY_GATE ER=0.10 < 0.15 (choppy) EM 42.00": "DAY_GATE",
+        "B_NO_STRIKE_IN_RANGE EM 42.00": "B_NO_STRIKE_IN_RANGE", "NO_EXPECTED_MOVE": "NO_EXPECTED_MOVE",
+        "STRIKE_COLLISION 7565/7560P already open under A": "STRIKE_COLLISION", "": "UNKNOWN",
+    }
+    for text, code in cases.items():
+        assert scheduler.skip_code(text) == code, text
+
+
+def test_a_strategy_with_a_position_open_is_journaled_as_skipped_while_the_other_enters(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.pm.positions.pop("B")
+    bot.enter(et(10, 25), "ORB", BULLISH)
+    rows = skipped(bot)
+    assert [(r["strategy"], r["reason_code"]) for r in rows] == [("A", "POSITION_OPEN")]
+    r = rows[0]
+    assert (r["setup"], r["direction"], r["source"], r["attempted"]) == ("ORB", BULLISH, "SIGNAL", False)
+    assert r["spot"] == SPOT and r["em"] == 42.0 and r["width"] > 0
+
+
+def test_a_strike_rejection_is_journaled_with_the_signal_context(bot):
+    chain = put_chain()
+    chain[7565.0] = (1.3, 1.5)
+    chain[7570.0] = (1.5, 1.7)
+    chain.update({s: (1.6, 1.8) for s in (7575.0, 7580.0, 7585.0, 7590.0, 7595.0)})
+    bot.broker.set_chain("P", chain)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    rows = skipped(bot, "B")
+    assert len(rows) == 1 and rows[0]["reason_code"] == "B_NO_STRIKE_IN_RANGE" and rows[0]["spot"] == SPOT
+    assert skipped(bot, "A") == []                       # A traded
+
+
+def test_the_daily_trade_cap_is_journaled_per_strategy(bot):
+    for _ in range(5):
+        bot.risk.record_trade("B", 10.0)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A"}
+    rows = skipped(bot, "B")
+    assert len(rows) == 1 and rows[0]["reason_code"] == "MAX_TRADES_PER_DAY"
+    assert rows[0]["spot"] == SPOT and "MAX_TRADES_PER_DAY (5)" in rows[0]["reason"]
+
+
+def test_every_strategy_is_journaled_when_the_whole_signal_is_blocked(bot):
+    bot.risk.record_trade("A", -1_000.0)                 # combined daily loss limit
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    rows = skipped(bot)
+    assert {r["strategy"] for r in rows} == {"A", "B"} and {r["reason_code"] for r in rows} == {"DAILY_LOSS_LIMIT"}
+    assert all(r["reason"].startswith("DAILY_LOSS_LIMIT") for r in rows)
+
+
+def test_a_manual_hold_is_journaled(bot, monkeypatch):
+    monkeypatch.setattr(bot.pm, "manual_hold", lambda: True)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert {(r["strategy"], r["reason_code"]) for r in skipped(bot)} == {("A", "MANUAL_HOLD"), ("B", "MANUAL_HOLD")}
+
+
+def test_a_news_blackout_is_journaled(bot, monkeypatch):
+    from datetime import time as dtime
+    monkeypatch.setattr(config, "NEWS_EVENTS", {TODAY.isoformat(): [dtime(9, 30)]})
+    bot.enter(et(9, 32), "ORB", BULLISH)
+    assert {(r["strategy"], r["reason_code"]) for r in skipped(bot)} == {("A", "NEWS_BLACKOUT"), ("B", "NEWS_BLACKOUT")}
+
+
+def test_a_missing_expiration_is_journaled(bot, monkeypatch):
+    monkeypatch.setattr(bot.broker, "get_expirations", lambda *a, **k: [])
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert {r["reason_code"] for r in skipped(bot)} == {"NO_EXPIRATION"} and len(skipped(bot)) == 2
+
+
+def test_a_continuation_re_entry_is_tagged_with_its_source(bot):
+    bot.risk.record_trade("A", -1_000.0)
+    bot.enter(et(10, 15), "ORB", BULLISH, "MOMENTUM", source="CONTINUATION")
+    assert {r["source"] for r in skipped(bot)} == {"CONTINUATION"} and {r["entry_kind"] for r in skipped(bot)} == {"MOMENTUM"}
+
+
+def test_an_unfilled_entry_is_journaled_as_an_attempted_skip(bot, monkeypatch):
+    monkeypatch.setattr(bot, "work_entry", lambda order, *a, **k: {**order, "status": "canceled", "filled_qty": 0})
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    rows = skipped(bot)
+    assert {r["strategy"] for r in rows} == {"A", "B"} and {r["reason_code"] for r in rows} == {"NOT_FILLED"}
+    assert all(r["attempted"] is True for r in rows)
+
+
+def test_momentum_aborts_are_journaled_per_waiting_strategy(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    m1 = make_candles(et(9, 34), [(7628, 7629, 7627.5, 7628.6), (7628.6, 7627, 7620, 7621.0)], minutes=1)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
+    bot.check_pending_momentum(et(9, 36), scheduler.Phase.OVERNIGHT_ONLY)
+    rows = skipped(bot, "A")
+    assert len(rows) == 1 and rows[0]["reason_code"] == "MOMENTUM_REVERSED" and rows[0]["entry_kind"] == "MOMENTUM"
+
+
+def test_momentum_timeout_and_closed_window_are_journaled(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: make_candles(et(9, 34), [], minutes=1))
+    bot.check_pending_momentum(et(9, 34) + timedelta(minutes=config.MOMENTUM_CONFIRM_TIMEOUT_MIN + 1),
+                               scheduler.Phase.OVERNIGHT_ONLY)
+    assert [r["reason_code"] for r in skipped(bot, "A")] == ["MOMENTUM_TIMEOUT"]
+    bot.pending_momentum["ON_BREAK"] = scheduler.PendingMomentum(
+        setup="ON_BREAK", direction=BULLISH, break_close=7624.0, strategies=("A",), signal_time=et(9, 34))
+    m1 = make_candles(et(9, 35), [(7628, 7629, 7627.5, 7628.6), (7628.6, 7630, 7628, 7629.2)], minutes=1)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
+    bot.check_pending_momentum(et(9, 37), scheduler.Phase.CLOSED)
+    assert [r["reason_code"] for r in skipped(bot, "A")] == ["MOMENTUM_TIMEOUT", "MOMENTUM_ENTRY_WINDOW_CLOSED"]

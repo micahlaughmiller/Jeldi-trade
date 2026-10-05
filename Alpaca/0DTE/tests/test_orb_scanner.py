@@ -140,12 +140,21 @@ def test_intraday_pages_capped_at_yahoo_limit():
         assert date.fromisoformat(p["start"]) >= floor
 
 
+# Hand-written NYSE full-day closures (month, day), independent of the calendar code under test.
+KNOWN_CLOSURES = {
+    2025: [(1, 1), (1, 20), (2, 17), (4, 18), (5, 26), (6, 19), (7, 4), (9, 1), (11, 27), (12, 25)],
+    2026: [(1, 1), (1, 19), (2, 16), (4, 3), (5, 25), (6, 19), (7, 3), (9, 7), (11, 26), (12, 25)],
+    2027: [(1, 1), (1, 18), (2, 15), (3, 26), (5, 31), (6, 18), (7, 5), (9, 6), (11, 25), (12, 24)],
+}
+
+
+def _trades(day: date) -> bool:
+    """Independent oracle: a weekday that is not in KNOWN_CLOSURES (2025-2027 only)."""
+    return day.weekday() < 5 and (day.month, day.day) not in KNOWN_CLOSURES[day.year]
+
+
 def test_nyse_holiday_calendar_matches_known_closures():
-    closed = {
-        2026: [(1, 1), (1, 19), (2, 16), (4, 3), (5, 25), (6, 19), (7, 3), (9, 7), (11, 26), (12, 25)],
-        2027: [(1, 1), (1, 18), (2, 15), (3, 26), (5, 31), (6, 18), (7, 5), (9, 6), (11, 25), (12, 24)],
-        2025: [(1, 1), (1, 20), (2, 17), (4, 18), (5, 26), (6, 19), (7, 4), (9, 1), (11, 27), (12, 25)],
-    }
+    closed = KNOWN_CLOSURES
     for year, days in closed.items():
         got = {(d.month, d.day) for d in osc._NYSE_HOLIDAYS.holidays(start=f"{year}-01-01", end=f"{year}-12-31")}
         assert got == set(days), (year, sorted(got ^ set(days)))
@@ -165,6 +174,42 @@ def test_has_session_needs_a_trading_day_in_the_window():
     assert osc.has_session(date(2026, 11, 27), date(2026, 11, 28))     # day after Thanksgiving is a (short) session
 
 
+def test_observed_holidays_move_off_the_weekend_the_nyse_way():
+    one_day = timedelta(days=1)
+    closed_days = [date(2021, 7, 5),      # Jul 4 on a Sunday -> Monday
+                   date(2021, 12, 24),    # Christmas on a Saturday -> Friday
+                   date(2022, 6, 20),     # first Juneteenth on a Sunday -> Monday
+                   date(2022, 12, 26),    # Christmas on a Sunday -> Monday
+                   date(2023, 1, 2),      # New Year's Day on a Sunday -> Monday
+                   date(2028, 7, 4)]
+    for d in closed_days:
+        assert not osc.has_session(d, d + one_day), d
+        assert osc.has_session(d - one_day, d) or (d - one_day).weekday() >= 5, d   # the day before still trades
+    for d in (date(2021, 12, 31),             # New Year's Day on a Saturday is NOT taken on the Friday before
+              date(2027, 12, 31),
+              date(2021, 6, 18),              # Juneteenth was not a market holiday before 2022
+              date(2024, 11, 29)):            # day after Thanksgiving: a short session, still a session
+        assert osc.has_session(d, d + one_day), d
+
+
+def test_has_session_across_a_year_boundary():
+    assert not osc.has_session(date(2023, 12, 31), date(2024, 1, 2))    # Sunday + New Year's Monday
+    assert not osc.has_session(date(2022, 12, 31), date(2023, 1, 3))    # Sat + Sun + observed Monday Jan 2
+    assert osc.has_session(date(2022, 12, 31), date(2023, 1, 4))        # ... until Tuesday Jan 3
+    assert not osc.has_session(date(2027, 1, 1), date(2027, 1, 4))      # Friday Jan 1 closed, then the weekend
+    assert osc.has_session(date(2026, 12, 31), date(2027, 1, 4))        # Thursday Dec 31 trades
+
+
+def test_intraday_pages_on_a_sunday_run_have_no_sessionless_window():
+    now = datetime(2026, 10, 4, 9, 20, tzinfo=ET)                       # a Sunday: weekend runs are supported
+    pages = osc._intraday_pages(now, sessions=25, today=now.date())
+    assert pages == [{"period": "7d"}, {"start": "2026-09-20", "end": "2026-09-28"},
+                     {"start": "2026-09-13", "end": "2026-09-21"}, {"start": "2026-09-06", "end": "2026-09-14"}]
+    for p in pages[1:]:     # in particular no Saturday + Sunday sliver such as [Sep 5, Sep 7)
+        assert any(_trades(date.fromisoformat(p["start"]) + timedelta(days=i))
+                   for i in range((date.fromisoformat(p["end"]) - date.fromisoformat(p["start"])).days))
+
+
 def test_intraday_pages_skip_a_window_with_no_trading_day():
     # 2026-10-05 -> Yahoo floor Sep 6: the oldest page would be [Sep 6, Sep 8) = Sunday + Labor Day -> no bars,
     # and yfinance logs an ERROR for every symbol. It must not be requested.
@@ -177,15 +222,18 @@ def test_intraday_pages_skip_a_window_with_no_trading_day():
 
 
 def test_intraday_page_skipping_never_drops_a_session_that_has_bars():
-    """Across a year of 'now' dates, every trading day from the Yahoo floor up to now stays covered by some page."""
+    """Across every day of 2026 as 'now' (weekends included), every trading day from the Yahoo floor up to now stays
+    covered by some page, judged by the independent KNOWN_CLOSURES table rather than by has_session itself."""
+    skipped_days = 0
     for offset in range(0, 365):
-        now = datetime(2026, 1, 5, 9, 20, tzinfo=ET) + timedelta(days=offset)
-        if now.weekday() >= 5:
-            continue
+        now = datetime(2026, 1, 1, 9, 20, tzinfo=ET) + timedelta(days=offset)
         pages = osc._intraday_pages(now, sessions=25, today=now.date())
+        unfiltered = 1 + sum(1 for k in range(1, 5)
+                             if now.date() - timedelta(days=7 * (k + 1)) < now.date() - timedelta(days=7 * k) + timedelta(days=1)
+                             and 7 * k < min(int(math.ceil(25 * 7 / 5)) + 3, osc.YF_1M_MAX_CALENDAR_DAYS))
+        skipped_days += len(pages) < unfiltered
         floor = now.date() - timedelta(days=osc.YF_1M_MAX_CALENDAR_DAYS)
         calendar_days = min(int(math.ceil(25 * 7 / 5)) + 3, osc.YF_1M_MAX_CALENDAR_DAYS)
-        need_from = now.date() - timedelta(days=calendar_days)
         covered = set()
         for p in pages:
             if "period" in p:
@@ -196,11 +244,14 @@ def test_intraday_page_skipping_never_drops_a_session_that_has_bars():
             while d < hi:
                 covered.add(d)
                 d += timedelta(days=1)
-        day = max(need_from, floor)
+        day = max(now.date() - timedelta(days=calendar_days), floor)
+        if day.year < 2025:
+            continue
         while day <= now.date():
-            if osc.has_session(day, day + timedelta(days=1)):
+            if _trades(day):
                 assert day in covered, (now.date(), day)
             day += timedelta(days=1)
+    assert skipped_days >= 50     # the skip path really runs here (Sundays + the Mondays after a Monday holiday)
 
 
 def test_normalize_daily_keeps_session_date():

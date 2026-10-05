@@ -104,6 +104,18 @@ EXTERNAL_SYNC_MIN_AGE_SEC = 120
 # broker a second time this many seconds later and acts only if both reads agree -- one read can be
 # empty or stale, and wrongly dropping a live position would drop its exit management.
 EXTERNAL_EXIT_RECHECK_SEC = 2
+# Official exit price (what realized P/L, the circuit breaker and the daily report run on):
+#   "prev_tick" -- the mark one maintenance tick BEFORE the tick that triggered the exit, the same rule the 0DTE
+#                  bots use. A paper fill (natural-price escalation, last-trade fills) can land far from what
+#                  the strategy saw; the tick before the trigger is the stand-in for "the print before the
+#                  close". With no usable prior tick the trigger mark itself is used. The broker's REAL fill is
+#                  still recorded (fill_debit / realized_pl_actual_fill) next to it.
+#   "fill"      -- the broker's actual fill (switch to this when the bot trades real money).
+# A resting GTC profit-target close has no trigger tick: it books at its fill, never worse than its limit.
+EXIT_PNL_BASIS = "prev_tick"
+# A prior tick (or trigger mark) older than this many seconds is not "the tick before the close" -- e.g.
+# yesterday's last mark on the first cycle of the day -- and is not used.
+EXIT_PREV_TICK_MAX_AGE_SEC = 300
 MANUAL_CLOSE_COOLDOWN_SEC = 120
 ENTRY_TIME_IN_FORCE = "day"
 PRICE_REDUCTION_INTERVAL_MIN = 60

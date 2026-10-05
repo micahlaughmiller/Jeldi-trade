@@ -105,6 +105,9 @@ where you launch from. Ctrl+C saves state and exits.
    the target or to expiration, where the broker settles it (booked `expired`, P&L unknown, with
    the last mark kept as an estimate; shares left by assignment are flagged `EXPIRED_SHARES`).
    Only a *realized* max loss counts toward the circuit breaker (see below).
+   An exit is booked at the **mark one tick before the tick that triggered it** (`EXIT_PNL_BASIS`), not at the
+   simulated fill; the fill and what it would have booked are logged next to it (`POSITION_CLOSED`,
+   the trades CSV, the closed-today report line). A trail exit therefore books at the best price it saw.
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -217,6 +220,7 @@ touch the network. `tests/test_broker_schwab.py` covers the Schwab broker with a
 | `MAX_LOSS_EXIT` | `False` (Schwab) | `True` = close at market on a max-loss hit; hits are counted toward the breaker either way |
 | `PROFIT_FLOOR_ENABLED` / `_ARM_PCT_OF_TARGET` | `True` / `0.40` (Schwab) | floor arms 40% of the way to the target (20% of max profit) |
 | `PROFIT_FLOOR_MODE` / `PROFIT_FLOOR_TRAIL_TICK` | `trail` / `0.05` (Schwab) | once armed, exit at market on the first 5-cent give-back from the best price if that still books a profit; if it reversed through entry first, disarm and ride |
+| `EXIT_PNL_BASIS` / `EXIT_PREV_TICK_MAX_AGE_SEC` | `prev_tick` / `300` | official exit price for P&L, the report and the circuit breaker: `prev_tick` = the mark one maintenance tick before the tick that triggered the exit (same rule as the 0DTE bots; the broker's real fill is logged beside it as `fill_debit` / `realized_pl_actual_fill`); `fill` = the broker's fill (use when live). A prior tick older than the max age is not used. A resting GTC profit-target close books at its fill, never worse than its limit |
 | `EXTERNAL_SYNC_ENABLED` | `True` | each maintenance cycle compare tracked spreads with `get_positions()` and follow manual changes (see Manual overrides) |
 | `EXTERNAL_SYNC_CONFIRM_CYCLES` | `2` | identical inconsistent observations required in a row before the bot acts on a manual change |
 | `EXTERNAL_SYNC_MIN_AGE_SEC` | `120` | spreads opened / last filled more recently than this are not synced (positions-feed lag) |

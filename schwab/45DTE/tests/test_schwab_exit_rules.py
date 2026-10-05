@@ -39,6 +39,7 @@ def test_schwab_config_values():
     assert config_45dte.EXIT_DTE_ENABLED is False and config_45dte.MAX_LOSS_EXIT is False
     assert config_45dte.PROFIT_FLOOR_ENABLED is True and config_45dte.PROFIT_FLOOR_MODE == "trail"
     assert config_45dte.PROFIT_FLOOR_ARM_PCT_OF_TARGET == 0.40 and config_45dte.PROFIT_FLOOR_TRAIL_TICK == 0.05
+    assert config_45dte.EXIT_PNL_BASIS == "prev_tick"      # official P/L = the tick before the close, like the 0DTE bots
 
 
 def test_arm_level_is_forty_percent_of_the_way_to_the_target(env):
@@ -56,7 +57,10 @@ def test_nickel_giveback_after_arming_banks_a_profit(env):
     set_chain(broker, 1.55, 0.30)    # 1.25 -> first nickel against
     om.maintain()
     assert om.positions == []
-    assert om.state["closed"][-1]["realized_pl"] == pytest.approx((1.60 - 1.25) * 100 * 2)
+    rec = om.state["closed"][-1]
+    assert rec["exit_basis"] == "prev_tick" and rec["exit_debit"] == 1.20           # the tick before the 1.25 trigger
+    assert rec["realized_pl"] == pytest.approx((1.60 - 1.20) * 100 * 2)             # official: +80
+    assert rec["realized_pl_actual_fill"] == pytest.approx((1.60 - 1.25) * 100 * 2)  # the (fake) broker filled at 1.25
 
 
 def test_a_loser_rides_with_no_stop_and_no_dte_exit(env):

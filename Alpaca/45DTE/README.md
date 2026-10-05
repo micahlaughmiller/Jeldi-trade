@@ -74,6 +74,9 @@ where you launch from. Ctrl+C saves state and exits.
    (`EXIT_DTE_ENABLED`), when the spread trades at/beyond 90 % of max loss (`MAX_LOSS_EXIT`),
    or on the profit floor (arms 85 % of the way to the target, then a fixed floor at 30 % of
    max profit). A max-loss exit whose realized debit is at/beyond that level counts toward the circuit breaker.
+   An exit is booked at the **mark one tick before the tick that triggered it** (`EXIT_PNL_BASIS`), not at the
+   broker's fill; the real fill and what it would have booked are logged next to it (`POSITION_CLOSED`,
+   the trades CSV, the closed-today report line).
 7. **Reports** every 60 min and after any fill/close: open positions (right, strikes,
    exp, DTE, qty, entry, current, unrealized, close-order state), working entries,
    closed-today with realized P&L, totals, portfolio risk % of equity, breaker state.
@@ -181,6 +184,7 @@ touch the network. `tests/live_smoke_alpaca.py` is the broker author's live smok
 | `EXIT_DTE_ENABLED` | `True` | `False` = never force-close on DTE; positions ride to expiration |
 | `PROFIT_FLOOR_ENABLED` / `_ARM_PCT_OF_TARGET` / `_PCT_OF_MAX` | `True` / `0.85` / `0.30` | profit floor: arms 85% of the way to the target, then a fixed floor at 30% of max profit |
 | `PROFIT_FLOOR_MODE` / `PROFIT_FLOOR_TRAIL_TICK` | `fixed` / `0.05` | `trail` = once armed, exit at market on the first tick give-back from the best price if still profitable |
+| `EXIT_PNL_BASIS` / `EXIT_PREV_TICK_MAX_AGE_SEC` | `prev_tick` / `300` | official exit price for P&L, the report and the circuit breaker: `prev_tick` = the mark one maintenance tick before the tick that triggered the exit (same rule as the 0DTE bots; the broker's real fill is logged beside it as `fill_debit` / `realized_pl_actual_fill`); `fill` = the broker's fill (use when live). A prior tick older than the max age is not used. A resting GTC profit-target close books at its fill, never worse than its limit |
 | `EXTERNAL_SYNC_ENABLED` | `True` | each maintenance cycle compare tracked spreads with `get_positions()` and follow manual changes (see Manual overrides) |
 | `EXTERNAL_SYNC_CONFIRM_CYCLES` | `2` | identical inconsistent observations required in a row before the bot acts on a manual change |
 | `EXTERNAL_SYNC_MIN_AGE_SEC` | `120` | spreads opened / last filled more recently than this are not synced (positions-feed lag) |

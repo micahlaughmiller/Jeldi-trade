@@ -397,18 +397,47 @@ class OrderManager:
         if order is None or order["status"] != "filled":
             return False
         self._record_close(position, float(order.get("filled_avg_price") or position["close_limit"]),
-                           "profit target", order["id"])
+                           "profit target", order["id"], limit_debit=position.get("close_limit"))
         return True
 
     def _record_close(self, position: dict[str, Any], exit_debit: float | None, reason: str,
-                      order_id: str | None) -> None:
-        realized = None if exit_debit is None else round((position["entry_credit"] - exit_debit) * 100 * position["qty"], 2)
-        record = {**position, "exit_debit": exit_debit, "realized_pl": realized, "close_reason": reason,
-                  "closed_at": self.now_fn().isoformat(), "close_order_id": order_id}
+                      order_id: str | None, *, trigger_price: float | None = None, prev_price: float | None = None,
+                      limit_debit: float | None = None) -> None:
+        """Book a close. `exit_debit` is the broker's ACTUAL fill (None when unknown). The OFFICIAL exit price --
+        the one realized_pl, the circuit breaker and the daily report run on -- follows config.EXIT_PNL_BASIS:
+        "prev_tick" uses the mark one tick before the tick that triggered the exit (`prev_price`), falling back to
+        the trigger mark itself (`trigger_price`) and then to the fill; a resting limit close (`limit_debit`, no
+        trigger tick) books at its fill but never worse than its limit. "fill" is the broker's fill as-is. The
+        real fill and its P/L are always kept beside the official figures."""
+        fill_debit = exit_debit
+        official = fill_debit
+        basis = "fill"
+        if self.config.EXIT_PNL_BASIS == "prev_tick":
+            if prev_price is not None:
+                official, basis = prev_price, "prev_tick"
+            elif trigger_price is not None:
+                official, basis = trigger_price, "trigger_mark"
+            elif limit_debit is not None and fill_debit is not None and fill_debit > limit_debit:
+                official, basis = limit_debit, "limit"
+        qty = position["qty"]
+
+        def pl(debit: float | None) -> float | None:
+            return None if debit is None else round((position["entry_credit"] - debit) * 100 * qty, 2)
+
+        realized, realized_fill = pl(official), pl(fill_debit)
+        slippage = None if fill_debit is None or trigger_price is None else round(fill_debit - trigger_price, 2)
+        detail = {"trigger_price": trigger_price, "prev_tick_price": prev_price, "fill_debit": fill_debit,
+                  "realized_pl_actual_fill": realized_fill, "exit_slippage": slippage, "exit_basis": basis}
+        record = {**position, "exit_debit": official, "realized_pl": realized, "close_reason": reason,
+                  "closed_at": self.now_fn().isoformat(), "close_order_id": order_id, **detail}
         self.state["closed"].append(record)
         self.state["positions"].pop(position["id"], None)
-        self.log.position_closed(position, exit_debit, realized, reason, order_id)
-        if self.risk.is_realized_max_loss(position["entry_credit"], exit_debit, spread_width(position)):
+        self.log.position_closed(position, official, realized, reason, order_id, **detail)
+        # The breaker counts a REALIZED max loss. On the tick basis the bot's own decision mark counts too: a
+        # max-loss stop is triggered by a mark at the line, and the tick before it may sit just short of it. The
+        # broker's fill never does -- a paper fill far from the marks must not trip the breaker.
+        debits = [d for d in (official, trigger_price if basis != "fill" else None) if d is not None]
+        if debits and self.risk.is_realized_max_loss(position["entry_credit"], max(debits), spread_width(position)):
             self.risk.record_max_loss_hit(position["id"], self.now_fn())
         self.save()
         self._notify()
@@ -426,9 +455,35 @@ class OrderManager:
         if short is None or long is None:
             return position.get("current_price")
         price = round(short["mid"] - long["mid"], 2)
+        # Keep the tick we are replacing (and when it was taken): an exit books at the tick BEFORE the one that
+        # triggered it (EXIT_PNL_BASIS "prev_tick"). Without a timestamp on the old mark it cannot be trusted.
+        if position.get("current_price") is not None and position.get("price_at"):
+            position["prev_price"], position["prev_price_at"] = position["current_price"], position["price_at"]
+        else:
+            position.pop("prev_price", None)
+            position.pop("prev_price_at", None)
         position["current_price"] = price
+        position["price_at"] = self.now_fn().isoformat()
         position["unrealized_pl"] = round((position["entry_credit"] - price) * 100 * position["qty"], 2)
         return price
+
+    def _exit_marks(self, position: dict[str, Any]) -> tuple[float | None, float | None]:
+        """(trigger mark, prior-tick mark) for an exit being sent now. The trigger mark is the latest refreshed
+        price; the prior tick is the one before it. Either is dropped when too old to be "just before the close"
+        (EXIT_PREV_TICK_MAX_AGE_SEC) -- e.g. yesterday's last mark on the first cycle of the day."""
+        trigger, prev = position.get("current_price"), position.get("prev_price")
+        max_age = self.config.EXIT_PREV_TICK_MAX_AGE_SEC
+        try:
+            at = datetime.fromisoformat(str(position["price_at"]))
+        except (KeyError, ValueError, TypeError):
+            return None, None
+        if trigger is None or (self.now_fn() - at).total_seconds() > max_age:
+            return None, None
+        try:
+            gap = (at - datetime.fromisoformat(str(position["prev_price_at"]))).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            return trigger, None
+        return trigger, (prev if prev is not None and gap <= max_age else None)
 
     def dte(self, position: dict[str, Any]) -> int:
         return (_exp(position["expiration"]) - self.now_fn().date()).days
@@ -843,7 +898,9 @@ class OrderManager:
                     return False
         if close_qty != position["qty"]:
             position["qty"] = close_qty   # the rest was already closed by the owner; book only what we closed
-        self._record_close(position, order.get("filled_avg_price"), reason, order["id"])
+        trigger, prev = self._exit_marks(position)
+        self._record_close(position, order.get("filled_avg_price"), reason, order["id"],
+                           trigger_price=trigger, prev_price=prev)
         return True
 
     def _legs_still_open(self, position: dict[str, Any], legs: list[dict[str, Any]] | None = None) -> list[str]:
@@ -956,7 +1013,8 @@ class OrderManager:
             except BrokerError:
                 order = None
         if order and order["status"] == "filled":
-            self._record_close(position, float(order.get("filled_avg_price") or 0.0), "profit target (while offline)", close_id)
+            self._record_close(position, float(order.get("filled_avg_price") or 0.0), "profit target (while offline)",
+                               close_id, limit_debit=position.get("close_limit"))
         else:
             if close_id and not close_id.startswith("DRY-") and not (order and order["status"] in TERMINAL):
                 # The legs are gone, so a still-working close order is an orphan (and could be mistaken for an
@@ -1094,8 +1152,11 @@ class OrderManager:
             for c in closed:
                 pl = "n/a" if c.get("realized_pl") is None else f"{c['realized_pl']:+.2f}"
                 exit_px = "n/a" if c.get("exit_debit") is None else f"{c['exit_debit']:.2f}"
+                fill = c.get("fill_debit")
+                fill_txt = "" if fill is None or fill == c.get("exit_debit") else \
+                    f" [fill {fill:.2f} = {c['realized_pl_actual_fill']:+.2f}]"
                 lines.append(f"  {c['symbol']} {c['right']} {c['short_strike']:g}/{c['long_strike']:g} x{c['qty']} "
-                             f"entry {c['entry_credit']:.2f} exit {exit_px} P&L {pl} ({c['close_reason']})")
+                             f"entry {c['entry_credit']:.2f} exit {exit_px} P&L {pl}{fill_txt} ({c['close_reason']})")
         open_risk = self.open_risk_dollars()
         risk_pct = f"{open_risk / equity:.1%}" if equity else "n/a"
         lines.append("-" * 96)

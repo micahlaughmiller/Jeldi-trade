@@ -14,3 +14,7 @@ def test_alpaca_keeps_the_original_exit_rules():
     assert config_45dte.MAX_LOSS_EXIT is True
     assert config_45dte.PROFIT_FLOOR_ENABLED is True and config_45dte.PROFIT_FLOOR_MODE == "fixed"
     assert config_45dte.PROFIT_FLOOR_ARM_PCT_OF_TARGET == 0.85 and config_45dte.PROFIT_FLOOR_PCT_OF_MAX == 0.30
+
+
+def test_alpaca_books_exits_at_the_tick_before_the_close():
+    assert config_45dte.EXIT_PNL_BASIS == "prev_tick" and config_45dte.EXIT_PREV_TICK_MAX_AGE_SEC == 300

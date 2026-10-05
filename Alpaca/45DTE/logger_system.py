@@ -16,6 +16,7 @@ ET = ZoneInfo("US/Eastern")
 TRADE_COLUMNS = [
     "timestamp", "action", "spread_id", "symbol", "right", "expiration", "short_strike", "long_strike",
     "qty", "entry_credit", "exit_debit", "realized_pl", "reason", "order_id",
+    "trigger_price", "prev_tick_price", "fill_debit", "realized_pl_actual_fill",
 ]
 
 
@@ -132,17 +133,26 @@ class TradingLogger:
                        order_id=order_id, reason=reason)
 
     def position_closed(self, spread: dict[str, Any], exit_debit: float | None, realized_pl: float | None,
-                        reason: str, order_id: str | None) -> None:
+                        reason: str, order_id: str | None, **extra: Any) -> None:
+        """exit_debit / realized_pl are the OFFICIAL figures; `extra` carries the other side of the comparison
+        (trigger_price, prev_tick_price, fill_debit, realized_pl_actual_fill, exit_slippage, exit_basis)."""
         pl = "n/a" if realized_pl is None else f"{realized_pl:+.2f}"
         exit_txt = "n/a" if exit_debit is None else f"{exit_debit:.2f}"
+        fill, fill_pl = extra.get("fill_debit"), extra.get("realized_pl_actual_fill")
+        compare = ""
+        if fill is not None and fill_pl is not None and (fill != exit_debit or fill_pl != realized_pl):
+            trig = extra.get("trigger_price")
+            compare = (f" | actual fill {fill:.2f} would have booked {fill_pl:+.2f}"
+                       f"{'' if trig is None else f' (trigger mark {trig:.2f})'}")
         self.log_event(
             "POSITION_CLOSED",
             f"{spread['symbol']} {spread['right']} {spread['short_strike']}/{spread['long_strike']} x{spread['qty']} "
-            f"exit={exit_txt} P&L={pl} ({reason})",
+            f"exit={exit_txt} P&L={pl} ({reason}){compare}",
             spread_id=spread.get("id"), symbol=spread["symbol"], exit_debit=exit_debit, realized_pl=realized_pl,
-            reason=reason, order_id=order_id,
+            reason=reason, order_id=order_id, **extra,
         )
-        self.record_trade("CLOSE", spread, exit_debit=exit_debit, realized_pl=realized_pl, reason=reason, order_id=order_id)
+        self.record_trade("CLOSE", spread, exit_debit=exit_debit, realized_pl=realized_pl, reason=reason,
+                          order_id=order_id, **extra)
 
     def breaker(self, tripped: bool, hits: int, message: str) -> None:
         self.log_event("BREAKER", message, tripped=tripped, hits=hits)
@@ -158,11 +168,20 @@ class TradingLogger:
         self.log_event("END_OF_DAY", "End-of-day summary written", **fields)
 
     def record_trade(self, action: str, spread: dict[str, Any], exit_debit: float | None = None,
-                     realized_pl: float | None = None, reason: str = "", order_id: str | None = None) -> None:
+                     realized_pl: float | None = None, reason: str = "", order_id: str | None = None,
+                     **extra: Any) -> None:
         path = self.trades_file()
         new = not path.exists()
+        fields = TRADE_COLUMNS
+        if not new:
+            # A file started earlier today by an older build keeps its own header: write only those columns
+            # rather than appending rows that no longer line up with it.
+            with path.open(encoding="utf-8", newline="") as fh:
+                header = next(csv.reader(fh), None)
+            if header:
+                fields = header
         with path.open("a", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=TRADE_COLUMNS)
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             if new:
                 writer.writeheader()
             writer.writerow({
@@ -171,6 +190,8 @@ class TradingLogger:
                 "short_strike": spread["short_strike"], "long_strike": spread["long_strike"], "qty": spread["qty"],
                 "entry_credit": spread.get("entry_credit"), "exit_debit": exit_debit, "realized_pl": realized_pl,
                 "reason": reason, "order_id": order_id,
+                **{k: extra.get(k) for k in ("trigger_price", "prev_tick_price", "fill_debit",
+                                             "realized_pl_actual_fill")},
             })
 
     def write_daily_summary(self, summary: dict[str, Any]) -> Path:

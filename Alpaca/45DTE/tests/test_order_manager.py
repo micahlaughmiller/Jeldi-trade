@@ -16,6 +16,7 @@ ORIGINAL_EXIT_RULES = dict(EXIT_DTE_ENABLED=True, MAX_LOSS_EXIT=True, PROFIT_FLO
                            PROFIT_FLOOR_MODE="fixed", PROFIT_FLOOR_ARM_PCT_OF_TARGET=0.85,
                            PROFIT_FLOOR_PCT_OF_MAX=0.30, PROFIT_FLOOR_TRAIL_TICK=0.05,
                            PROFIT_FLOOR_MIN_PROFIT=0.05)
+PNL_BASIS_RULES = dict(EXIT_PNL_BASIS="fill", EXIT_PREV_TICK_MAX_AGE_SEC=300)   # the tick basis opts in below
 MANUAL_OVERRIDE_RULES = dict(EXTERNAL_EXIT_RECHECK_SEC=0, EXTERNAL_SYNC_ENABLED=True, EXTERNAL_SYNC_CONFIRM_CYCLES=2,
                              EXTERNAL_SYNC_MIN_AGE_SEC=120, MANUAL_CLOSE_COOLDOWN_SEC=120)
 TRAIL_EXIT_RULES = dict(EXIT_DTE_ENABLED=False, MAX_LOSS_EXIT=False, PROFIT_FLOOR_ENABLED=True,
@@ -28,7 +29,7 @@ def _original_exit_rules(monkeypatch):
     """Pin the original exit rules (and the manual-override sync settings) so the tests below mean the same
     thing in every broker folder (the Schwab folder's own config overrides several of the exit rules); the
     trail-mode tests opt in explicitly."""
-    for key, value in {**ORIGINAL_EXIT_RULES, **MANUAL_OVERRIDE_RULES}.items():
+    for key, value in {**ORIGINAL_EXIT_RULES, **MANUAL_OVERRIDE_RULES, **PNL_BASIS_RULES}.items():
         monkeypatch.setattr(config_45dte, key, value)
 
 
@@ -1398,3 +1399,189 @@ class TestExitPreflightNeedsTwoAgreeingReads:
         assert om.exit_at_market(pos, "test exit") is True
         assert om.positions == [] and "manual" in om.state["closed"][-1]["close_reason"]
         assert not any(c[0] == "close_spread_at_market" for c in broker.calls)
+
+
+
+class TestOfficialExitPrice:
+    """EXIT_PNL_BASIS "prev_tick": the official P/L is the mark one tick before the trigger tick (as in the 0DTE
+    bots); the broker's real fill is kept beside it."""
+
+    @pytest.fixture(autouse=True)
+    def _tick_basis(self, monkeypatch):
+        monkeypatch.setattr(config_45dte, "EXIT_PNL_BASIS", "prev_tick")
+
+    @staticmethod
+    def _fill_at(broker, price):
+        """Make every market close fill at `price` (a paper fill far from the marks)."""
+        orig = broker.close_spread_at_market
+
+        def worse(*args, **kwargs):
+            order = orig(*args, **kwargs)
+            order["filled_avg_price"] = price
+            return order
+        broker.close_spread_at_market = worse
+
+    def _armed_trail_position(self, env, trail_rules_applied=True):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 2)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        set_chain(broker, 1.50, 0.30)         # 1.20 -> armed at the best
+        om.maintain()
+        return om.positions[0]
+
+    def test_a_trail_exit_books_at_the_prior_tick_not_the_adverse_fill(self, env, trail_rules):
+        clock, broker, log, om, tmp = env
+        self._armed_trail_position(env)
+        self._fill_at(broker, 1.95)           # the paper fill lands 0.70 away from the mark
+        clock.advance(seconds=60)
+        set_chain(broker, 1.55, 0.30)         # 1.25: the first nickel against -> trail exit fires
+        om.maintain()
+        assert om.positions == []
+        rec = om.state["closed"][-1]
+        assert rec["exit_debit"] == 1.20 and rec["exit_basis"] == "prev_tick"
+        assert rec["realized_pl"] == pytest.approx((1.60 - 1.20) * 100 * 2)          # +80 official
+        assert rec["fill_debit"] == 1.95 and rec["realized_pl_actual_fill"] == pytest.approx((1.60 - 1.95) * 100 * 2)
+        assert rec["trigger_price"] == 1.25 and rec["prev_tick_price"] == 1.20 and rec["exit_slippage"] == 0.70
+        assert om.realized_today_total() == pytest.approx(80.0)
+
+    def test_the_close_event_and_trades_csv_carry_both_figures(self, env, trail_rules):
+        clock, broker, log, om, tmp = env
+        self._armed_trail_position(env)
+        self._fill_at(broker, 1.95)
+        clock.advance(seconds=60)
+        set_chain(broker, 1.55, 0.30)
+        om.maintain()
+        events = [json.loads(line) for line in (tmp / "session_2026-09-17.jsonl").read_text().splitlines()]
+        closed = next(e for e in events if e["type"] == "POSITION_CLOSED")
+        assert closed["realized_pl"] == 80.0 and closed["realized_pl_actual_fill"] == -70.0
+        assert "actual fill 1.95 would have booked -70.00" in closed["message"]
+        import csv
+        rows = list(csv.DictReader((tmp / "trades_2026-09-17.csv").open()))
+        close = next(r for r in rows if r["action"] == "CLOSE")
+        assert float(close["realized_pl"]) == 80.0 and float(close["realized_pl_actual_fill"]) == -70.0
+        assert float(close["fill_debit"]) == 1.95 and float(close["prev_tick_price"]) == 1.20
+        assert "P&L +80.00 [fill 1.95 = -70.00]" in om.position_report(25_000.0)
+
+    def test_no_prior_tick_falls_back_to_the_trigger_mark(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 1)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        pos = om.positions[0]
+        set_chain(broker, 1.50, 0.30)
+        om.refresh_price(pos)                 # the very first tick: nothing before it
+        self._fill_at(broker, 1.90)
+        assert om.exit_at_market(pos, "test") is True
+        rec = om.state["closed"][-1]
+        assert rec["exit_debit"] == 1.20 and rec["exit_basis"] == "trigger_mark" and rec["prev_tick_price"] is None
+        assert rec["realized_pl_actual_fill"] == pytest.approx((1.60 - 1.90) * 100)
+
+    def test_a_stale_prior_tick_is_not_used(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 1)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        pos = om.positions[0]
+        set_chain(broker, 1.50, 0.30)
+        om.refresh_price(pos)                                  # 1.20, yesterday's last tick
+        clock.advance(hours=17)
+        set_chain(broker, 1.40, 0.30)
+        om.refresh_price(pos)                                  # 1.10, first tick of the day
+        assert pos["prev_price"] == 1.20
+        assert om.exit_at_market(pos, "test") is True
+        rec = om.state["closed"][-1]
+        assert rec["prev_tick_price"] is None and rec["exit_debit"] == 1.10 and rec["exit_basis"] == "trigger_mark"
+
+    def test_a_stale_trigger_mark_falls_back_to_the_fill(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 1)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        pos = om.positions[0]
+        set_chain(broker, 1.50, 0.30)
+        om.refresh_price(pos)
+        om.refresh_price(pos)
+        clock.advance(hours=1)                                 # no refresh since: the marks say nothing about now
+        self._fill_at(broker, 1.90)
+        assert om.exit_at_market(pos, "test") is True
+        rec = om.state["closed"][-1]
+        assert rec["exit_debit"] == 1.90 and rec["exit_basis"] == "fill" and rec["trigger_price"] is None
+
+    def test_the_fill_basis_keeps_the_brokers_fill_as_official(self, env, trail_rules, monkeypatch):
+        monkeypatch.setattr(config_45dte, "EXIT_PNL_BASIS", "fill")
+        clock, broker, log, om, tmp = env
+        self._armed_trail_position(env)
+        self._fill_at(broker, 1.95)
+        clock.advance(seconds=60)
+        set_chain(broker, 1.55, 0.30)
+        om.maintain()
+        rec = om.state["closed"][-1]
+        assert rec["exit_debit"] == 1.95 and rec["realized_pl"] == pytest.approx((1.60 - 1.95) * 100 * 2)
+        assert rec["exit_basis"] == "fill" and rec["realized_pl_actual_fill"] == rec["realized_pl"]
+
+    def test_a_resting_profit_target_fill_is_never_booked_worse_than_its_limit(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 1)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        om.maintain()
+        pos = om.positions[0]
+        limit = pos["close_limit"]
+        broker.fill_order(pos["close_order_id"], limit + 0.60)    # a paper fill the limit order could never give
+        om.maintain()
+        rec = om.state["closed"][-1]
+        assert rec["close_reason"] == "profit target" and rec["exit_basis"] == "limit"
+        assert rec["exit_debit"] == limit and rec["fill_debit"] == pytest.approx(limit + 0.60)
+        assert rec["realized_pl"] == pytest.approx((1.60 - limit) * 100)
+
+    def test_a_resting_profit_target_fill_better_than_its_limit_keeps_the_better_price(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.60), 1)
+        broker.fill_order(oid, 1.60)
+        om.poll_entries()
+        om.maintain()
+        pos = om.positions[0]
+        broker.fill_order(pos["close_order_id"], pos["close_limit"] - 0.10)
+        om.maintain()
+        rec = om.state["closed"][-1]
+        assert rec["exit_debit"] == pytest.approx(pos["close_limit"] - 0.10) and rec["exit_basis"] == "fill"
+
+    def test_a_max_loss_stop_still_feeds_the_breaker_on_the_tick_basis(self, env):
+        clock, broker, log, om, tmp = env
+        oid = om.submit_entry(spec(1.50), 1)
+        broker.fill_order(oid, 1.50)
+        om.poll_entries()
+        set_chain(broker, 5.30, 1.30)         # 4.00: short of the 4.65 line
+        om.maintain()
+        assert om.risk.max_loss_hits == 0
+        clock.advance(seconds=60)
+        set_chain(broker, 6.00, 1.30)         # 4.70: the stop fires; the prior tick (4.00) is the official price
+        om.maintain()
+        rec = om.state["closed"][-1]
+        assert om.positions == [] and rec["exit_debit"] == 4.00 and rec["trigger_price"] == 4.70
+        assert om.risk.max_loss_hits == 1     # the decision mark was at the line: a realized max-loss stop
+
+    def test_a_profit_exit_with_a_max_loss_sized_paper_fill_does_not_feed_the_breaker(self, env, trail_rules):
+        clock, broker, log, om, tmp = env
+        self._armed_trail_position(env)
+        self._fill_at(broker, 4.90)           # a wild paper fill, far past the max-loss line
+        clock.advance(seconds=60)
+        set_chain(broker, 1.55, 0.30)
+        om.maintain()
+        rec = om.state["closed"][-1]
+        assert rec["realized_pl"] > 0 > rec["realized_pl_actual_fill"]
+        assert om.risk.max_loss_hits == 0
+
+    def test_an_old_trades_csv_header_is_kept_for_the_rest_of_the_day(self, env, trail_rules):
+        clock, broker, log, om, tmp = env
+        old_header = "timestamp,action,spread_id,symbol,right,expiration,short_strike,long_strike,qty,entry_credit,exit_debit,realized_pl,reason,order_id"
+        (tmp / "trades_2026-09-17.csv").write_text(old_header + "\n", encoding="utf-8")
+        self._armed_trail_position(env)
+        clock.advance(seconds=60)
+        set_chain(broker, 1.55, 0.30)
+        om.maintain()
+        import csv
+        rows = list((tmp / "trades_2026-09-17.csv").open(newline=""))
+        parsed = list(csv.reader(rows))
+        assert ",".join(parsed[0]) == old_header and len(parsed) > 1 and all(len(r) == 14 for r in parsed)

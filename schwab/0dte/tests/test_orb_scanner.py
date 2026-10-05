@@ -1,5 +1,6 @@
 """ORB pre-breakout scanner: synthetic bars only, no network (fetch functions are monkeypatched)."""
 
+import math
 from datetime import date, datetime, time, timedelta
 
 import pandas as pd
@@ -137,6 +138,69 @@ def test_intraday_pages_capped_at_yahoo_limit():
     later_pages = osc._intraday_pages(past, sessions=25, today=date(2026, 9, 28))
     for p in later_pages[1:]:
         assert date.fromisoformat(p["start"]) >= floor
+
+
+def test_nyse_holiday_calendar_matches_known_closures():
+    closed = {
+        2026: [(1, 1), (1, 19), (2, 16), (4, 3), (5, 25), (6, 19), (7, 3), (9, 7), (11, 26), (12, 25)],
+        2027: [(1, 1), (1, 18), (2, 15), (3, 26), (5, 31), (6, 18), (7, 5), (9, 6), (11, 25), (12, 24)],
+        2025: [(1, 1), (1, 20), (2, 17), (4, 18), (5, 26), (6, 19), (7, 4), (9, 1), (11, 27), (12, 25)],
+    }
+    for year, days in closed.items():
+        got = {(d.month, d.day) for d in osc._NYSE_HOLIDAYS.holidays(start=f"{year}-01-01", end=f"{year}-12-31")}
+        assert got == set(days), (year, sorted(got ^ set(days)))
+    # a Saturday New Year's Day is not observed on the Friday before (2022-01-01 was a Saturday)
+    assert (12, 31) not in {(d.month, d.day) for d in
+                            osc._NYSE_HOLIDAYS.holidays(start="2021-12-01", end="2021-12-31")}
+    assert osc._NYSE_HOLIDAYS.holidays(start="2021-12-20", end="2021-12-31").tolist() == [pd.Timestamp("2021-12-24")]
+
+
+def test_has_session_needs_a_trading_day_in_the_window():
+    assert not osc.has_session(date(2026, 9, 6), date(2026, 9, 8))     # Sunday + Labor Day: the logged ERROR window
+    assert not osc.has_session(date(2026, 9, 5), date(2026, 9, 8) - timedelta(days=1))   # Sat + Sun
+    assert osc.has_session(date(2026, 9, 7), date(2026, 9, 9))         # Tuesday the 8th is in it
+    assert osc.has_session(date(2026, 9, 6), date(2026, 9, 9))
+    assert not osc.has_session(date(2026, 9, 8), date(2026, 9, 8))     # empty window
+    assert not osc.has_session(date(2026, 12, 25), date(2026, 12, 27))  # Christmas Friday + Saturday
+    assert osc.has_session(date(2026, 11, 27), date(2026, 11, 28))     # day after Thanksgiving is a (short) session
+
+
+def test_intraday_pages_skip_a_window_with_no_trading_day():
+    # 2026-10-05 -> Yahoo floor Sep 6: the oldest page would be [Sep 6, Sep 8) = Sunday + Labor Day -> no bars,
+    # and yfinance logs an ERROR for every symbol. It must not be requested.
+    now = datetime(2026, 10, 5, 9, 20, tzinfo=ET)
+    pages = osc._intraday_pages(now, sessions=25, today=now.date())
+    assert {"start": "2026-09-06", "end": "2026-09-08"} not in pages
+    assert pages[0] == {"period": "7d"} and len(pages) == 4
+    for p in pages[1:]:
+        assert osc.has_session(date.fromisoformat(p["start"]), date.fromisoformat(p["end"]))
+
+
+def test_intraday_page_skipping_never_drops_a_session_that_has_bars():
+    """Across a year of 'now' dates, every trading day from the Yahoo floor up to now stays covered by some page."""
+    for offset in range(0, 365):
+        now = datetime(2026, 1, 5, 9, 20, tzinfo=ET) + timedelta(days=offset)
+        if now.weekday() >= 5:
+            continue
+        pages = osc._intraday_pages(now, sessions=25, today=now.date())
+        floor = now.date() - timedelta(days=osc.YF_1M_MAX_CALENDAR_DAYS)
+        calendar_days = min(int(math.ceil(25 * 7 / 5)) + 3, osc.YF_1M_MAX_CALENDAR_DAYS)
+        need_from = now.date() - timedelta(days=calendar_days)
+        covered = set()
+        for p in pages:
+            if "period" in p:
+                lo, hi = now.date() - timedelta(days=7), now.date() + timedelta(days=1)
+            else:
+                lo, hi = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
+            d = lo
+            while d < hi:
+                covered.add(d)
+                d += timedelta(days=1)
+        day = max(need_from, floor)
+        while day <= now.date():
+            if osc.has_session(day, day + timedelta(days=1)):
+                assert day in covered, (now.date(), day)
+            day += timedelta(days=1)
 
 
 def test_normalize_daily_keeps_session_date():

@@ -36,11 +36,15 @@ import sys
 import time as _time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 import yfinance as yf
+from pandas.tseries.holiday import (AbstractHolidayCalendar, GoodFriday, Holiday, USLaborDay,
+                                    USMartinLutherKingJr, USMemorialDay, USPresidentsDay,
+                                    USThanksgivingDay, nearest_workday, sunday_to_monday)
 
 import config
 from strategy import BEARISH, BULLISH, at_time, ema
@@ -54,6 +58,46 @@ YF_1M_MAX_CALENDAR_DAYS = 29     # Yahoo refuses 1m requests reaching further ba
 YF_1M_PAGE_DAYS = 7              # and serves at most ~7-8 days of 1m bars per request
 DEFAULT_UNIVERSE_PATH = Path(__file__).resolve().parent / "data" / "orb_universe.json"
 INDEX_TIER = "IDX"               # tier label given to the index (SPX); tiebreak 0
+
+
+
+class _NyseHolidays(AbstractHolidayCalendar):
+    """Full-day NYSE closures (early-close days still trade). Saturday holidays are observed the Friday before,
+    Sunday ones the Monday after -- except New Year's Day, which is not moved to the prior Friday."""
+    rules = [
+        Holiday("New Year's Day", month=1, day=1, observance=sunday_to_monday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth", month=6, day=19, start_date="2022-01-01", observance=nearest_workday),
+        Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
+    ]
+
+
+_NYSE_HOLIDAYS = _NyseHolidays()
+
+
+@lru_cache(maxsize=None)
+def _closed_days(year: int) -> frozenset[date]:
+    return frozenset(ts.date() for ts in _NYSE_HOLIDAYS.holidays(start=pd.Timestamp(year, 1, 1),
+                                                                 end=pd.Timestamp(year, 12, 31)))
+
+
+def has_session(start: date, end: date) -> bool:
+    """True if [start, end) holds at least one weekday that is not an NYSE holiday, i.e. a day Yahoo can have
+    1-minute bars for. Asking Yahoo for a window with none (a weekend plus a Monday holiday) returns nothing and
+    makes yfinance log an ERROR ("possibly delisted; no price data found") for every symbol in the batch."""
+    day = start
+    while day < end:
+        if day.weekday() < 5 and day not in _closed_days(day.year):
+            return True
+        day += timedelta(days=1)
+    return False
+
 
 _CACHE: dict[tuple, tuple[float, object]] = {}
 _COLUMNS = ["open", "high", "low", "close", "volume"]
@@ -248,7 +292,8 @@ def _rth_only(df: pd.DataFrame) -> pd.DataFrame:
 def _intraday_pages(now: datetime, sessions: int, today: date | None = None) -> list[dict]:
     """yf.download kwargs covering ~`sessions` sessions back from `now`: today's rolling 7-day
     window first, then 7-day start/end windows back to Yahoo's ~30-day 1m limit. That limit is
-    measured from the real clock (`today`), not from a past `now` being re-scored."""
+    measured from the real clock (`today`), not from a past `now` being re-scored. A window with no trading
+    session in it (e.g. the Sunday + Labor Day sliver the limit can clip the oldest page down to) is skipped."""
     today = today or datetime.now(ET).date()
     floor = max(now.date(), today) - timedelta(days=YF_1M_MAX_CALENDAR_DAYS)
     calendar_days = min(int(math.ceil(sessions * 7 / 5)) + 3, YF_1M_MAX_CALENDAR_DAYS)
@@ -260,7 +305,8 @@ def _intraday_pages(now: datetime, sessions: int, today: date | None = None) -> 
         start = max(start, floor)
         if start >= end:
             break
-        pages.append({"start": start.isoformat(), "end": end.isoformat()})
+        if has_session(start, end):    # the floor can leave a sliver that is all weekend/holiday: nothing to fetch
+            pages.append({"start": start.isoformat(), "end": end.isoformat()})
         k += 1
     return pages
 

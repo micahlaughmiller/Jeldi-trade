@@ -120,11 +120,16 @@ def test_orb_only_news_mode_admits_stock_orb(monkeypatch):
     assert strategy.setup_allowed("STOCK_ORB", news_day) is False
 
 
-def test_only_astra_opts_into_f():
+def test_every_persona_runs_f():
     overrides = getattr(config, "PERSONA_OVERRIDES", {})          # Alpaca personas; the Schwab twin has none
     if overrides:
         assert overrides["ASTRA"]["STRATEGIES"] == ("B", "F")   # 2026-10-01: A removed
-    assert all("F" not in o.get("STRATEGIES", ()) for name, o in overrides.items() if name != "ASTRA")
+    # 2026-10-06: F runs on every persona, in addition to (never instead of) the persona's own SPX strategies
+    if overrides:
+        assert all("F" in o["STRATEGIES"] and o["STRATEGIES"][-1] == "F" for o in overrides.values())
+        assert {n: tuple(s for s in o["STRATEGIES"] if s != "F") for n, o in overrides.items()} == {
+            "ASTRA": ("B",), "ARIA": ("B", "D"), "ELENA": ("B", "C", "D"), "DAVID": ("B", "C", "E"),
+            "JORDAN": ("B", "C", "E")}
     assert config.STOCK_STRATEGIES == ("F",) and config.DAILY_LOSS_LIMIT_EXEMPT == ("F",)
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None
     assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7,

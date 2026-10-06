@@ -218,7 +218,8 @@ def test_persona_cde_matrix_gives_every_strategy_two_test_variants():
     assert set(overrides) == set(config.TRADER_NAMES)
     runs = {s: sorted(n for n, o in overrides.items() if s in o.get("STRATEGIES", ())) for s in "BCDEF"}
     assert runs == {"B": ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"], "C": ["DAVID", "ELENA", "JORDAN"],
-                    "D": ["ARIA", "ELENA"], "E": ["DAVID", "JORDAN"], "F": ["ASTRA"]}
+                    "D": ["ARIA", "ELENA"], "E": ["DAVID", "JORDAN"],
+                    "F": ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"]}
     assert all("A" not in o["STRATEGIES"] for o in overrides.values())
     # D and E variants never share a persona, because the D_* constants are shared by both inside one persona
     assert not any({"D", "E"} <= set(o["STRATEGIES"]) for o in overrides.values())

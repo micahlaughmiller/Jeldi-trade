@@ -585,7 +585,7 @@ E_USE_TREND_GATE = True
 C_ENTRY_END_MIN = 30
 
 # ------------------------------------------------------ Strategy F: stock opening-range breakout
-# ASTRA only (PERSONA_OVERRIDES). The 30 names in data/orb_universe.json are scored by orb_scanner
+# Every persona (PERSONA_OVERRIDES; ASTRA only until 2026-10-06). The 30 names in data/orb_universe.json are scored by orb_scanner
 # (100-point Pre-Breakout Score over the 09:30-09:45 bars) and ranked ONCE at F_RANK_TIME; the top
 # F_WATCH_TOP with score >= F_MIN_SCORE are watched for a completed 5-minute candle closing through the
 # 15-minute opening range (strategy.OrbSetup per ticker, whichever boundary breaks), confirmed by
@@ -681,23 +681,23 @@ def _a(momentum_only=False, **extra) -> dict:
 #   D  ARIA  BB 1.5 std, %B 0.85, chop 1.0      ELENA BB 1.0 std, %B 0.90, chop 1.0  (spec: 2.0 / 0.95 / 2.0)
 #   E  DAVID no trend gate, %B 0.95             JORDAN no trend gate, %B 0.85
 # D_* constants are shared by D and E inside one persona, which is why D and E variants live on
-# different personas. B is unchanged everywhere; F stays on ASTRA only.
+# different personas. B is unchanged everywhere. 2026-10-06: F (stock ORB) now runs on EVERY persona (it was ASTRA only).
 PERSONA_OVERRIDES: dict[str, dict] = {
     # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. 2026-10-01: A removed.
     "ASTRA":  {"STRATEGIES": ("B", "F")},
     "ARIA":   {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
-              "STRATEGIES": ("B", "D"),
+              "STRATEGIES": ("B", "D", "F"),
               "D_BB_STD": 1.5, "D_BAND_TOUCH_PCT_B": 0.85, "D_EMA_CHOP_THRESHOLD_PTS": 1.0},
     "ELENA":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.10, 0.05), 5: (0.10, 0.05)}, momentum_only=True),  # method 2, $10-wide
-              "STRATEGIES": ("B", "C", "D"), "C_ENTRY_END_MIN": 60,
+              "STRATEGIES": ("B", "C", "D", "F"), "C_ENTRY_END_MIN": 60,
               "D_BB_STD": 1.0, "D_BAND_TOUCH_PCT_B": 0.90, "D_EMA_CHOP_THRESHOLD_PTS": 1.0},
     # 2026-09-24: the day-type gate (Kaufman ER >= 0.15) was tested on DAVID/JORDAN for Strategy A; with A
     # removed that gate is inert (it only ever lived in A's tuning), kept here only so their exit method
     # labels stay as they were.
     "DAVID":  {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, DAY_GATE_ENABLED=True),  # method 1, $10-wide
-              "STRATEGIES": ("B", "C", "E"), "E_USE_TREND_GATE": False},
+              "STRATEGIES": ("B", "C", "E", "F"), "E_USE_TREND_GATE": False},
     "JORDAN": {**_a(STALE_TIMER_MIN=5, DAY_GATE_ENABLED=True),                                         # method 3, $10-wide
-              "STRATEGIES": ("B", "C", "E"), "C_ENTRY_END_MIN": 60,
+              "STRATEGIES": ("B", "C", "E", "F"), "C_ENTRY_END_MIN": 60,
               "E_USE_TREND_GATE": False, "D_BAND_TOUCH_PCT_B": 0.85},
 }
 globals().update(PERSONA_OVERRIDES.get(ACTIVE_TRADER, {}))

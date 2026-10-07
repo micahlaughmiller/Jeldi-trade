@@ -508,14 +508,12 @@ def test_manual_hold_blocks_new_entries_and_keeps_the_bot_up_at_the_forced_close
 
 # ------------------------------------------------- 1:00 pm ET hard stop (2026-10-05)
 
-def test_the_hard_stop_is_one_pm_eastern_and_has_no_wind_down_phase():
+def test_the_hard_stop_is_one_pm_eastern_and_a_manual_hold_does_not_delay_it():
     import strategy
     from datetime import time as dtime
-    assert config.LAST_ENTRY_TIME == dtime(13, 0) and config.FORCE_CLOSE_TIME == dtime(13, 0)
-    assert config.MANUAL_HOLD_DELAYS_FORCE_CLOSE is False
-    assert strategy.phase(et(12, 59, 59)) == strategy.Phase.ORB_ONLY
+    assert config.FORCE_CLOSE_TIME == dtime(13, 0) and config.MANUAL_HOLD_DELAYS_FORCE_CLOSE is False
+    assert strategy.phase(et(12, 59, 59)) != strategy.Phase.CLOSED
     assert strategy.phase(et(13, 0, 0)) == strategy.Phase.CLOSED
-    assert strategy.Phase.NO_NEW_ENTRIES not in {strategy.phase(et(h, m)) for h in range(9, 17) for m in range(0, 60)}
 
 
 def test_the_hard_stop_closes_everything_even_with_a_manual_hold_file(bot, hold_dir):

@@ -144,7 +144,8 @@ class RiskManager:
 
     def trading_allowed(self, strat: str, equity: float | None = None,
                         now: datetime | None = None, setup: str | None = None,
-                        open_count: int = 0, exempt_open_pnl: float = 0.0) -> tuple[bool, str]:
+                        open_count: int = 0, exempt_open_pnl: float = 0.0,
+                        open_spx: int = 0) -> tuple[bool, str]:
         """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
         the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
         different ORB signal that represented the morning's move continuing into the day) -- if either the
@@ -157,6 +158,12 @@ class RiskManager:
         entries = max(s.entries_today, s.trades_today + open_count)
         if entries >= limit(strat, "MAX_TRADES_PER_DAY"):
             return False, f"{strat}: MAX_TRADES_PER_DAY ({entries})"
+        total_cap = getattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
+        if total_cap:
+            # A-E count a trade when it CLOSES (an open one is `open_spx`), F counts at ENTRY (entries_today >= its closes)
+            taken = sum(max(st.entries_today, st.trades_today) for st in self.state.strategies.values()) + open_spx
+            if taken >= total_cap:
+                return False, f"TOTAL_MAX_TRADES_PER_DAY ({taken}/{total_cap})"
         if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
         if s.manual_cooldown_until and now is not None:

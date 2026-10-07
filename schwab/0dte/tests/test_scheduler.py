@@ -1160,3 +1160,41 @@ def test_momentum_timeout_and_closed_window_are_journaled(bot, monkeypatch):
     monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: m1)
     bot.check_pending_momentum(et(9, 37), scheduler.Phase.CLOSED)
     assert [r["reason_code"] for r in skipped(bot, "A")] == ["MOMENTUM_TIMEOUT", "MOMENTUM_ENTRY_WINDOW_CLOSED"]
+
+
+# ------------------------------------------------- 12:00 ET entry cutoff and the 5-trade total cap (2026-10-07)
+
+def test_the_total_cap_blocks_every_strategy_and_is_journaled(bot, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", 5)
+    for strat in ("A", "A", "A", "B", "B"):
+        bot.risk.record_trade(strat, 10.0)                        # 5 trades today across A and B; neither is at its own cap
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert bot.pm.positions == {}
+    rows = skipped(bot)
+    assert {r["strategy"] for r in rows} == {"A", "B"} and {r["reason_code"] for r in rows} == {"TOTAL_MAX_TRADES_PER_DAY"}
+
+
+def test_an_open_position_counts_toward_the_total_cap_within_one_signal(bot, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", 5)
+    for strat in ("A", "A", "A", "B"):
+        bot.risk.record_trade(strat, 10.0)                        # 4 trades so far: exactly one more is allowed
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A"}                         # A takes the 5th ...
+    assert [(r["strategy"], r["reason_code"]) for r in skipped(bot)] == [("B", "TOTAL_MAX_TRADES_PER_DAY")]   # ... B is refused
+
+
+def test_nothing_enters_from_noon_eastern_and_the_bot_keeps_managing_until_the_hard_stop(bot, monkeypatch):
+    import pandas as pd
+    calls = []
+    for name in ("try_es_break_entry", "try_on_break_entry", "try_orb_entry", "check_continuation_reentry",
+                 "check_mean_reversion_entry"):
+        monkeypatch.setattr(bot, name, lambda *a, _n=name, **k: calls.append(_n))
+    bot.refresh_levels = lambda now: None
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: pd.DataFrame())
+    bot.tick(et(11, 59, 30))
+    assert "check_continuation_reentry" in calls and "check_mean_reversion_entry" in calls    # still entering
+    calls.clear()
+    bot.tick(et(12, 0, 30))
+    assert calls == [] and bot.done is False                       # no entry path runs; the bot is still up (positions are managed)
+    bot.tick(et(13, 0, 30))
+    assert bot.done is True

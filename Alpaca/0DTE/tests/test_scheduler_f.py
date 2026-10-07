@@ -628,3 +628,12 @@ def test_the_entry_hold_runs_from_the_fill_not_from_the_signal_tick(bot, data, m
     enter_f(bot, data)
     pos = bot.pm.positions["F:TSLA"]
     assert pos.entry_time == et(9, 55, 10) + timedelta(seconds=37)
+
+
+def test_f_is_refused_by_the_total_cap_too(bot, data, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", 5)
+    rank(bot, data)
+    for strat in ("A", "A", "A", "B", "B"):
+        bot.risk.record_trade(strat, 10.0)
+    out = bot.f.enter(et(10, 0), signal())
+    assert out.startswith("skip:") and "TOTAL_MAX_TRADES_PER_DAY" in out and "F:TSLA" not in bot.pm.positions

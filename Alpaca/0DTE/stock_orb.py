@@ -697,7 +697,7 @@ class StockOrbTrader:
         equity = broker.get_account()["equity"]
         allowed, reason = bot.risk.trading_allowed(
             STRATEGY, equity, now, SETUP, open_count=bot.pm.open_count(STRATEGY),
-            exempt_open_pnl=bot.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT))
+            exempt_open_pnl=bot.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT), open_spx=bot.pm.open_spx_count())
         if not allowed:
             log.info("[F] No new entries: %s", reason)
             self._skip(now, sig, reason)

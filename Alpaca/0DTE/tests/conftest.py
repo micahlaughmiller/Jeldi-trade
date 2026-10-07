@@ -21,10 +21,21 @@ def _pin_default_strategies(monkeypatch):
     monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
 
 
+REAL_CONFIG_MODULES = ("test_session_limits",)   # these run against the shipped session/limit values
+
+
+@pytest.fixture(autouse=True)
+def _pin_total_trade_cap_off(request, monkeypatch):
+    """The shared suite predates the 2026-10-07 one-cap-for-all-strategies rule (MAX_TRADES_TOTAL_PER_DAY = 5), so it
+    runs with the total cap off; tests of the cap set it themselves and test_session_limits uses the real value."""
+    if request.module.__name__ not in REAL_CONFIG_MODULES:
+        monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
+
+
 @pytest.fixture
 def wind_down_times(monkeypatch):
     """The session end before the 2026-10-05 hard stop (last entry 15:00, force close 15:30), for the tests that
-    exercise the NO_NEW_ENTRIES phase -- the shipped config has no such phase (both are 13:00)."""
+    exercise the NO_NEW_ENTRIES phase with other times than the shipped ones (last entry 12:00, force close 13:00)."""
     monkeypatch.setattr(config, "LAST_ENTRY_TIME", time(15, 0))
     monkeypatch.setattr(config, "FORCE_CLOSE_TIME", time(15, 30))
 

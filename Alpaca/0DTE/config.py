@@ -150,10 +150,11 @@ MARKET_CLOSE = time(16, 0)
 OVERNIGHT_SESSION_START = time(18, 0)
 OPENING_RANGE_MINUTES = 30
 OVERNIGHT_ENTRY_END_MIN = 30
-# 2026-10-05: HARD STOP at 1:00 pm Eastern (12:00 noon Central), no matter what. No new entry from then,
-# every open spread is closed, every working order is cancelled and the bot exits for the day. It was
-# 15:00 last entry / 15:30 force close. They are the same time now, so there is no wind-down phase.
-LAST_ENTRY_TIME = time(13, 0)     # 12:00 noon Central: last new entry
+# 2026-10-05: HARD STOP at 1:00 pm Eastern (12:00 noon Central), no matter what: every open spread is closed, every
+# working order is cancelled and the bot exits for the day (it was 15:30). 2026-10-07: NEW ENTRIES stop at 12:00 noon
+# Eastern (11:00 Central) -- the last hour (12:00-13:00 ET) only manages what is already open, then the hard stop.
+# The window between the two is the NO_NEW_ENTRIES phase.
+LAST_ENTRY_TIME = time(12, 0)     # 11:00 Central: last new entry (all strategies, F included)
 FORCE_CLOSE_TIME = time(13, 0)    # 12:00 noon Central: everything closed, bot stops
 
 # 2026-09-25: "as fast as Alpaca will let them" -- tightened from 15s. Watch for HTTP 429s across
@@ -234,6 +235,9 @@ MAX_CONTRACTS_PER_TRADE = 10
 # exploratory limits (this also caps the kind of single-persona re-entry concentration risk the 9/30-
 # 10/1 analysis surfaced on B).
 MAX_TRADES_PER_DAY = 5
+# 2026-10-07: ONE cap across every strategy of a persona (B, C, D, E and F together): once this many trades have been
+# taken today (closed, plus those still open) no strategy enters again. None = off (the per-strategy caps below remain).
+MAX_TRADES_TOTAL_PER_DAY = 5
 MAX_CONSECUTIVE_LOSSES = 5
 # Per-strategy overrides of the two counters plus a cool-down (minutes after that strategy's last exit
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every

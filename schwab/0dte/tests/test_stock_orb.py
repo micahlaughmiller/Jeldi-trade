@@ -301,7 +301,7 @@ def test_confirmation_rejections_are_final(bot, data, monkeypatch):
     assert events(b, "F_CONFIRM_REJECTED")[-1]["reasons"] == ["NO_METRICS"]
 
 
-def test_pending_drains_one_entry_per_tick_in_rank_order_and_caps_at_three(bot, data, monkeypatch):
+def test_pending_drains_one_entry_per_tick_in_rank_order_and_caps_at_three(bot, data, monkeypatch, f_five_a_day):
     monkeypatch.setattr(config, "F_SIGNAL_TTL_MIN", 10)
     data.set_frames(today_closes(BREAK, MOMENTUM, HOLD))
     rank(bot, data, [candidate(s, "A", 90.0 - i) for i, s in enumerate(STOCKS)])

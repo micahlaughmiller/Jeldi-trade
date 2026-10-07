@@ -213,9 +213,10 @@ MAX_CONTRACTS_PER_TRADE = 10
 # live data gathered to start cutting toward an actual live-trading version rather than wide-open
 # exploratory limits. Identical to Alpaca/0DTE/config.py.
 MAX_TRADES_PER_DAY = 5
-# 2026-10-07: ONE cap across every strategy of a persona (B, C, D, E and F together): once this many trades have been
-# taken today (closed, plus those still open) no strategy enters again. None = off (the per-strategy caps below remain).
-MAX_TRADES_TOTAL_PER_DAY = 5
+# 2026-10-07: optional ONE cap across every strategy of a persona (B, C, D, E and F together): once this many trades have
+# been taken today (closed, plus those still open) no strategy enters again. OFF (None): the same day the user asked for
+# per-strategy limits instead -- B 5 a day (MAX_TRADES_PER_DAY above), C, D, E and F 3 a day each (LIMITS_BY_STRATEGY below).
+MAX_TRADES_TOTAL_PER_DAY = None
 MAX_CONSECUTIVE_LOSSES = 5
 # Per-strategy overrides of the two counters plus a cool-down (minutes after that strategy's last exit
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every
@@ -225,12 +226,13 @@ LIMITS_BY_STRATEGY = {
     "B": {},
     # 2026-09-25: 5 trades/day per strategy for the new multi-strategy personas (each active
     # strategy independently gets its own 5/day allowance, not a combined cap).
-    "C": {"MAX_TRADES_PER_DAY": 5},
-    "D": {"MAX_TRADES_PER_DAY": 5},
-    "E": {"MAX_TRADES_PER_DAY": 5},
+    # 2026-10-07: B keeps 5 a day (the global MAX_TRADES_PER_DAY); every other strategy gets 3 a day.
+    "C": {"MAX_TRADES_PER_DAY": 3},
+    "D": {"MAX_TRADES_PER_DAY": 3},
+    "E": {"MAX_TRADES_PER_DAY": 3},
     # 2026-09-28 Strategy F: entries counted at ENTRY, 7 consecutive losses across all F tickers,
     # up to 3 F positions open at once in different tickers. No COOLDOWN_MIN (strategy-wide).
-    "F": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
+    "F": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
 }
 DAILY_LOSS_LIMIT_PCT = 0.10
 # Per-strategy concurrency cap and the limit() fallback for strategies without their own entry (A-E are

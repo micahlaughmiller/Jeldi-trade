@@ -289,7 +289,7 @@ def test_partial_runner_fill_resolves_by_key(bot, data, caplog):
 
 # ----------------------------------------------------------------------------------- risk
 
-def test_five_entries_per_day_counts_open_positions_and_recorded_entries(bot, data):
+def test_five_entries_per_day_counts_open_positions_and_recorded_entries(bot, data, f_five_a_day):
     rank(bot, data)
     for _ in range(3):
         bot.risk.record_trade("F", 10.0)
@@ -584,7 +584,7 @@ def test_report_start_has_f_line_and_prewarm_runs_pre_open(bot, data, caplog):
     bot.report_start(et(9, 0), bot.broker.get_account(), [])
     f_line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Strategy F:"))
     assert "universe 4 names (A:2, B:1, C:1)" in f_line and "rank at 09:45 +45s" in f_line
-    assert "min score 60" in f_line and "watch top 5" in f_line and "max open 3" in f_line and "limits 5/day 7 losses" in f_line
+    assert "min score 60" in f_line and "watch top 5" in f_line and "max open 3" in f_line and "limits 3/day 7 losses" in f_line
     assert "exits 6%/10% of width (floor $0.05)" in f_line and "DTE 0-7" in f_line
     bot.f.step(et(9, 19, 59))
     assert data.calls["bars"] == []

@@ -144,5 +144,5 @@ def test_every_persona_runs_f():
             n: ("B", "C", "D", "E", "F") for n in ("ASTRA", "ARIA", "ELENA", "DAVID", "JORDAN")}
     assert config.STOCK_STRATEGIES == ("F",) and config.DAILY_LOSS_LIMIT_EXEMPT == ("F",)
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None
-    assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7,
+    assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 7,
                                               "MAX_CONCURRENT_POSITIONS": 3}

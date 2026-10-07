@@ -186,12 +186,12 @@ def test_cooldown_setup_survives_state_roundtrip():
 # ------------------------------------------------------------ Strategy F: entry-counted cap, exempt P/L
 
 def test_f_limits():
-    assert (limit("F", "MAX_TRADES_PER_DAY"), limit("F", "MAX_CONSECUTIVE_LOSSES"), limit("F", "COOLDOWN_MIN", 0)) == (5, 7, 0)
+    assert (limit("F", "MAX_TRADES_PER_DAY"), limit("F", "MAX_CONSECUTIVE_LOSSES"), limit("F", "COOLDOWN_MIN", 0)) == (3, 7, 0)
     assert limit("F", "MAX_CONCURRENT_POSITIONS", 1) == 3 and limit("A", "MAX_CONCURRENT_POSITIONS", 1) == 1
     assert limit("B", "MAX_CONCURRENT_POSITIONS", config.MAX_CONCURRENT_POSITIONS) == 1
 
 
-def test_entries_cap_counts_recorded_entries_and_open_positions():
+def test_entries_cap_counts_recorded_entries_and_open_positions(f_five_a_day):
     rm = RiskManager(10_000)
     assert rm.record_entry("F") == 1 and rm.state.for_strategy("F").entries_today == 1
     for _ in range(3):

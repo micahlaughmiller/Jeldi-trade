@@ -41,6 +41,13 @@ def wind_down_times(monkeypatch):
 
 
 @pytest.fixture
+def f_five_a_day(monkeypatch):
+    """F's daily trade limit before 2026-10-07 (5; it is 3 now), for tests of how entries and open positions are
+    counted against that limit -- the counting does not depend on the number."""
+    monkeypatch.setitem(config.LIMITS_BY_STRATEGY, "F", {**config.LIMITS_BY_STRATEGY["F"], "MAX_TRADES_PER_DAY": 5})
+
+
+@pytest.fixture
 def pre_f_stop_fix(monkeypatch):
     """F as it behaved before 2026-10-07 (quote gate 12% of width with no stop ratio, stop fires immediately). The
     older F fixtures use wide quotes and tick within seconds of the fill, which the new gate and hold would refuse."""

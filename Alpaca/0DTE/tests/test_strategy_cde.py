@@ -217,12 +217,13 @@ def test_persona_cde_matrix_gives_every_strategy_two_test_variants():
     assert config.TRADER_NAMES == ("ASTRA", "ARIA", "DAVID", "ELENA", "JORDAN")
     assert set(overrides) == set(config.TRADER_NAMES)
     runs = {s: sorted(n for n, o in overrides.items() if s in o.get("STRATEGIES", ())) for s in "BCDEF"}
-    assert runs == {"B": ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"], "C": ["DAVID", "ELENA", "JORDAN"],
-                    "D": ["ARIA", "ELENA"], "E": ["DAVID", "JORDAN"],
-                    "F": ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"]}
+    every = ["ARIA", "ASTRA", "DAVID", "ELENA", "JORDAN"]
+    assert runs == {s: every for s in "BCDEF"}                  # 2026-10-07: every strategy on every persona
     assert all("A" not in o["STRATEGIES"] for o in overrides.values())
-    # D and E variants never share a persona, because the D_* constants are shared by both inside one persona
-    assert not any({"D", "E"} <= set(o["STRATEGIES"]) for o in overrides.values())
+    # D and E now share a persona, so they share that persona's D_* constants: each persona's variant is
+    # fixed by its own override dict (and E's trend gate by E_USE_TREND_GATE)
+    assert overrides["ARIA"]["D_BB_STD"] == 1.5 and overrides["ELENA"]["D_BB_STD"] == 1.0
+    assert "D_BB_STD" not in overrides["ASTRA"] and "D_BB_STD" not in overrides["DAVID"]
     # E variants run without the trend gate; D variants keep it
     assert all(overrides[n]["E_USE_TREND_GATE"] is False for n in ("DAVID", "JORDAN"))
     assert overrides["ELENA"]["C_ENTRY_END_MIN"] == overrides["JORDAN"]["C_ENTRY_END_MIN"] == 60

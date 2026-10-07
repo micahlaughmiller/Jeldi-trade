@@ -29,6 +29,15 @@ def wind_down_times(monkeypatch):
     monkeypatch.setattr(config, "FORCE_CLOSE_TIME", time(15, 30))
 
 
+@pytest.fixture
+def pre_f_stop_fix(monkeypatch):
+    """F as it behaved before 2026-10-07 (quote gate 12% of width with no stop ratio, stop fires immediately). The
+    older F fixtures use wide quotes and tick within seconds of the fill, which the new gate and hold would refuse."""
+    monkeypatch.setattr(config, "F_MAX_QUOTE_SPREAD_FRAC", 0.12)
+    monkeypatch.setattr(config, "F_MAX_QUOTE_SPREAD_STOP_RATIO", 1000.0)
+    monkeypatch.setitem(config.EXIT_TUNING_BY_STRATEGY, "F", {})
+
+
 GUARD_MODULES = ("test_alpaca_adoption_rules", "test_schwab_adoption_rules")   # run against the REAL config
 
 

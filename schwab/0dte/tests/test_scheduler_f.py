@@ -18,6 +18,8 @@ from strategy import BULLISH, OrbSetup
 
 EXP = TODAY + timedelta(days=2)
 
+pytestmark = pytest.mark.usefixtures("pre_f_stop_fix")
+
 
 @pytest.fixture(autouse=True)
 def _legacy_exit_flow(monkeypatch):
@@ -601,3 +603,12 @@ def test_claude_persona_has_no_f(tmp_path, monkeypatch, data, caplog):
     bot.report_start(et(9, 0), bot.broker.get_account(), [])
     assert not any(r.getMessage().startswith("Strategy F") for r in caplog.records)
     assert set(bot.risk.state.strategies) == {"A", "B", "C", "D", "E"}
+
+
+def test_f_entry_is_refused_when_the_quote_spread_is_wider_than_half_the_stop(bot, data, monkeypatch):
+    # 2026-10-07: the live gate (not the pre-fix pin): quote spread 0.40 on a $5 vertical vs a stop of 0.40
+    monkeypatch.setattr(config, "F_MAX_QUOTE_SPREAD_FRAC", 0.12)           # old width gate would pass 0.40 (<= 0.60) ...
+    monkeypatch.setattr(config, "F_MAX_QUOTE_SPREAD_STOP_RATIO", 0.5)       # ... the stop ratio does not (0.40 > 0.5 x 0.40)
+    rank(bot, data)
+    out = bot.f.enter(et(10, 0), signal())
+    assert out.startswith("skip: BID_ASK_BLOWN") and "quote spread 0.40 vs stop 0.40" in out

@@ -94,10 +94,26 @@ def test_f_exit_params_scale_with_width_and_floor_at_five_cents():
 
 
 def test_quote_blown_out_threshold_and_zero_bid():
-    assert quote_blown_out(SpreadQuote(mid=0.9, bid_side=0.6, ask_side=1.2), 5.0) is False    # 0.60 == 12% of 5
-    assert quote_blown_out(SpreadQuote(mid=0.9, bid_side=0.6, ask_side=1.21), 5.0) is True
+    assert config.F_MAX_QUOTE_SPREAD_FRAC == 0.05 and config.F_MAX_QUOTE_SPREAD_STOP_RATIO == 0.5   # was 0.12, no ratio
+    assert quote_blown_out(SpreadQuote(mid=0.9, bid_side=0.75, ask_side=1.0), 5.0) is False    # 0.25 == 5% of 5
+    assert quote_blown_out(SpreadQuote(mid=0.9, bid_side=0.75, ask_side=1.01), 5.0) is True
     assert quote_blown_out(SpreadQuote(mid=0.3, bid_side=0.0, ask_side=0.6), 5.0) is True
-    assert quote_blown_out(SpreadQuote(mid=0.15, bid_side=0.1, ask_side=0.2), 1.0) is False    # 0.10 < 0.12
+    assert quote_blown_out(SpreadQuote(mid=0.15, bid_side=0.13, ask_side=0.17), 1.0) is False   # 0.04 <= 0.05
+    assert quote_blown_out(SpreadQuote(mid=0.15, bid_side=0.1, ask_side=0.2), 1.0) is True      # 0.10 > 0.05 (old gate passed it)
+
+
+def test_f_stop_distance_and_the_quote_to_stop_ratio_gate():
+    from strategy import f_stop_distance
+    assert (f_stop_distance(1.0), f_stop_distance(2.5), f_stop_distance(5.0)) == (0.08, 0.20, 0.40)
+    # $1 wide, stop 0.08: the quote spread may be at most 0.04 -- UBER's 0.05-0.10 on 10/6 is refused
+    assert quote_blown_out(SpreadQuote(mid=0.12, bid_side=0.10, ask_side=0.14), 1.0, stop_distance=0.08) is False
+    assert quote_blown_out(SpreadQuote(mid=0.12, bid_side=0.09, ask_side=0.15), 1.0, stop_distance=0.08) is True
+    # $2.5 wide, stop 0.20: at most 0.10 -- MRVL's 0.29 on 10/7 is refused, a 0.10 quote still passes
+    assert quote_blown_out(SpreadQuote(mid=0.53, bid_side=0.40, ask_side=0.69), 2.5, stop_distance=0.20) is True
+    assert quote_blown_out(SpreadQuote(mid=0.53, bid_side=0.50, ask_side=0.60), 2.5, stop_distance=0.20) is False
+    # the ratio is optional: without a stop distance only the width gate applies
+    sliver = SpreadQuote(mid=0.12, bid_side=0.10, ask_side=0.15)                   # 0.05: inside 5% of width, but > 0.5 x 0.08
+    assert quote_blown_out(sliver, 1.0) is False and quote_blown_out(sliver, 1.0, stop_distance=0.08) is True
 
 
 def test_spx_strategies_excludes_stock_strategies_and_registry_has_f(monkeypatch):
@@ -122,14 +138,10 @@ def test_orb_only_news_mode_admits_stock_orb(monkeypatch):
 
 def test_every_persona_runs_f():
     overrides = getattr(config, "PERSONA_OVERRIDES", {})          # Alpaca personas; the Schwab twin has none
+    # 2026-10-07: every strategy runs on every persona (F last), each persona keeping its own parameter overrides
     if overrides:
-        assert overrides["ASTRA"]["STRATEGIES"] == ("B", "F")   # 2026-10-01: A removed
-    # 2026-10-06: F runs on every persona, in addition to (never instead of) the persona's own SPX strategies
-    if overrides:
-        assert all("F" in o["STRATEGIES"] and o["STRATEGIES"][-1] == "F" for o in overrides.values())
-        assert {n: tuple(s for s in o["STRATEGIES"] if s != "F") for n, o in overrides.items()} == {
-            "ASTRA": ("B",), "ARIA": ("B", "D"), "ELENA": ("B", "C", "D"), "DAVID": ("B", "C", "E"),
-            "JORDAN": ("B", "C", "E")}
+        assert {n: o["STRATEGIES"] for n, o in overrides.items()} == {
+            n: ("B", "C", "D", "E", "F") for n in ("ASTRA", "ARIA", "ELENA", "DAVID", "JORDAN")}
     assert config.STOCK_STRATEGIES == ("F",) and config.DAILY_LOSS_LIMIT_EXEMPT == ("F",)
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None
     assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 7,

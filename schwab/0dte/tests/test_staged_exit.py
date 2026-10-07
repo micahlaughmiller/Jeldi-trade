@@ -191,7 +191,7 @@ def test_a_and_b_share_identical_staged_thresholds(pm, broker):
     assert reasons == {"A": "STAGE2_FLOOR", "B": "STAGE2_FLOOR"}
 
 
-def test_f_scales_staged_thresholds_by_its_own_width(pm, broker):
+def test_f_scales_staged_thresholds_by_its_own_width(pm, broker, pre_f_stop_fix):
     p = open_f_spread(pm, broker, credit=0.80, width=3.0)
     # STAGE0_STOP_PCT(0.08) * width(3) = 0.24 -> stop at 0.80+0.24=1.04.
     assert p.width == 3.0
@@ -206,3 +206,56 @@ def test_staged_exit_disabled_falls_back_to_legacy_flat_stop(pm, broker, monkeyp
     assert tick(pm, et(10, 5), 2.40, flat()) == []
     fills = tick(pm, et(10, 6), 2.50, flat())
     assert fills and fills[0]["exit_reason"] == "STOP_LOSS"
+
+
+# ------------------------------------------------------- F stop hold and time confirmation (2026-10-07)
+
+def test_f_stop_timing_defaults():
+    import strategy
+    assert [strategy.exit_setting("F", k) for k in ("STOP_MIN_HOLD_SEC", "STOP_HOLD_EMERGENCY_MULT", "STOP_CONFIRM_TIME_SEC")] \
+        == [60, 3.0, 30]
+    assert [strategy.exit_setting("B", k) for k in ("STOP_MIN_HOLD_SEC", "STOP_CONFIRM_TIME_SEC")] == [0, 0]
+
+
+def test_f_stop_is_ignored_in_the_first_minute(pm, broker):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)             # stop 1.04, emergency 0.80 + 3 x 0.24 = 1.52, entry 9:55
+    assert tick(pm, et(9, 55, 20), 1.10, flat(), key="F:TSLA") == []   # past the stop, inside the hold
+    assert tick(pm, et(9, 55, 40), 1.20, flat(), key="F:TSLA") == []
+    assert p.stop_first_at is None and "F:TSLA" in pm.positions
+
+
+def test_f_emergency_stop_still_fires_inside_the_hold(pm, broker):
+    open_f_spread(pm, broker, credit=0.80, width=3.0)
+    fills = tick(pm, et(9, 55, 30), 1.52, flat(), key="F:TSLA")
+    assert fills and fills[0]["exit_reason"] == "STOP_LOSS"
+
+
+def test_f_stop_needs_thirty_seconds_above_the_stop_after_the_hold(pm, broker):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)
+    assert tick(pm, et(10, 0, 0), 1.10, flat(), key="F:TSLA") == [] and p.stop_first_at == et(10, 0, 0)
+    assert tick(pm, et(10, 0, 15), 1.12, flat(), key="F:TSLA") == []
+    fills = tick(pm, et(10, 0, 30), 1.10, flat(), key="F:TSLA")
+    assert fills and fills[0]["exit_reason"] == "STOP_LOSS"
+
+
+def test_f_stop_confirmation_restarts_if_the_price_recovers(pm, broker):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)
+    assert tick(pm, et(10, 0, 0), 1.10, flat(), key="F:TSLA") == []
+    assert tick(pm, et(10, 0, 15), 0.95, flat(), key="F:TSLA") == [] and p.stop_first_at is None
+    assert tick(pm, et(10, 0, 30), 1.10, flat(), key="F:TSLA") == [] and p.stop_first_at == et(10, 0, 30)
+    assert tick(pm, et(10, 0, 50), 1.10, flat(), key="F:TSLA") == []                    # only 20 s this time
+    assert tick(pm, et(10, 1, 0), 1.10, flat(), key="F:TSLA")[0]["exit_reason"] == "STOP_LOSS"
+
+
+def test_other_strategies_stop_exactly_as_before(pm, broker):
+    open_spread(pm, broker, strategy="B", credit=2.00, width=5.0)      # entered 10:00
+    fills = tick(pm, et(10, 0, 10), 2.40, flat())                      # 10 s after entry, at the stop: still immediate
+    assert fills and fills[0]["exit_reason"] == "STOP_LOSS"
+
+
+def test_stop_first_at_survives_a_state_round_trip(pm, broker):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)
+    p.stop_first_at = et(10, 0, 5)
+    assert OpenSpread.from_dict(p.to_dict()).stop_first_at == et(10, 0, 5)
+    p.stop_first_at = None
+    assert OpenSpread.from_dict(p.to_dict()).stop_first_at is None

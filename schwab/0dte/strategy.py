@@ -463,10 +463,21 @@ def f_exit_params(width: float) -> dict:
     }
 
 
-def quote_blown_out(quote: SpreadQuote, width: float, max_frac: float | None = None) -> bool:
-    """No bid-side credit, or a bid/ask spread on the vertical wider than max_frac of its width."""
+def f_stop_distance(width: float) -> float:
+    """How far above its entry credit an F spread's staged stop sits (PositionManager._staged_tick's level())."""
+    return max(config.STAGE_EXIT_FLOOR, exit_setting("F", "STAGE0_STOP_PCT", config.STAGE0_STOP_PCT) * width)
+
+
+def quote_blown_out(quote: SpreadQuote, width: float, max_frac: float | None = None,
+                    stop_distance: float | None = None) -> bool:
+    """No bid-side credit, a bid/ask spread on the vertical wider than max_frac of its width, or (when the
+    stop distance is given) wider than F_MAX_QUOTE_SPREAD_STOP_RATIO of it -- a stop inside the quote noise
+    is a coin flip, not a stop."""
     max_frac = config.F_MAX_QUOTE_SPREAD_FRAC if max_frac is None else max_frac
-    return quote.bid_side <= 0 or (quote.ask_side - quote.bid_side) > max_frac * width
+    spread = quote.ask_side - quote.bid_side
+    if quote.bid_side <= 0 or spread > max_frac * width:
+        return True
+    return stop_distance is not None and spread > config.F_MAX_QUOTE_SPREAD_STOP_RATIO * stop_distance + 1e-9
 
 
 def _signed_bodies(candles: pd.DataFrame, direction: str) -> pd.Series:

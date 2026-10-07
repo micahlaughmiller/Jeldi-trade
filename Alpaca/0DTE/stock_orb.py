@@ -732,9 +732,11 @@ class StockOrbTrader:
             return self._reject(now, sig, result)
         quote = result
         detail = f" width {width:g} EM {em:.2f} exp {exp.isoformat()}"
-        if strategy.quote_blown_out(quote, width):
+        stop_distance = strategy.f_stop_distance(width)
+        if strategy.quote_blown_out(quote, width, stop_distance=stop_distance):
             return self._reject(now, sig, f"BID_ASK_BLOWN bid-side {quote.bid_side:.2f} ask-side {quote.ask_side:.2f} "
-                                          f"at {short:g}/{long:g} (width {width:g})", quote)
+                                          f"at {short:g}/{long:g} (width {width:g}, quote spread "
+                                          f"{quote.ask_side - quote.bid_side:.2f} vs stop {stop_distance:.2f})", quote)
         collision = bot.pm.find_collision(sym, exp, right, short, long)
         if collision:
             return self._reject(now, sig, f"STRIKE_COLLISION {short:g}/{long:g}{right} already open under {collision}", quote)

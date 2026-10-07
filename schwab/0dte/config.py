@@ -274,6 +274,15 @@ STOP_LOSS = 0.60
 # stop. Named in SECONDS (not a raw tick count) specifically so this can't silently drift if
 # TICK_SECONDS ever changes -- position_manager derives the actual tick count from the current rate.
 STOP_CONFIRM_SECONDS = 0
+# 2026-10-07 (staged exit only; 0 = off, today's behaviour, for every strategy except F -- see F_BASE_TUNING):
+#   STOP_MIN_HOLD_SEC          for this long after entry the stop only fires at STOP_HOLD_EMERGENCY_MULT x its normal
+#                              distance (a real collapse still exits at once; quote noise right after the fill does not)
+#   STOP_CONFIRM_TIME_SEC      real seconds the price must stay at/above the stop before it closes. Wall-clock, unlike
+#                              STOP_CONFIRM_SECONDS (which is divided by TICK_SECONDS and so assumes a price every
+#                              tick -- F is priced only every F_PRICE_EVERY_SEC)
+STOP_MIN_HOLD_SEC = 0
+STOP_HOLD_EMERGENCY_MULT = 3.0
+STOP_CONFIRM_TIME_SEC = 0
 B_PROFIT_TARGET = 0.30
 B_STOP_LOSS = 0.50
 # C, D: same target/stop as B by default. E: 5-cent target for the choppy-day variant; its stop
@@ -450,7 +459,11 @@ D_BASE_TUNING: dict = {}
 E_BASE_TUNING: dict = {}
 # F: the shared exit knobs at the module defaults, evaluated on the TICKER's own 5-minute candles. Lock
 # arm/giveback/trail are per-position width-scaled overrides (strategy.f_exit_params), not tuned here.
-F_BASE_TUNING: dict = {}
+# 2026-10-07: all three F stop-outs of 10/6-10/7 happened 5-52 s after entry, with MFE ~0, while the underlying never
+# threatened the short strike: the quoted bid/ask on the vertical (0.05-0.29) was as wide as the stop (0.08-0.25), so a
+# single wide print stopped the trade. F's stop now waits out the first minute (emergency stop at 3x) and must hold
+# for 30 s; and an entry is refused unless the quoted spread is at most F_MAX_QUOTE_SPREAD_STOP_RATIO of the stop.
+F_BASE_TUNING: dict = {"STOP_MIN_HOLD_SEC": 60, "STOP_HOLD_EMERGENCY_MULT": 3.0, "STOP_CONFIRM_TIME_SEC": 30}
 EXIT_TUNING_BY_STRATEGY = {
     "A": dict(A_BASE_TUNING), "B": dict(B_BASE_TUNING),
     "C": dict(C_BASE_TUNING), "D": dict(D_BASE_TUNING), "E": dict(E_BASE_TUNING),
@@ -562,7 +575,8 @@ F_TRAIL_PCT_OF_WIDTH = 0.06       # runner trail as a fraction of width (0.30 on
 F_EXIT_FLOOR = 0.05               # floor under every width-scaled exit level above
 F_BREAK_VOLUME_RATIO = 1.0        # break-candle volume >= ratio x same-window mean over prior sessions
 F_MIN_REMAINING_EM_FRAC = 0.35    # remaining expected move must still be >= this fraction of the day's EM
-F_MAX_QUOTE_SPREAD_FRAC = 0.12    # reject when (ask_side - bid_side) of the spread quote > this fraction of width
+F_MAX_QUOTE_SPREAD_FRAC = 0.05    # reject when (ask_side - bid_side) of the spread quote > this fraction of width (was 0.12)
+F_MAX_QUOTE_SPREAD_STOP_RATIO = 0.5   # ... or > this fraction of F's stop distance, so the stop sits >= 2x above the quote noise
 F_ENTRY_STEP_PCT = 0.01           # work_entry limit step as a fraction of width, min $0.01 (0.05 on $5)
 F_ENTRY_STEP_SEC = 15             # work_entry fill wait per step for F orders (SPX keeps ENTRY_STEP_SEC) ...
 F_ENTRY_TIMEOUT_SEC = 45          # ... so this timeout is honoured after three steps instead of overrunning

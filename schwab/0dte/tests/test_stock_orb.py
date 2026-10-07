@@ -15,6 +15,8 @@ from f_fixtures import (BREAK, HOLD, INSIDE, MOMENTUM, OR_HIGH, OR_LOW, RANK_AT,
 from stock_orb import StockOrbTrader, StockSignal, completed_candles, confirm_break, normal_volume
 from strategy import BEARISH, BULLISH, OrbSetup
 
+pytestmark = pytest.mark.usefixtures("pre_f_stop_fix")
+
 
 @pytest.fixture
 def data() -> DataStub:

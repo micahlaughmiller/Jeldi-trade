@@ -80,6 +80,8 @@ class OpenSpread:
     manual_attention: bool = False
     sync_obs: str | None = None
     sync_obs_count: int = 0
+    # 2026-10-07: when the price first sat at/above the stop in the current run (STOP_CONFIRM_TIME_SEC); None when it is below
+    stop_first_at: datetime | None = None
 
     @property
     def remaining(self) -> int:
@@ -133,6 +135,7 @@ class OpenSpread:
         d["last_tick_at"] = self.last_tick_at.isoformat() if self.last_tick_at else None
         d["pending_quote_since"] = self.pending_quote_since.isoformat() if self.pending_quote_since else None
         d["stuck_since"] = self.stuck_since.isoformat() if self.stuck_since else None
+        d["stop_first_at"] = self.stop_first_at.isoformat() if self.stop_first_at else None
         return d
 
     @classmethod
@@ -148,6 +151,8 @@ class OpenSpread:
             kw["pending_quote_since"] = datetime.fromisoformat(kw["pending_quote_since"])
         if kw.get("stuck_since"):
             kw["stuck_since"] = datetime.fromisoformat(kw["stuck_since"])
+        if kw.get("stop_first_at"):
+            kw["stop_first_at"] = datetime.fromisoformat(kw["stop_first_at"])
         return cls(**kw)
 
 
@@ -569,14 +574,40 @@ class PositionManager:
         confirm_seconds = strategy.exit_setting(p.strategy, "STOP_CONFIRM_SECONDS", 0)
         confirm = max(1, round(confirm_seconds / config.TICK_SECONDS))
         stop_price = round(p.entry_credit + level("STAGE0_STOP_PCT"), 2)
-        if spread_price >= stop_price:
+        # 2026-10-07: F's stop waits out the quote noise right after the fill (STOP_MIN_HOLD_SEC, with an emergency stop at
+        # STOP_HOLD_EMERGENCY_MULT x the distance) and must hold for STOP_CONFIRM_TIME_SEC of wall-clock time. All 0 elsewhere.
+        hold_sec = strategy.exit_setting(p.strategy, "STOP_MIN_HOLD_SEC", 0) or 0
+        time_confirm = strategy.exit_setting(p.strategy, "STOP_CONFIRM_TIME_SEC", 0) or 0
+        in_hold = hold_sec > 0 and (now - p.entry_time).total_seconds() < hold_sec
+        if in_hold:
+            emergency = round(p.entry_credit + strategy.exit_setting(p.strategy, "STOP_HOLD_EMERGENCY_MULT", 3.0)
+                              * level("STAGE0_STOP_PCT"), 2)
+            if spread_price >= emergency:
+                return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+            if spread_price >= stop_price:
+                log.info("[%s] STAGE0 STOP ignored during the %ds entry hold at %.2f (stop %.2f, emergency %.2f)",
+                         p.key, hold_sec, spread_price, stop_price, emergency)
+            p.stop_streak = 0
+            p.stop_first_at = None
+        elif spread_price >= stop_price:
+            if time_confirm > 0:
+                if p.stop_first_at is None:
+                    p.stop_first_at = now
+                waited = (now - p.stop_first_at).total_seconds()
+                if waited >= time_confirm:
+                    return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+                log.info("[%s] STAGE0 STOP candidate for %.0fs/%ds at %.2f (stop %.2f): holding for confirmation",
+                         p.key, waited, time_confirm, spread_price, stop_price)
+                return []
             p.stop_streak += 1
             if p.stop_streak >= confirm:
                 return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
             log.info("[%s] STAGE0 STOP candidate tick %d/%d (%ds) at %.2f (stop %.2f): holding for confirmation",
                      p.key, p.stop_streak, confirm, confirm_seconds, spread_price, stop_price)
             return []
-        p.stop_streak = 0
+        else:
+            p.stop_streak = 0
+            p.stop_first_at = None
 
         profit = round(p.entry_credit - spread_price, 2)
         if profit >= level("STAGE1_ARM_PCT"):

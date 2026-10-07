@@ -13,6 +13,7 @@ from f_fixtures import (BREAK, HOLD, MOMENTUM, OR_HIGH, STOCKS, TODAY, DataStub,
                         today_closes, tsla_put_chain)
 from position_manager import OpenSpread, occ_root, option_legs
 from risk_manager import RiskManager
+import stock_orb
 from stock_orb import StockSignal, WatchItem
 from strategy import BULLISH, OrbSetup
 
@@ -612,3 +613,18 @@ def test_f_entry_is_refused_when_the_quote_spread_is_wider_than_half_the_stop(bo
     rank(bot, data)
     out = bot.f.enter(et(10, 0), signal())
     assert out.startswith("skip: BID_ASK_BLOWN") and "quote spread 0.40 vs stop 0.40" in out
+
+
+def test_the_entry_hold_runs_from_the_fill_not_from_the_signal_tick(bot, data, monkeypatch):
+    import types
+    clock = [1000.0]
+    monkeypatch.setattr(stock_orb, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: None))
+    original = bot.work_entry
+
+    def slow_fill(order, *a, **k):
+        clock[0] += 37.0                                               # the order worked for 37 s before it filled
+        return original(order, *a, **k)
+    monkeypatch.setattr(bot, "work_entry", slow_fill)
+    enter_f(bot, data)
+    pos = bot.pm.positions["F:TSLA"]
+    assert pos.entry_time == et(9, 55, 10) + timedelta(seconds=37)

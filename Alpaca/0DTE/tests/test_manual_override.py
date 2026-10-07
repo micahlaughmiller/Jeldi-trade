@@ -195,13 +195,13 @@ def test_a_brand_new_position_whose_legs_are_not_visible_yet_still_closes_as_bef
 
 def test_a_failed_read_before_a_close_does_not_block_the_close(pm, broker):
     """If the positions API is down the bot cannot verify anything, so the preflight steps aside and the
-    close is sent exactly as before (the existing post-close verification then raises BrokerError, which
-    the main loop already handles) -- an outage must never leave a stop unexecuted."""
+    close is sent exactly as before -- an outage must never leave a stop unexecuted. 2026-10-07: the
+    post-close verification read then fails too; a close the broker reports as filled is trusted and booked
+    (it used to raise out of the whole force-close pass and drop the rows of the positions already closed)."""
     open_spread(pm, broker)
     broker.reads_fail = True
-    with pytest.raises(BrokerError):
-        pm.force_close(et(15, 30), {"B": 1.50})
-    assert len(broker.close_calls) == 1
+    rows = pm.force_close(et(15, 30), {"B": 1.50})
+    assert len(broker.close_calls) == 1 and [r["exit_reason"] for r in rows] == ["FORCE_CLOSE"] and pm.positions == {}
 
 
 # ------------------------------------------------------------------ scheduler wiring

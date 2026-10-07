@@ -748,6 +748,7 @@ class StockOrbTrader:
                                           f"open risk {open_risk:.2f}", quote)
         log.warning("[F:%s] ENTRY %s %s spot %.2f: sell %s%s buy %s%s x%d @ %.2f (bid-side %.2f)%s",
                     sym, sig.kind, sig.direction, spot, short, right, long, right, qty, quote.mid, quote.bid_side, detail)
+        worked_from = time.monotonic()
         order = broker.place_credit_spread(
             sym, exp, right, short, long, qty, quote.mid, time_in_force="day", root=sym,
             client_tag=f"0dte-{config.TRADER_NAME.lower()}-f-stockorb-{sym.lower()}")
@@ -761,10 +762,13 @@ class StockOrbTrader:
                               status=order.get("status"))
             return f"not filled ({order.get('status')}){detail}"
         credit = float(order.get("filled_avg_price") or order.get("limit_price") or quote.mid)
+        # the entry hold (STOP_MIN_HOLD_SEC) runs from the FILL, not from the tick that placed the order: work_entry can
+        # block for up to F_ENTRY_TIMEOUT_SEC before the order fills
+        filled_at = now + timedelta(seconds=round(time.monotonic() - worked_from))
         ex = strategy.f_exit_params(width)
         spread = OpenSpread(
             strategy=STRATEGY, direction=sig.direction, setup=SETUP, right=right, root=sym, expiration=exp,
-            short_strike=short, long_strike=long, width=width, qty=filled, entry_credit=credit, entry_time=now,
+            short_strike=short, long_strike=long, width=width, qty=filled, entry_credit=credit, entry_time=filled_at,
             current_price=credit, best_price=credit, profit_target=ex["profit_target"], stop_loss=ex["stop_loss"],
             entry_mid=quote.mid, entry_bid=quote.bid_side, entry_ask=quote.ask_side, overrides=ex["overrides"],
             scan={**sig.scan_row, "rank": sig.rank, "scanner_direction": sig.scanner_direction,

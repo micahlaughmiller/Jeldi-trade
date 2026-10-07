@@ -259,3 +259,42 @@ def test_stop_first_at_survives_a_state_round_trip(pm, broker):
     assert OpenSpread.from_dict(p.to_dict()).stop_first_at == et(10, 0, 5)
     p.stop_first_at = None
     assert OpenSpread.from_dict(p.to_dict()).stop_first_at is None
+
+
+def test_f_emergency_stop_fires_at_once_after_the_hold_too(pm, broker):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)             # stop 1.04, emergency 1.52
+    fills = tick(pm, et(10, 0, 0), 1.52, flat(), key="F:TSLA")        # well past the 60 s hold: no 30 s wait for a collapse
+    assert fills and fills[0]["exit_reason"] == "STOP_LOSS" and p.stop_first_at is None
+
+
+def test_a_failed_verification_read_does_not_lose_the_fills_of_the_other_positions(pm, broker, monkeypatch):
+    from broker import BrokerError
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    open_spread(pm, broker, strategy="C", qty=1, credit=2.00, width=5.0, right="C")
+    real = pm._remaining_at_broker
+    calls = {"n": 0}
+
+    def flaky(p):
+        calls["n"] += 1
+        if calls["n"] == 2:                                            # the read after the SECOND close order fails (a 429)
+            raise BrokerError("429 too many requests")
+        return real(p)
+    monkeypatch.setattr(pm, "_remaining_at_broker", flaky)
+    fills = pm.force_close(et(13, 0), {"B": 2.0, "C": 2.0}, override_hold=True)
+    assert sorted(f["strategy"] for f in fills) == ["B", "C"] and pm.positions == {}
+    assert not any(f.get("external") for f in fills)                   # booked at their fills, not as hand-closes
+
+
+def test_force_close_continues_past_a_broker_error_in_one_position(pm, broker, monkeypatch):
+    from broker import BrokerError
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    open_spread(pm, broker, strategy="C", qty=1, credit=2.00, width=5.0, right="C")
+    real_close = pm._close
+
+    def boom(p, *a, **k):
+        if p.strategy == "B":
+            raise BrokerError("boom")
+        return real_close(p, *a, **k)
+    monkeypatch.setattr(pm, "_close", boom)
+    fills = pm.force_close(et(13, 0), {"B": 2.0, "C": 2.0}, override_hold=True)
+    assert [f["strategy"] for f in fills] == ["C"] and set(pm.positions) == {"B"}

@@ -579,11 +579,13 @@ class PositionManager:
         hold_sec = strategy.exit_setting(p.strategy, "STOP_MIN_HOLD_SEC", 0) or 0
         time_confirm = strategy.exit_setting(p.strategy, "STOP_CONFIRM_TIME_SEC", 0) or 0
         in_hold = hold_sec > 0 and (now - p.entry_time).total_seconds() < hold_sec
-        if in_hold:
+        if hold_sec > 0 or time_confirm > 0:
+            # a collapse to STOP_HOLD_EMERGENCY_MULT x the stop distance exits at once, in the hold and after it
             emergency = round(p.entry_credit + strategy.exit_setting(p.strategy, "STOP_HOLD_EMERGENCY_MULT", 3.0)
                               * level("STAGE0_STOP_PCT"), 2)
             if spread_price >= emergency:
                 return self._close(p, p.remaining, "STOP_LOSS", now, spread_price)
+        if in_hold:
             if spread_price >= stop_price:
                 log.info("[%s] STAGE0 STOP ignored during the %ds entry hold at %.2f (stop %.2f, emergency %.2f)",
                          p.key, hold_sec, spread_price, stop_price, emergency)
@@ -682,8 +684,13 @@ class PositionManager:
         fills: list[dict] = []
         for key, p in list(self.positions.items()):
             price = prices.get(key)
-            fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price,
-                                 override_hold=override_hold)
+            try:
+                fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price,
+                                     override_hold=override_hold)
+            except BrokerError as e:   # one position's broker error must not stop the others from closing
+                log.critical("[%s] force close hit a broker error: %s -- continuing with the other positions", key, e,
+                             extra={"keep": True})
+                self.journal.event("CLOSE_FAILED", now, strategy=p.strategy, error=str(e), reason=reason)
         return fills
 
     # ----------------------------------------------- manual-override safety (2026-10-02)
@@ -885,7 +892,20 @@ class PositionManager:
                 continue
             if order.get("status") == "dry_run":
                 break
-            left = max(self._remaining_at_broker(p) - owner_extra, 0)
+            try:
+                left = max(self._remaining_at_broker(p) - owner_extra, 0)
+            except BrokerError as e:
+                # 2026-10-07: the positions read AFTER the order failed (an Alpaca 429, say). Raising here dropped the rows
+                # already built for the other positions of a force-close pass. A fill the broker itself reports as filled
+                # is trusted; anything else is retried (the next attempt's preflight re-reads and only sends what is held).
+                log.error("[%s] close verification read failed (%s); order status %s", key, e, order.get("status"))
+                self.journal.event("CLOSE_VERIFY_FAILED", now, strategy=p.strategy, attempt=attempt, error=str(e),
+                                   order_status=order.get("status"), reason=reason)
+                if order.get("status") == "filled":
+                    left = expected_left
+                    break
+                order = None
+                continue
             if left <= expected_left:
                 break
             log.error("[%s] CLOSE_FAILED attempt %d/%d: broker still shows %d contracts (expected %d)",

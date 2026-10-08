@@ -1198,3 +1198,23 @@ def test_nothing_enters_from_noon_eastern_and_the_bot_keeps_managing_until_the_h
     assert calls == [] and bot.done is False                       # no entry path runs; the bot is still up (positions are managed)
     bot.tick(et(13, 0, 30))
     assert bot.done is True
+
+
+# ------------------------------------------------- at most N trades open at one time (2026-10-08)
+
+def test_the_open_position_cap_stops_a_strategy_from_entering_and_is_journaled(bot, monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 1)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert len(bot.pm.positions) == 1                              # the first strategy took the only slot ...
+    refused = [r for r in skipped(bot) if r["reason_code"] == "MAX_OPEN_POSITIONS"]
+    assert len(refused) == 1 and refused[0]["reason"] == "MAX_OPEN_POSITIONS (1/1)"   # ... the second was turned away
+    bot.enter(et(10, 25), "ORB", BULLISH)                          # a later signal while it is still open: nothing enters
+    assert len(bot.pm.positions) == 1
+
+
+def test_two_open_slots_let_both_strategies_in_and_a_closed_slot_frees_up(bot, monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 2)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}
+    bot.pm.positions.pop("B")
+    assert bot.entry_possible(10_000.0) is True and bot.pm.open_total_count() == 1

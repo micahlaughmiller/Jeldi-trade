@@ -88,3 +88,24 @@ def test_with_the_total_cap_off_only_the_per_strategy_caps_apply():
     for strat in ("A", "A", "B", "B", "B", "A"):
         rm.record_trade(strat, 1.0)
     assert config.MAX_TRADES_TOTAL_PER_DAY is None and rm.trading_allowed("A")[0] is True
+
+
+# ------------------------------------------------- at most 2 trades open at one time (2026-10-08)
+
+def test_the_shipped_open_position_cap_is_two():
+    assert config.MAX_OPEN_POSITIONS_TOTAL == 2
+
+
+def test_a_third_trade_is_refused_while_two_are_open_whatever_the_strategy():
+    rm = RiskManager(10_000)
+    for strat in "BCDEF":
+        assert rm.trading_allowed(strat, open_total=0)[0] is True
+        assert rm.trading_allowed(strat, open_total=1)[0] is True
+        ok, reason = rm.trading_allowed(strat, open_total=2)
+        assert ok is False and reason == "MAX_OPEN_POSITIONS (2/2)", (strat, reason)
+
+
+def test_the_open_cap_is_independent_of_the_daily_trade_counts():
+    rm = RiskManager(10_000)
+    rm.record_trade("B", 10.0)
+    assert rm.trading_allowed("C", open_total=1)[0] is True and rm.trading_allowed("C", open_total=2)[0] is False

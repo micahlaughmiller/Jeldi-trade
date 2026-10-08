@@ -239,6 +239,11 @@ MAX_TRADES_PER_DAY = 5
 # been taken today (closed, plus those still open) no strategy enters again. OFF (None): the same day the user asked for
 # per-strategy limits instead -- B 5 a day (MAX_TRADES_PER_DAY above), C, D, E and F 3 a day each (LIMITS_BY_STRATEGY below).
 MAX_TRADES_TOTAL_PER_DAY = None
+# 2026-10-08: at most this many trades OPEN at one time across ALL of a persona's strategies (B, C, D, E and F together;
+# before this each of B-E had its own single slot and F up to 3, so 7 could be open). None = off. A trade being
+# decided is refused while this many are open; positions adopted from the broker at a restart are not counted against a
+# new entry's decision beyond being open.
+MAX_OPEN_POSITIONS_TOTAL = 2
 MAX_CONSECUTIVE_LOSSES = 5
 # Per-strategy overrides of the two counters plus a cool-down (minutes after that strategy's last exit
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every

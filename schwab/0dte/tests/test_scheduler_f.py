@@ -637,3 +637,12 @@ def test_f_is_refused_by_the_total_cap_too(bot, data, monkeypatch):
         bot.risk.record_trade(strat, 10.0)
     out = bot.f.enter(et(10, 0), signal())
     assert out.startswith("skip:") and "TOTAL_MAX_TRADES_PER_DAY" in out and "F:TSLA" not in bot.pm.positions
+
+
+def test_f_is_refused_while_the_persona_already_has_two_trades_open(bot, data, monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 2)
+    rank(bot, data)
+    bot.pm.open(f_spread("AMZN"))
+    bot.pm.open(f_spread("META"))
+    out = bot.f.enter(et(10, 0), signal())
+    assert out.startswith("skip:") and "MAX_OPEN_POSITIONS (2/2)" in out and "F:TSLA" not in bot.pm.positions

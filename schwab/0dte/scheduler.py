@@ -480,7 +480,8 @@ class Bot:
                 blocks[strat] = "position open"
                 continue
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
-                                                        exempt_open_pnl=exempt_open, open_spx=self.pm.open_spx_count())
+                                                        exempt_open_pnl=exempt_open, open_spx=self.pm.open_spx_count(),
+                                                        open_total=self.pm.open_total_count())
             if allowed:
                 return True
             reasons.append(reason)
@@ -907,7 +908,7 @@ class Bot:
                 return f"skip: DAY_GATE ER={0.0 if day_er is None else day_er:.2f} < {min_er:.2f} (choppy)", 0.0
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup,
                                                     exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT),
-                                                    open_spx=self.pm.open_spx_count())
+                                                    open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count())
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":

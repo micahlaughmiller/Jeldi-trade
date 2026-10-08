@@ -269,10 +269,21 @@ class PositionManager:
 
     def find_collision(self, root: str, expiration: date, right: str, short_strike: float,
                        long_strike: float) -> str | None:
-        """Key of an open position on exactly these contracts, else None."""
+        """Key of an open position that uses ANY of these two contracts (same root, expiration and right), else None. The broker
+        nets positions per contract symbol: two spreads on the identical pair confuse its position-intent inference on close
+        (2026-09-25), and two that merely SHARE a strike (one's short is the other's long) show up as one netted leg that neither
+        spread can be closed against (2026-10-08 audit: the position manager then sends no close at all)."""
+        strikes = {short_strike, long_strike}
         return next((k for k, p in self.positions.items()
                      if p.root == root and p.expiration == expiration and p.right == right
-                     and p.short_strike == short_strike and p.long_strike == long_strike), None)
+                     and (p.short_strike in strikes or p.long_strike in strikes)), None)
+
+    def collision_reason(self, key: str, right: str, short_strike: float, long_strike: float) -> str:
+        p = self.positions[key]
+        new = f"{short_strike:g}/{long_strike:g}{right}"
+        if p.short_strike == short_strike and p.long_strike == long_strike:
+            return f"STRIKE_COLLISION {new} already open under {key}"
+        return f"STRIKE_COLLISION {new} shares a strike with {p.short_strike:g}/{p.long_strike:g}{right} open under {key}"
 
     def adopt_from_broker(self, positions: list[dict], now: datetime, spot: float,
                           saved: dict[str, dict] | None = None,

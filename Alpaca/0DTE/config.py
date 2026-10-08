@@ -92,6 +92,15 @@ TICK_EXCEPTION_LOG_SEC = 60
 TOKEN_CHECK_SEC = 60
 TOKEN_WARN_DAYS = 5.0
 TOKEN_ENTRY_MARGIN_MIN = 30
+# 2026-10-08: live ES (Schwab /ES candles, market_data.py). When a request fails the feed is treated as off for this many seconds
+# (breakouts are then confirmed on SPX candles + the basis, never on the delayed Yahoo ES=F series), then tried again.
+ES_LIVE_RETRY_SEC = 60
+# Live /ES bars whose newest minute is older than this (during the regular session) mean the feed is stalled or delayed: treated as a
+# failed request, so breakouts are confirmed on SPX candles instead of on a stale ES series.
+ES_LIVE_MAX_BAR_AGE_SEC = 300
+# One process per persona: a second launch against the same account would trade it with its own counters and caps. True = the
+# bot takes a lock file in logs/ at start and a second copy refuses to run.
+SINGLE_INSTANCE_LOCK = True
 # 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
 # thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
 # spreads against what the broker actually holds; a position must look wrong on

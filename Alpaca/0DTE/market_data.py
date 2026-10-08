@@ -54,76 +54,145 @@ _FEED_STATE: dict[tuple, dict] = {}
 # process startup that would itself go stale after ~30 minutes.
 
 
-def _schwab_read_only_client():
-    token_path = getattr(config, "SCHWAB_TOKEN_PATH", "").strip()
-    api_key = getattr(config, "SCHWAB_APP_KEY", "").strip()
+class _TimeoutSession(requests.Session):
+    """The read-only Schwab session. schwab-py sends its requests with no timeout, and this call runs in the single-threaded tick loop
+    that manages every open position: a stalled connection must not be able to freeze it."""
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", (3.0, 8.0))
+        return super().request(*args, **kwargs)
+
+
+# 2026-10-08: the fallback from live ES to the delayed proxy used to be invisible (nothing logged when the token was missing, expired
+# or the request failed). _ES_LIVE["state"] is the last (usable, reason) reported, so a change is logged once and a steady state
+# is silent; "fail_until" is the monotonic time before which a failed request is not repeated.
+_ES_LIVE: dict = {"state": None, "fail_until": 0.0}
+_ES_BACKOFF = "a Schwab /ES request failed a moment ago, retrying shortly"
+
+
+def _es_report(ok: bool, reason: str = "") -> None:
+    state = (ok, reason)
+    if _ES_LIVE["state"] == state:
+        return
+    _ES_LIVE["state"] = state
+    if ok:
+        log.warning("LIVE_ES on: breakouts are confirmed on Schwab /ES candles.", extra={"keep": True})
+    else:
+        log.warning("LIVE_ES off (%s): breakouts are confirmed on SPX candles against ES levels shifted by the SPX-ES basis "
+                    "(Yahoo ES=F, about 10 min delayed; the basis is known from about 09:40, no breakout can be confirmed before).",
+                    reason, extra={"keep": True})
+
+
+def _es_failed(reason: str) -> None:
+    _ES_LIVE["fail_until"] = _time.monotonic() + float(getattr(config, "ES_LIVE_RETRY_SEC", 60))
+    _es_report(False, reason)
+
+
+def _es_token_check():
+    """(client, "") when a read-only Schwab client can be built from the token file right now, else (None, why not). No logging."""
+    token_path = str(getattr(config, "SCHWAB_TOKEN_PATH", "") or "").strip()
+    api_key = str(getattr(config, "SCHWAB_APP_KEY", "") or "").strip()
     if not token_path or not api_key:
-        return None
+        return None, "SCHWAB_APP_KEY / SCHWAB_TOKEN_PATH not configured"
+    if _time.monotonic() < _ES_LIVE["fail_until"]:
+        return None, _ES_BACKOFF
     try:
         with open(token_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         token = raw["token"]
         access_token = token["access_token"]
         expires_at = float(token["expires_at"])
+    except FileNotFoundError:
+        return None, f"token file not found: {token_path}"
     except Exception as e:
-        log.warning("Reading Schwab access token failed (falling back to delayed yfinance ES=F): %s", e)
-        return None
+        return None, f"token file unreadable ({type(e).__name__})"
     if _time.time() >= expires_at - 30:   # expired, or close enough to expire mid-request -- do NOT refresh
-        return None
+        return None, "access token expired (only a running Schwab bot refreshes it)"
     try:
         from schwab.client import Client
-    except Exception as e:
-        log.warning("schwab-py unavailable (falling back to delayed yfinance ES=F): %s", e)
-        return None
-    session = requests.Session()
+    except Exception:
+        return None, "schwab-py is not installed in this environment"
+    session = _TimeoutSession()
     session.headers["Authorization"] = f"Bearer {access_token}"
-    return Client(api_key, session)
+    return Client(api_key, session), ""
+
+
+def _schwab_read_only_client():
+    client, reason = _es_token_check()
+    if client is None and reason != _ES_BACKOFF:      # the failure that started the back-off was already reported
+        _es_report(False, reason)
+    return client
+
+
+def live_es_status() -> tuple[bool, str]:
+    """(usable, reason) for the start-of-day report: whether live ES could be used right now, and if not why not. No client, no logging."""
+    client, reason = _es_token_check()
+    return client is not None, reason or "token file holds a valid access token"
+
+
+def live_es_backoff_active() -> bool:
+    """True while a failed /ES request keeps live ES switched off (see ES_LIVE_RETRY_SEC)."""
+    return _time.monotonic() < _ES_LIVE["fail_until"]
 
 
 def live_es_available() -> bool:
     """True once this folder's Schwab cross-auth is configured and the shared token file currently
-    holds an unexpired access token -- lets callers switch from the ES_TO_SPX proxy (confirm on live
-    SPX candles against a basis-shifted ES level) to confirming directly on ES's own (now genuinely
-    live) candles for the real lead-time edge. Cheap (a local file read, no network call) so this is
+    holds an unexpired access token (and no /ES request failed in the last ES_LIVE_RETRY_SEC) -- lets callers switch from the
+    ES_TO_SPX proxy (confirm on live SPX candles against a basis-shifted ES level) to confirming directly on ES's own (now
+    genuinely live) candles for the real lead-time edge. Cheap (a local file read, no network call) so this is
     safe to call on every tick without caching, unlike the old design's permanent client cache."""
     return _schwab_read_only_client() is not None
+
+
+def _es_minutes(candles: list) -> pd.DataFrame:
+    df = pd.DataFrame(candles)
+    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(config.ET)
+    return df.set_index("datetime")[["open", "high", "low", "close", "volume"]].sort_index()
 
 
 def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
     """Real ES futures candles via Schwab (config.ES_SCHWAB_SYMBOL, e.g. "/ES"), resampled to
     interval_min. Returns None -- never raises -- if Schwab cross-auth isn't configured in this
-    folder's .env, the shared token has expired, or the call fails for any reason; get_candles() falls
-    back to yfinance in that case."""
+    folder's .env, the shared token has expired, or the call fails for any reason (the failure is logged once and the feed
+    is left alone for ES_LIVE_RETRY_SEC). Candles are COMPLETE ones only, by the same rule as the SPX series (_candles_from_1m)."""
     client = _schwab_read_only_client()
     if client is None:
         return None
     now = _now(now)
     # Cached like _download's yfinance calls: at TICK_SECONDS=1 (fast-as-Alpaca-allows polling) an
-    # uncached call here would hit Schwab's API every single tick across every running persona --
-    # this keeps it to at most one real request per DATA_CACHE_SEC regardless of tick rate.
+    # uncached call here would hit Schwab's API every single tick -- this keeps it to at most one real request per
+    # DATA_CACHE_SEC (sooner right after a minute closes: _fresh), regardless of tick rate.
     cache_key = ("es_live", config.ES_SCHWAB_SYMBOL)
     hit = _CACHE.get(cache_key)
-    if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
-        candles = hit[1]
+    if hit and len(hit) > 2 and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC and _fresh(hit[2], "1m", df=hit[1]):
+        df1, fetched = hit[1], hit[2]
     else:
+        status = None
         try:
-            resp = client.get_price_history_every_minute(config.ES_SCHWAB_SYMBOL, need_extended_hours_data=True)
+            # a bounded window (the default is the whole available history) and a request timeout (_TimeoutSession)
+            start = now - timedelta(minutes=max(int(lookback_min), 1440))
+            resp = client.get_price_history_every_minute(config.ES_SCHWAB_SYMBOL, start_datetime=start, end_datetime=now,
+                                                         need_extended_hours_data=True)
+            status = getattr(resp, "status_code", None)
             data = resp.json()
+            candles = data.get("candles") if isinstance(data, dict) else None
+            if not candles:
+                _es_failed("Schwab /ES returned no candles" + (f" (HTTP {status})" if status else ""))
+                return None
+            df1 = _es_minutes(candles)
+            max_age = float(getattr(config, "ES_LIVE_MAX_BAR_AGE_SEC", 300))
+            age = (now - df1.index[-1]).total_seconds()
+            if max_age and _in_session(now.timestamp()) and age > max_age:
+                # a stalled or delayed series is as useless as a failed request: switch to the SPX candles, not "LIVE_ES on"
+                _es_failed(f"Schwab /ES bars are {age / 60:.0f} min old")
+                return None
         except Exception as e:
-            log.warning("Schwab ES price history failed (falling back to delayed yfinance ES=F): %s", e)
+            _es_failed(f"Schwab /ES request failed ({type(e).__name__}{f', HTTP {status}' if status else ''})")
             return None
-        candles = data.get("candles") or []
-        _CACHE[cache_key] = (_time.monotonic(), candles)
-    if not candles:
-        return None
-    df = pd.DataFrame(candles)
-    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(config.ET)
-    df = df.set_index("datetime")[["open", "high", "low", "close", "volume"]].sort_index()
-    if interval_min > 1:
-        df = df.resample(f"{interval_min}min").agg(
-            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
-    df = df[(df.index >= now - timedelta(minutes=lookback_min)) & (df.index + timedelta(minutes=interval_min) <= now)]
-    return df
+        fetched = _time.time()
+        _CACHE[cache_key] = (_time.monotonic(), df1, fetched)
+        _es_report(True)
+    return _candles_from_1m(df1, fetched, interval_min, lookback_min, now)
 
 
 # 2026-10-01: real-time SPX-equivalent candles via Alpaca's own SPY bars (see config.py's SPY_SYMBOL
@@ -467,9 +536,15 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
                 now: datetime | None = None) -> pd.DataFrame:
     now = _now(now)
     if symbol == config.ES_SYMBOL:
+        was_live = live_es_available()
         live = get_es_candles_live(int(interval.rstrip("m")), lookback_min, now)
         if live is not None and not live.empty:
             return live
+        if was_live:
+            # live ES was usable a moment ago but gave nothing now (no candle complete yet, or the request failed): never
+            # substitute the ~10 min delayed Yahoo ES=F series for it -- the caller sees "no candles yet", and after a failure
+            # live_es_available() is False so the next tick confirms on SPX candles instead
+            return pd.DataFrame(columns=_COLUMNS)
     if symbol == config.SPX_SYMBOL and getattr(config, "SPX_CANDLE_SOURCE", "yahoo") == "yahoo":
         return get_spx_candles_yahoo(int(interval.rstrip("m")), lookback_min, now)
     if symbol == config.SPX_SYMBOL:

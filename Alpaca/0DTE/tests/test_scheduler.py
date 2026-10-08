@@ -1471,3 +1471,384 @@ def test_the_start_report_shows_the_token_line_when_the_broker_has_one(bot, monk
     monkeypatch.setattr(bot.broker, "token_status", lambda now: {"state": "WARN", "message": "5.2 days old"}, raising=False)
     bot.report_start(et(9, 25), bot.broker.get_account(), [])
     assert any("Schwab token: WARN -- 5.2 days old" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------- ASTRA-only audit (2026-10-08): live-ES break close, entry-wait watchdog, shared legs
+
+def _es_on_break(bot, direction, break_close_es, basis=-55.0):
+    from strategy import OrbSetup
+    bot.basis = basis
+    bot.on_setup = OrbSetup(7680.0, 7620.0)
+    bot.on_setup.state = OrbSetup.DONE
+    bot.on_setup.direction = direction
+    bot.on_setup.break_close = break_close_es
+    bot.on_setup_symbol = config.ES_SYMBOL
+
+
+def test_a_live_es_break_close_is_converted_to_spx_terms_before_the_continuation_check(bot, monkeypatch):
+    _es_on_break(bot, BULLISH, 7679.0)                  # ES terms; 7679 - 55 = 7624 SPX
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0                            # SPX beats 7624 by 5 -> a real continuation
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert len(calls) == 1
+    assert events(bot, "CONTINUATION_REENTRY")[0]["break_close"] == 7624.0
+
+
+def test_a_reversed_bearish_live_es_break_no_longer_looks_like_a_continuation(bot, monkeypatch):
+    from strategy import BEARISH
+    _es_on_break(bot, BEARISH, 7620.0)                  # SPX terms 7565; spot has since come back UP to 7600
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7600.0
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == []                                  # uncorrected: -(7600 - 7620) = +20 "beat" -> a re-entry INTO the reversal
+
+
+def test_a_bullish_live_es_break_that_continues_is_no_longer_blocked_by_the_scale(bot, monkeypatch):
+    _es_on_break(bot, BULLISH, 7679.0)
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7626.0                            # 7626 - 7679 = -53 uncorrected: "never continues"
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert len(calls) == 1
+
+
+def test_a_live_es_break_without_a_basis_skips_the_continuation_check_instead_of_guessing(bot, monkeypatch):
+    _es_on_break(bot, BULLISH, 7679.0)
+    bot.basis = None
+    calls = _spy_enter(bot, monkeypatch)
+    monkeypatch.setattr(bot.broker, "get_spot", lambda *a, **k: pytest.fail("no spot call without a usable break level"))
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert calls == []
+
+
+def test_an_spx_terms_setup_is_untouched_by_the_conversion(bot, monkeypatch):
+    _es_on_break(bot, BULLISH, 7624.0, basis=-55.0)
+    bot.on_setup_symbol = config.SPX_SYMBOL             # the proxy path: levels already shifted to SPX terms
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert len(calls) == 1 and events(bot, "CONTINUATION_REENTRY")[0]["break_close"] == 7624.0
+    bot.on_setup_symbol = None                          # a state file from before the symbol was recorded
+    bot.last_continuation_check.clear()
+    assert bot._spx_terms(7624.0, bot.on_setup_symbol) == 7624.0
+
+
+def test_the_signal_says_which_level_source_and_basis_it_used(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)
+    monkeypatch.setattr(scheduler.market_data, "get_candles",
+                        lambda *a, **k: make_candles(et(9, 30), [(7675, 7685, 7674, 7684), (7684, 7690, 7681, 7688)]))
+    bot.overnight = Levels(7680.0, 7620.0, et(9, 29))   # ES terms
+    bot.basis = -55.0
+    dispatched = []
+    monkeypatch.setattr(bot, "dispatch_entry", lambda *a, **k: dispatched.append(a))
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), [(7620, 7630, 7619, 7624)]))
+    sig = events(bot, "SIGNAL")[0]
+    assert sig["level_symbol"] == config.ES_SYMBOL and sig["basis"] == -55.0 and sig["high"] == 7680.0
+    assert dispatched and dispatched[0][4] == pytest.approx(7684.0 - 55.0)       # the break close handed on is in SPX terms
+
+
+def test_the_proxy_signal_records_the_spx_source(bot, monkeypatch):
+    _done_on_break(bot)
+    sig = events(bot, "SIGNAL")[0]
+    assert sig["level_symbol"] == config.SPX_SYMBOL and sig["basis"] == 0.0
+
+
+def test_a_momentum_wait_with_an_unconvertible_break_close_is_skipped_not_started(bot, monkeypatch):
+    real = scheduler.strategy.exit_setting
+    monkeypatch.setattr(scheduler.strategy, "exit_setting",
+                        lambda s, name, default=None: True if name == "MOMENTUM_CONFIRM_ENABLED" else real(s, name, default))
+    calls = _spy_enter(bot, monkeypatch)
+    bot.dispatch_entry(et(9, 34), "ORB", BULLISH, "MOMENTUM", None)
+    assert bot.pending_momentum == {} and calls == []
+    assert {r["reason_code"] for r in skipped(bot)} == {"MOMENTUM_BASIS_UNKNOWN"}
+
+
+def test_the_start_report_says_whether_live_es_is_on(bot, monkeypatch):
+    monkeypatch.setattr(scheduler.market_data, "live_es_status", lambda: (False, "access token expired"))
+    line = bot._live_es_report_line()
+    assert "OFF" in line and "access token expired" in line and "SPX-ES basis" in line
+    monkeypatch.setattr(scheduler.market_data, "live_es_status", lambda: (True, "token file holds a valid access token"))
+    assert "ON" in bot._live_es_report_line()
+    monkeypatch.setattr(scheduler.market_data, "live_es_status", lambda: 1 / 0)
+    assert "status unavailable" in bot._live_es_report_line()
+
+
+def test_a_slow_entry_wait_does_not_get_a_healthy_position_flattened(bot):
+    _open_both(bot)                                      # both priced at 10:15:00
+    bot._entry_wait_end = et(10, 17, 5)                  # the loop was blocked working an order until 10:17:05 (125 s)
+    bot._check_marks(et(10, 17, 6))
+    assert set(bot.pm.positions) == {"A", "B"} and bot._data_stale is False and events(bot, "STALE_MARK") == []
+    for p in bot.pm.positions.values():
+        p.last_mark_at = et(10, 17, 7)                   # the first tick after the wait priced them
+    bot._check_marks(et(10, 17, 9))
+    assert bot._data_stale is False
+
+
+
+
+
+
+def test_work_entry_records_when_it_released_the_loop(bot, monkeypatch):
+    monkeypatch.setattr(scheduler, "now_et", lambda: et(10, 20, 30))
+    assert bot._entry_wait_end is None
+    assert bot.work_entry({"id": "x", "status": "dry_run"}, 0.9, 0.65) == {"id": "x", "status": "dry_run"}
+    assert bot._entry_wait_end == et(10, 20, 30)
+    monkeypatch.setattr(bot, "_work_entry", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broker down")))
+    monkeypatch.setattr(scheduler, "now_et", lambda: et(10, 22))
+    with pytest.raises(RuntimeError):
+        bot.work_entry({"id": "x"}, 0.9, 0.65)
+    assert bot._entry_wait_end == et(10, 22)             # recorded even when the wait raised
+
+
+def _overlap_setup(bot, monkeypatch, short, long):
+    """B open on 7565/7560P; the next strategy is offered `short`/`long` on the same side."""
+    from strategy import SpreadQuote
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert "B" in bot.pm.positions and (bot.pm.positions["B"].short_strike, bot.pm.positions["B"].long_strike) == (7565.0, 7560.0)
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    monkeypatch.setattr(scheduler.strategy, "select_strikes_b",
+                        lambda *a, **k: (short, long, SpreadQuote(mid=0.90, bid_side=0.85, ask_side=0.95)))
+    bot.enter(et(10, 25), "ES_BREAK", BULLISH, strategies=("C",))
+    return [r for r in events(bot, "ENTRY_REJECTED") if r["strategy"] == "C"]
+
+
+@pytest.mark.parametrize("short,long", [(7570.0, 7565.0), (7560.0, 7555.0)], ids=["new long is the open short", "new short is the open long"])
+def test_a_spread_that_shares_a_strike_with_an_open_one_is_refused(bot, monkeypatch, short, long):
+    rejected = _overlap_setup(bot, monkeypatch, short, long)
+    assert "C" not in bot.pm.positions
+    assert rejected and "STRIKE_COLLISION" in rejected[0]["reason"] and "shares a strike" in rejected[0]["reason"] \
+        and "under B" in rejected[0]["reason"]
+    assert {r["reason_code"] for r in skipped(bot) if r["strategy"] == "C"} == {"STRIKE_COLLISION"}
+
+
+def test_a_neighbouring_spread_with_no_shared_strike_is_still_allowed(bot, monkeypatch):
+    rejected = _overlap_setup(bot, monkeypatch, 7555.0, 7550.0)
+    assert rejected == [] and "C" in bot.pm.positions
+
+
+def test_find_collision_ignores_other_rights_roots_and_expirations(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    b = bot.pm.positions["B"]
+    f = bot.pm.find_collision
+    assert f(b.root, b.expiration, "P", 7565.0, 7560.0) == "B" and f(b.root, b.expiration, "P", 7560.0, 7555.0) == "B"
+    assert f(b.root, b.expiration, "C", 7565.0, 7570.0) is None
+    assert f("TSLA", b.expiration, "P", 7565.0, 7560.0) is None
+    assert f(b.root, b.expiration + timedelta(days=1), "P", 7565.0, 7560.0) is None
+    assert bot.pm.collision_reason("B", "P", 7565.0, 7560.0) == "STRIKE_COLLISION 7565/7560P already open under B"
+
+
+def test_main_refuses_to_start_a_second_copy(monkeypatch, caplog):
+    import sys
+    monkeypatch.setattr(sys, "argv", ["scheduler.py"])
+    monkeypatch.setattr(scheduler, "setup_logging", lambda: None)
+    monkeypatch.setattr(scheduler, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(scheduler.instance_lock, "acquire", lambda directory, name: (False, "pid 4242"))
+    monkeypatch.setattr(scheduler, "Bot", lambda *a, **k: pytest.fail("a second copy must not even build its broker"))
+    with pytest.raises(SystemExit) as exc:
+        scheduler.main()
+    assert exc.value.code == 2
+    assert any("already running (pid 4242)" in r.getMessage() for r in caplog.records)
+
+
+def test_main_takes_the_lock_named_after_the_persona(monkeypatch):
+    import sys
+    seen = []
+    monkeypatch.setattr(sys, "argv", ["scheduler.py", "--once"])
+    monkeypatch.setattr(scheduler, "setup_logging", lambda: None)
+    monkeypatch.setattr(scheduler, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(scheduler.instance_lock, "acquire", lambda directory, name: seen.append((directory, name)) or (True, ""))
+
+    class Stop(Exception):
+        pass
+
+    def stop(*a, **k):
+        raise Stop
+    monkeypatch.setattr(scheduler, "Bot", stop)
+    with pytest.raises(Stop):
+        scheduler.main()
+    assert seen == [(scheduler.LOG_DIR, f"0dte_{config.TRADER_NAME.lower()}")]
+    monkeypatch.setattr(config, "SINGLE_INSTANCE_LOCK", False)
+    seen.clear()
+    with pytest.raises(Stop):
+        scheduler.main()
+    assert seen == []
+
+
+# ---- review follow-ups (2026-10-08): the watchdog clock restarts when the loop is released; live-ES fallback and chase; coverage gaps
+
+def test_a_position_still_unpriced_after_the_wait_alerts_then_flattens_on_the_normal_schedule(bot):
+    _open_both(bot)
+    bot._entry_wait_end = et(10, 17, 5)                  # the loop was released at 10:17:05 after a 125 s wait
+    bot._check_marks(et(10, 17, 20))                     # 15 s after the release: nothing
+    assert set(bot.pm.positions) == {"A", "B"} and bot._data_stale is False and events(bot, "STALE_MARK") == []
+    bot._check_marks(et(10, 17, 30))                     # 25 s after: no price yet -> alert and entries halted
+    assert bot._data_stale is True and set(bot.pm.positions) == {"A", "B"} and {e["key"] for e in events(bot, "STALE_MARK")} == {"A", "B"}
+    bot._check_marks(et(10, 18, 40))                     # 95 s after the release and still no price: flattened as before
+    assert bot.pm.positions == {} and {e["exit_reason"] for e in events(bot, "EXIT")} == {"STALE_DATA_FLATTEN"}
+
+
+def test_the_staleness_clock_restarts_only_at_the_end_of_the_wait(bot):
+    _open_both(bot)
+    bot._entry_wait_end = et(10, 16, 0)
+    bot._check_marks(et(10, 16, 31))                     # 91 s since the last price, but only 31 s since the loop was released
+    assert set(bot.pm.positions) == {"A", "B"}
+    bot._check_marks(et(10, 17, 31))                     # 91 s since the release
+    assert bot.pm.positions == {}
+
+
+def test_a_slow_entry_through_the_real_enter_path_does_not_get_the_open_position_flattened(bot, monkeypatch):
+    from datetime import timedelta
+    _open_both(bot)
+    bot.pm.positions.pop("B")                            # B's slot is free for a new entry; A stays open, last priced 10:15:00
+    clock = [et(10, 15)]
+    monkeypatch.setattr(scheduler, "now_et", lambda: clock[0])
+    monkeypatch.setattr(config, "ENTRY_TIMEOUT_SEC", 0)  # one wait, then give up
+    bot.broker.fill_entries = False                      # the order rests unfilled
+
+    def slow_wait(order_id, timeout_sec, poll_sec=2.0):
+        clock[0] += timedelta(seconds=125)               # the loop is blocked for 125 s
+        return bot.broker.get_order(order_id)
+    monkeypatch.setattr(bot.broker, "wait_for_fill", slow_wait)
+    bot.enter(clock[0], "ORB", BULLISH, strategies=("B",))
+    assert clock[0] == et(10, 17, 5) and bot._entry_wait_end == et(10, 17, 5)       # stamped when the wait ENDED
+    bot._check_marks(clock[0] + timedelta(seconds=1))
+    assert set(bot.pm.positions) == {"A"} and events(bot, "EXIT") == []
+
+
+def test_a_failed_live_es_request_carries_on_with_the_spx_candles_in_the_same_call(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    state = {"live": True}
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: state["live"])
+
+    def es_candles(symbol, *a, **k):
+        assert symbol == config.ES_SYMBOL
+        state["live"] = False                            # the request failed: live ES is off for a while
+        return make_candles(et(9, 30), [], minutes=2)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", es_candles)
+    bot.overnight = Levels(7620.0, 7560.0, et(9, 29))
+    bot.basis = 0.0
+    bars = [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)]
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), bars))
+    assert bot.on_setup_symbol == config.SPX_SYMBOL and bot.on_setup.state == bot.on_setup.DONE       # the break fired on SPX candles
+    assert events(bot, "SIGNAL")[0]["level_symbol"] == config.SPX_SYMBOL and bot._es_chase_until is None
+
+
+def test_a_live_es_frame_behind_the_spx_candle_is_chased_until_it_catches_up(bot, monkeypatch):
+    from datetime import timedelta
+    from conftest import make_candles
+    from strategy import Levels
+    spx = make_candles(et(9, 30), [(7615, 7625, 7614, 7624), (7624, 7630, 7621, 7628)])          # 09:30 and 09:32
+    behind = make_candles(et(9, 30), [(7675, 7685, 7674, 7684)])                                  # ES has only 09:30
+    full = make_candles(et(9, 30), [(7675, 7685, 7674, 7684), (7684, 7690, 7681, 7688)])
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)
+    frames = {"es": behind}
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: frames["es"])
+    bot.overnight = Levels(7680.0, 7620.0, et(9, 29))
+    bot.try_on_break_entry(et(9, 34), spx)
+    assert bot._es_chase_until == spx.index[-1].to_pydatetime() + timedelta(minutes=scheduler.ES_CHASE_MIN)
+    assert events(bot, "SIGNAL") == []
+    bot._es_chase_until = None
+    frames["es"] = full                                  # the second ES candle has arrived: the momentum entry fires on it
+    bot.try_on_break_entry(et(9, 34, 3), spx)
+    assert bot._es_chase_until is None and events(bot, "SIGNAL")[0]["level_symbol"] == config.ES_SYMBOL
+
+
+def test_a_failed_request_with_no_spx_fallback_yet_keeps_chasing(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    spx = make_candles(et(9, 30), [(7615, 7625, 7614, 7624)])
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: False)
+    monkeypatch.setattr(scheduler.market_data, "live_es_backoff_active", lambda: True)
+    bot.overnight = Levels(7680.0, 7620.0, et(9, 29))
+    bot.basis = None                                     # no SPX-terms level yet (Yahoo's delayed ES has no bar): nothing to evaluate
+    bot.try_on_break_entry(et(9, 32, 5), spx)
+    assert bot._es_chase_until is not None
+    bot._es_chase_until = None
+    monkeypatch.setattr(scheduler.market_data, "live_es_backoff_active", lambda: False)
+    bot.try_on_break_entry(et(9, 32, 6), spx)
+    assert bot._es_chase_until is None                   # no back-off, nothing to wait for
+
+
+def test_an_explicit_es_source_never_chases(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    monkeypatch.setattr(config, "BREAKOUT_LEVEL_SOURCE", "ES")
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: False)
+    import pandas as pd
+    monkeypatch.setattr(scheduler.market_data, "get_candles",
+                        lambda *a, **k: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]))    # what market_data returns
+    bot.overnight = Levels(7680.0, 7620.0, et(9, 29))
+    bot.try_on_break_entry(et(9, 34), make_candles(et(9, 30), [(7615, 7625, 7614, 7624)]))
+    assert bot._es_chase_until is None
+
+
+def test_tick_evaluates_the_breakout_setups_again_only_while_chasing(bot, monkeypatch):
+    from conftest import make_candles
+    spx = make_candles(et(9, 30), [(7615, 7625, 7614, 7624)])
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: spx)
+    monkeypatch.setattr(bot, "refresh_levels", lambda now: None)
+    calls = []
+    monkeypatch.setattr(bot, "try_on_break_entry", lambda now, c: calls.append("on"))
+    monkeypatch.setattr(bot, "try_es_break_entry", lambda now, c: calls.append("es"))
+    bot.last_candle = spx.index[-1].to_pydatetime()      # no NEW candle
+    bot.tick(et(9, 33, 5))
+    assert calls == []
+    bot._es_chase_until = et(9, 37)
+    bot.tick(et(9, 33, 6))
+    assert calls == ["on", "es"] and bot._es_chase_until is None
+    bot._es_chase_until = et(9, 37)
+    bot.tick(et(9, 37, 1))                               # the chase window has closed
+    assert calls == ["on", "es"]
+
+
+def test_the_es_break_signal_records_its_level_source_too(bot, monkeypatch):
+    from conftest import make_candles
+    from strategy import Levels
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "C"))
+    monkeypatch.setattr(scheduler.market_data, "live_es_available", lambda: True)
+    monkeypatch.setattr(scheduler.market_data, "get_candles",
+                        lambda *a, **k: make_candles(et(9, 30), [(7675, 7685, 7674, 7684), (7684, 7690, 7681, 7688)]))
+    bot.overnight = Levels(7680.0, 7620.0, et(9, 29))
+    bot.basis = -55.0
+    bot.try_es_break_entry(et(9, 34), make_candles(et(9, 30), [(7615, 7625, 7614, 7624)]))
+    sig = [r for r in events(bot, "SIGNAL") if r["setup"] == "ES_BREAK"][0]
+    assert sig["level_symbol"] == config.ES_SYMBOL and sig["basis"] == -55.0
+
+
+def test_only_the_on_break_setup_is_converted_not_the_orb_setup(bot, monkeypatch):
+    from strategy import OrbSetup
+    _es_on_break(bot, BULLISH, 7679.0, basis=-55.0)      # ON_BREAK in ES terms: 7624 in SPX points
+    bot.orb_setup = OrbSetup(7650.0, 7600.0)             # ORB is always in SPX terms
+    bot.orb_setup.state = OrbSetup.DONE
+    bot.orb_setup.direction = BULLISH
+    bot.orb_setup.break_close = 7655.0
+    calls = _spy_enter(bot, monkeypatch)
+    bot.broker.spot = 7629.0                             # beats ON_BREAK's 7624, but is 26 points BELOW ORB's break close
+    bot.check_continuation_reentry(et(9, 39), scheduler.Phase.OVERNIGHT_ONLY)
+    assert [args[1] for args, _ in calls] == ["ON_BREAK"]
+
+
+def test_the_start_report_prints_the_live_es_line(bot, caplog):
+    caplog.set_level("INFO")
+    bot.report_start(et(9, 0), bot.broker.get_account(), [])
+    assert any("Live ES (Schwab /ES): OFF" in r.getMessage() for r in caplog.records)
+
+
+def test_main_says_so_when_the_lock_cannot_be_used(monkeypatch, caplog):
+    import sys
+    monkeypatch.setattr(sys, "argv", ["scheduler.py", "--once"])
+    monkeypatch.setattr(scheduler, "setup_logging", lambda: None)
+    monkeypatch.setattr(scheduler, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(scheduler.instance_lock, "acquire", lambda directory, name: (True, "lock unavailable (x); not enforced"))
+
+    class Stop(Exception):
+        pass
+
+    def stop(*a, **k):
+        raise Stop
+    monkeypatch.setattr(scheduler, "Bot", stop)
+    with pytest.raises(Stop):
+        scheduler.main()
+    assert any("NOT enforced" in r.getMessage() and r.keep is True for r in caplog.records)

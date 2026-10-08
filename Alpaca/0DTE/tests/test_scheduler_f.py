@@ -648,3 +648,125 @@ def test_f_is_refused_while_the_persona_already_has_two_trades_open(bot, data, m
     bot.pm.open(f_spread("META"))
     out = bot.f.enter(et(10, 0), signal())
     assert out.startswith("skip:") and "MAX_OPEN_POSITIONS (2/2)" in out and "F:TSLA" not in bot.pm.positions
+
+
+# ----------------------------------------------------------------------------------- waiting out a transient block (2026-10-08)
+
+def _two_open(bot, monkeypatch, cap=2):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", cap)
+    bot.pm.open(f_spread("AMZN"))
+    bot.pm.open(f_spread("META"))
+
+
+def test_a_confirmed_f_signal_waits_for_a_slot_instead_of_being_dropped(bot, data, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    rank(bot, data)
+    _two_open(bot, monkeypatch)
+    bot.f.pending += [signal("TSLA", 1)]
+    for sec in (10, 11, 12):
+        bot.f.step(et(9, 55, sec))                                    # the cap is full on every one of these ticks
+    assert "F:TSLA" not in bot.pm.positions and [s.symbol for s in bot.f.pending] == ["TSLA"]
+    assert events(bot, "F_SKIPPED") == []
+    waiting = [r for r in caplog.records if "confirmed signal(s) waiting" in r.getMessage()]
+    assert len(waiting) == 1 and "MAX_OPEN_POSITIONS (2/2)" in waiting[0].getMessage()      # said once, not every tick
+    bot.pm.positions.pop("F:META")                                    # a slot opens
+    bot.f.step(et(9, 55, 20))
+    assert "F:TSLA" in bot.pm.positions and bot.f.pending == []
+
+
+def test_an_f_signal_that_waits_too_long_still_expires(bot, data, monkeypatch):
+    rank(bot, data)
+    _two_open(bot, monkeypatch)
+    bot.f.pending += [signal("TSLA", 1)]
+    bot.f.step(et(9, 55, 10))
+    bot.f.step(et(9, 50) + timedelta(minutes=5 + config.F_SIGNAL_TTL_MIN, seconds=1))      # candle end + TTL has passed
+    assert bot.f.pending == []
+    assert [e["reason"] for e in events(bot, "F_SKIPPED")] == ["SIGNAL_EXPIRED"]
+
+
+def test_f_signals_wait_through_a_failing_close_and_stale_prices_too(bot, data, monkeypatch):
+    rank(bot, data)
+    bot.f.pending += [signal("TSLA", 1)]
+    monkeypatch.setattr(bot.pm, "any_close_blocked", lambda: True)
+    bot.f.step(et(9, 55, 10))
+    assert [s.symbol for s in bot.f.pending] == ["TSLA"] and "F:TSLA" not in bot.pm.positions
+    monkeypatch.setattr(bot.pm, "any_close_blocked", lambda: False)
+    bot._data_stale = True
+    bot.f.step(et(9, 55, 11))
+    assert [s.symbol for s in bot.f.pending] == ["TSLA"] and bot.f._waiting_on.startswith("DATA_STALE")
+    bot._data_stale = False
+    bot.f.step(et(9, 55, 12))
+    assert "F:TSLA" in bot.pm.positions and bot.f._waiting_on is None
+
+
+def test_a_day_limit_still_drops_the_f_signals_at_once(bot, data, monkeypatch):
+    rank(bot, data)
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 2)
+    for _ in range(3):
+        bot.risk.record_trade("F", 10.0)                              # F's 3 trades a day are used
+    bot.f.pending += [signal("TSLA", 1), signal("PFE", 2)]
+    bot.f.step(et(9, 55, 10))
+    assert bot.f.pending == [] and {e["reason"] for e in events(bot, "F_SKIPPED")} == {"F: MAX_TRADES_PER_DAY (3)"}
+
+
+def test_an_f_spread_that_shares_a_strike_with_an_open_f_spread_on_the_same_ticker_is_refused(bot, data):
+    rank(bot, data)
+    other = f_spread("TSLA")                                          # 417.5/412.5P already open on TSLA
+    other.long_strike, other.short_strike = 412.5, 417.5
+    bot.pm.open(other)
+    assert bot.pm.find_collision("TSLA", EXP, "P", 422.5, 417.5) == "F:TSLA"                   # new short = open short
+    assert bot.pm.find_collision("TSLA", EXP, "P", 412.5, 407.5) == "F:TSLA"                   # new short = open long
+    assert bot.pm.find_collision("TSLA", EXP, "P", 407.5, 402.5) is None
+    assert bot.pm.collision_reason("F:TSLA", "P", 422.5, 417.5) == \
+        "STRIKE_COLLISION 422.5/417.5P shares a strike with 417.5/412.5P open under F:TSLA"
+
+
+def test_f_entry_refuses_an_identical_or_overlapping_spread_on_the_same_ticker(bot, data):
+    rank(bot, data)
+    bot.pm.open(f_spread("TSLA"))                                      # 417.5/412.5P, exactly what the strike walk picks
+    out = bot.f.enter(et(10, 0), signal())
+    assert out.startswith("skip:") and "STRIKE_COLLISION 417.5/412.5P already open under F:TSLA" in out
+    bot.pm.positions.pop("F:TSLA")
+    shifted = f_spread("TSLA")
+    shifted.short_strike, shifted.long_strike = 422.5, 417.5           # its long leg is the new spread's short leg
+    bot.pm.open(shifted)
+    out = bot.f.enter(et(10, 0, 1), signal())
+    assert out.startswith("skip:") and "STRIKE_COLLISION 417.5/412.5P shares a strike with 422.5/417.5P open under F:TSLA" in out
+    assert len(bot.pm.positions) == 1
+
+
+# ---- review follow-ups (2026-10-08): journal the wait, supersede a waiting signal, reset the waiting note
+
+def test_waiting_is_journaled_once_per_block_and_expiry_resets_the_note(bot, data, monkeypatch):
+    rank(bot, data)
+    _two_open(bot, monkeypatch)
+    bot.f.pending += [signal("TSLA", 1)]
+    for sec in (10, 11, 12):
+        bot.f.step(et(9, 55, sec))
+    waiting = events(bot, "F_WAITING")
+    assert len(waiting) == 1 and waiting[0]["reason"] == "MAX_OPEN_POSITIONS (2/2)" and waiting[0]["tickers"] == ["TSLA"]
+    bot.f.step(et(9, 50) + timedelta(minutes=5 + config.F_SIGNAL_TTL_MIN, seconds=1))
+    assert bot.f.pending == [] and bot.f._waiting_on is None                # nothing waits any more: the next block is announced again
+    fresh = signal("PFE", 2)
+    fresh.candle_time = et(10, 20)                                          # a signal that has not expired yet
+    bot.f.pending.append(fresh)
+    bot.f.step(et(10, 30))
+    assert len(events(bot, "F_WAITING")) == 2
+
+
+def test_a_newer_break_on_the_same_ticker_replaces_the_waiting_signal(bot, data, monkeypatch):
+    rank(bot, data)
+    _two_open(bot, monkeypatch)
+    old = signal("TSLA", 1)
+    bot.f.pending.append(old)
+    newer = signal("TSLA", 1)
+    newer.candle_time = et(10, 5)
+    newer.direction = "BEARISH"
+    monkeypatch.setattr(bot.f, "_confirmation", lambda sig, now, check_volume, refresh=False: ({"checked_at": now.isoformat()}, []))
+    bot.f._confirm_and_queue(newer, et(10, 10))
+    assert bot.f.pending == [newer]
+    skipped = events(bot, "F_SKIPPED")
+    assert len(skipped) == 1 and skipped[0]["ticker"] == "TSLA" and skipped[0]["reason"].startswith("SUPERSEDED by the MOMENTUM break of 10:05")
+    assert old.key in bot.acted
+    bot.f._confirm_and_queue(newer, et(10, 11))                             # the very same signal again: left alone
+    assert bot.f.pending == [newer] and len(events(bot, "F_SKIPPED")) == 1

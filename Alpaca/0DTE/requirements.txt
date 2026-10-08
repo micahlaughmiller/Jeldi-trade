@@ -3,4 +3,5 @@ numpy
 yfinance
 requests
 python-dotenv
+schwab-py>=1.5
 pytest

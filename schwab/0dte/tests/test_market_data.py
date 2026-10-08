@@ -117,6 +117,7 @@ def test_get_es_candles_live_resamples_to_requested_interval(monkeypatch):
             return FakeResp()
 
     monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: FakeClient())
+    _clock(monkeypatch, now + timedelta(seconds=5))     # the snapshot was taken just after the last bar closed
     df = market_data.get_es_candles_live(2, 180, now=now)
     assert df is not None
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
@@ -128,6 +129,7 @@ def test_get_es_candles_live_resamples_to_requested_interval(monkeypatch):
 def test_get_candles_falls_back_to_yfinance_when_live_es_unavailable(monkeypatch):
     import config
     monkeypatch.setattr(market_data, "get_es_candles_live", lambda *a, **k: None)
+    monkeypatch.setattr(market_data, "live_es_available", lambda: False)      # whatever Schwab token this machine happens to hold
     called = []
     monkeypatch.setattr(market_data, "_download", lambda *a, **k: called.append(a) or market_data._normalize(None))
     market_data.get_candles(config.ES_SYMBOL, "2m", 180)
@@ -555,3 +557,277 @@ def test_get_spx_candles_via_alpaca_reports_feed_health(monkeypatch, caplog):
     monkeypatch.setattr(market_data, "_alpaca_data_get", lambda path, params: None)
     market_data.get_spx_candles_via_alpaca(5, 180)
     assert any("DATA FEED DOWN" in r.message and config.SPY_SYMBOL in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------------------------------
+# 2026-10-08: the live-ES path, hardened (ASTRA-only audit): bounded request with a timeout, complete candles only, a failed request
+# turns the feed off for a while instead of silently substituting the ~10 min delayed Yahoo series, every state change is logged once.
+
+import types
+from datetime import datetime, timedelta
+
+from conftest import et
+
+
+@pytest.fixture(autouse=True)
+def _reset_es_live_state():
+    market_data._ES_LIVE.update(state=None, fail_until=0.0)
+    yield
+    market_data._ES_LIVE.update(state=None, fail_until=0.0)
+
+
+def _clock(monkeypatch, wall: datetime) -> None:
+    """Pin market_data's wall clock (time.time) to `wall`; monotonic/sleep stay real."""
+    import time as real
+    monkeypatch.setattr(market_data, "_time", types.SimpleNamespace(time=lambda: wall.timestamp(), monotonic=real.monotonic,
+                                                                    sleep=real.sleep))
+
+
+def _minute_rows(first: datetime, n: int, skip=()) -> list[dict]:
+    rows = []
+    for i in range(n):
+        t = first + timedelta(minutes=i)
+        if t in skip:
+            continue
+        rows.append({"open": 100.0 + i, "high": 101.0 + i, "low": 99.0 + i, "close": 100.5 + i, "volume": 10,
+                     "datetime": int(t.timestamp() * 1000)})
+    return rows
+
+
+class _Resp:
+    def __init__(self, body):
+        self.body = body
+
+    def json(self):
+        return self.body
+
+
+class _Client:
+    def __init__(self, body=None, error=None):
+        self.body, self.error, self.calls = body, error, []
+
+    def get_price_history_every_minute(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if self.error:
+            raise self.error
+        return _Resp(self.body)
+
+
+def _valid_token_config(monkeypatch, tmp_path):
+    token_path = tmp_path / "token.json"
+    _write_token(token_path)
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(token_path))
+
+
+def test_the_read_only_session_carries_a_default_timeout(monkeypatch, tmp_path):
+    _valid_token_config(monkeypatch, tmp_path)
+    seen = []
+    monkeypatch.setattr(requests.Session, "request", lambda self, *a, **k: seen.append(k) or types.SimpleNamespace(status_code=200))
+    client = market_data._schwab_read_only_client()
+    client.session.get("https://example.invalid/x")
+    client.session.get("https://example.invalid/y", timeout=1)
+    assert seen[0]["timeout"] == (3.0, 8.0) and seen[1]["timeout"] == 1
+
+
+def test_the_history_request_is_bounded_to_a_day_ending_now(monkeypatch):
+    now = et(9, 40)
+    client = _Client({"candles": _minute_rows(et(9, 30), 10)})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    _clock(monkeypatch, now + timedelta(seconds=5))
+    market_data.get_es_candles_live(2, 180, now=now)
+    kwargs = client.calls[0][1]
+    assert kwargs["end_datetime"] == now and kwargs["start_datetime"] == now - timedelta(minutes=1440)
+    assert kwargs["need_extended_hours_data"] is True
+
+
+def test_live_es_candles_are_complete_ones_only(monkeypatch):
+    now = et(10, 0)
+    # 09:56 .. 09:58 present, the 09:59 bar is missing: the 09:58 two-minute candle has one of its two bars
+    client = _Client({"candles": _minute_rows(et(9, 56), 4, skip={et(9, 59)})})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    _clock(monkeypatch, now + timedelta(seconds=5))
+    df = market_data.get_es_candles_live(2, 180, now=now)
+    assert list(df.index) == [et(9, 56)]                                   # the half-built 09:58 candle is withheld
+    market_data._CACHE.clear()
+    full = _Client({"candles": _minute_rows(et(9, 56), 4)})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: full)
+    assert list(market_data.get_es_candles_live(2, 180, now=now).index) == [et(9, 56), et(9, 58)]
+
+
+def test_a_snapshot_taken_before_the_last_bar_settled_does_not_emit_the_candle(monkeypatch):
+    now = et(10, 0, 3)
+    client = _Client({"candles": _minute_rows(et(9, 56), 4)})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    _clock(monkeypatch, et(9, 59, 59))                                     # fetched while the 09:59 bar was still forming
+    assert list(market_data.get_es_candles_live(2, 180, now=now).index) == [et(9, 56)]
+
+
+def test_a_failed_request_turns_live_es_off_for_a_while_and_says_so_once(monkeypatch, tmp_path, caplog):
+    from schwab.client import Client
+    caplog.set_level("INFO")
+    _valid_token_config(monkeypatch, tmp_path)
+
+    def boom(self, *a, **k):
+        raise RuntimeError("network error")
+    monkeypatch.setattr(Client, "get_price_history_every_minute", boom)
+    assert market_data.live_es_available() is True
+    assert market_data.get_es_candles_live(2, 180, now=et(9, 40)) is None
+    assert market_data.live_es_available() is False                        # the proxy takes over at once
+    assert market_data.get_es_candles_live(2, 180, now=et(9, 41)) is None  # no second request while it is off
+    lines = [r for r in caplog.records if "LIVE_ES" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].keep is True and "RuntimeError" in lines[0].getMessage()
+    market_data._ES_LIVE["fail_until"] = 0.0                               # the retry window is over
+    assert market_data.live_es_available() is True
+
+
+def test_candles_never_fall_back_to_delayed_yahoo_es_when_live_es_was_usable(monkeypatch, tmp_path):
+    from schwab.client import Client
+    _valid_token_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(Client, "get_price_history_every_minute", lambda self, *a, **k: _Resp({"error": "unauthorized"}))
+    monkeypatch.setattr(market_data, "_download", lambda *a, **k: pytest.fail("delayed ES=F must not stand in for live ES"))
+    out = market_data.get_candles(config.ES_SYMBOL, "2m", 180, et(9, 40))
+    assert out.empty and list(out.columns) == ["open", "high", "low", "close", "volume"]
+    assert market_data.live_es_available() is False
+
+
+def test_live_es_not_usable_at_all_still_reads_yahoo_for_an_explicit_es_source(monkeypatch):
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
+    called = []
+    monkeypatch.setattr(market_data, "_download", lambda *a, **k: called.append(a) or market_data._normalize(None))
+    market_data.get_candles(config.ES_SYMBOL, "2m", 180, et(9, 40))
+    assert called
+
+
+@pytest.mark.parametrize("body", [[], "nope", None, {"candles": None}, {"candles": [{"not": "a candle"}]}])
+def test_a_malformed_history_body_is_a_failure_not_a_crash(monkeypatch, body):
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: _Client(body))
+    assert market_data.get_es_candles_live(2, 180, now=et(9, 40)) is None
+    assert market_data._ES_LIVE["fail_until"] > 0
+
+
+def test_a_steady_live_es_state_is_silent_and_a_change_is_logged(monkeypatch, tmp_path, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
+    for _ in range(3):
+        market_data._schwab_read_only_client()
+    off = [r for r in caplog.records if "LIVE_ES off" in r.getMessage()]
+    assert len(off) == 1 and "not configured" in off[0].getMessage() and off[0].keep is True
+    _valid_token_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: _Client({"candles": _minute_rows(et(9, 30), 10)}))
+    _clock(monkeypatch, et(9, 40, 5))
+    market_data.get_es_candles_live(2, 180, now=et(9, 40))
+    market_data._CACHE.clear()
+    market_data.get_es_candles_live(2, 180, now=et(9, 40))
+    assert len([r for r in caplog.records if "LIVE_ES on" in r.getMessage()]) == 1
+
+
+def test_live_es_status_says_why_it_is_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
+    assert market_data.live_es_status() == (False, "SCHWAB_APP_KEY / SCHWAB_TOKEN_PATH not configured")
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(tmp_path / "missing.json"))
+    ok, why = market_data.live_es_status()
+    assert ok is False and why.startswith("token file not found")
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, expires_at=__import__("time").time() - 5)
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(token_path))
+    ok, why = market_data.live_es_status()
+    assert ok is False and "expired" in why and "Schwab bot" in why
+    _write_token(token_path)
+    assert market_data.live_es_status()[0] is True
+    token_path.write_text("{not json")
+    ok, why = market_data.live_es_status()
+    assert ok is False and "unreadable" in why
+
+
+def test_the_status_check_logs_nothing_and_builds_no_state(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "")
+    market_data.live_es_status()
+    assert [r for r in caplog.records if "LIVE_ES" in r.getMessage()] == [] and market_data._ES_LIVE["state"] is None
+
+
+# ---- review follow-ups (2026-10-08)
+
+class _StatusResp(_Resp):
+    def __init__(self, body, status, error=None):
+        super().__init__(body)
+        self.status_code, self.error = status, error
+
+    def json(self):
+        if self.error:
+            raise self.error
+        return self.body
+
+
+def test_a_response_without_candles_names_its_http_status(monkeypatch):
+    client = _Client()
+    client.get_price_history_every_minute = lambda *a, **k: _StatusResp({"errors": [{"status": 403}]}, 403)
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    assert market_data.get_es_candles_live(2, 180, now=et(9, 40)) is None
+    assert market_data._ES_LIVE["state"] == (False, "Schwab /ES returned no candles (HTTP 403)")
+    market_data._ES_LIVE.update(state=None, fail_until=0.0)
+    client.get_price_history_every_minute = lambda *a, **k: _StatusResp(None, 401, ValueError("not json"))
+    assert market_data.get_es_candles_live(2, 180, now=et(9, 40)) is None
+    assert market_data._ES_LIVE["state"] == (False, "Schwab /ES request failed (ValueError, HTTP 401)")
+
+
+def test_a_stalled_live_es_series_counts_as_a_failure_not_as_live(monkeypatch):
+    client = _Client({"candles": _minute_rows(et(9, 0), 36)})                  # the newest bar is 09:35
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    now = et(9, 50, 3)
+    _clock(monkeypatch, now)
+    assert market_data.get_es_candles_live(2, 180, now=now) is None
+    assert market_data._ES_LIVE["state"] == (False, "Schwab /ES bars are 15 min old")
+    assert market_data.live_es_backoff_active() is True
+
+
+def test_a_series_that_is_a_few_minutes_old_is_still_live_and_the_check_is_for_the_session_only(monkeypatch):
+    now = et(9, 40)
+    client = _Client({"candles": _minute_rows(et(9, 30), 7)})                  # newest bar 09:36: four minutes old
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    _clock(monkeypatch, now + timedelta(seconds=5))
+    assert market_data.get_es_candles_live(2, 180, now=now) is not None and market_data._ES_LIVE["state"] == (True, "")
+    market_data._CACHE.clear()
+    evening = datetime(2026, 10, 7, 18, 30, tzinfo=et(9, 0).tzinfo)            # overnight: a quiet tape is not a stall
+    old = _Client({"candles": _minute_rows(et(17, 0), 30)})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: old)
+    _clock(monkeypatch, evening)
+    assert market_data.get_es_candles_live(2, 180, now=evening) is not None
+
+
+def test_the_live_es_request_is_cached_and_refreshed_when_the_minute_rolls(monkeypatch):
+    client = _Client({"candles": _minute_rows(et(9, 30), 10)})
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    now = et(9, 40)
+    _clock(monkeypatch, et(9, 40, 5))
+    market_data.get_es_candles_live(2, 180, now=now)
+    _clock(monkeypatch, et(9, 40, 15))
+    market_data.get_es_candles_live(2, 180, now=now)
+    assert len(client.calls) == 1                                              # inside DATA_CACHE_SEC and the same minute: one request
+    _clock(monkeypatch, et(9, 41, 3))                                          # the minute rolled and settled: ask again
+    market_data.get_es_candles_live(2, 180, now=et(9, 41))
+    assert len(client.calls) == 2
+    _clock(monkeypatch, et(9, 41, 40))                                         # more than DATA_CACHE_SEC old
+    market_data.get_es_candles_live(2, 180, now=et(9, 41, 40))
+    assert len(client.calls) == 3
+
+
+def test_a_token_that_expires_within_thirty_seconds_is_not_usable(monkeypatch, tmp_path):
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, expires_at=__import__("time").time() + 20)
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(token_path))
+    ok, why = market_data.live_es_status()
+    assert ok is False and "expired" in why
+    _write_token(token_path, expires_at=__import__("time").time() + 120)
+    assert market_data.live_es_status()[0] is True
+
+
+def test_live_es_backoff_active_follows_the_failure_window():
+    assert market_data.live_es_backoff_active() is False
+    market_data._es_failed("x")
+    assert market_data.live_es_backoff_active() is True
+    market_data._ES_LIVE["fail_until"] = 0.0
+    assert market_data.live_es_backoff_active() is False

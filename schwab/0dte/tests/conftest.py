@@ -47,6 +47,18 @@ def _no_shared_snapshots(request, monkeypatch):
         monkeypatch.setattr(config, "SHARED_DATA_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_es(request, monkeypatch):
+    """Unit tests never read a real Schwab token or call Schwab, whatever .env / token.json this machine holds: live ES is off
+    unless a test turns it on. test_market_data exercises the real token/status code against its own temp files."""
+    import market_data
+    market_data._ES_LIVE.update(state=None, fail_until=0.0)
+    if request.module.__name__ != "test_market_data":
+        monkeypatch.setattr(market_data, "_es_token_check", lambda: (None, "unit tests: live ES off"))
+    yield
+    market_data._ES_LIVE.update(state=None, fail_until=0.0)
+
+
 @pytest.fixture
 def wind_down_times(monkeypatch):
     """The session end before the 2026-10-05 hard stop (last entry 15:00, force close 15:30), for the tests that

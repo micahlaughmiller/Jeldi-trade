@@ -142,6 +142,19 @@ class RiskManager:
     def daily_loss_limit(self) -> float:
         return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
 
+    def transient_block(self, open_total: int = 0, close_blocked: bool = False, halt: str | None = None) -> str | None:
+        """Why NO strategy may enter right now for a reason that clears by itself -- stale prices or an expiring broker token (halt),
+        a close failing at the broker, the open-position cap -- as opposed to a day limit, which does not. F keeps a confirmed
+        signal waiting through these instead of dropping it."""
+        if halt:
+            return halt                  # stale prices / expiring broker token: entries are halted whatever the strategy
+        if close_blocked:
+            return "CLOSE_BLOCKED (a close is failing at the broker: new entries are halted)"
+        open_cap = getattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
+        if open_cap and open_total >= open_cap:
+            return f"MAX_OPEN_POSITIONS ({open_total}/{open_cap})"
+        return None
+
     def trading_allowed(self, strat: str, equity: float | None = None,
                         now: datetime | None = None, setup: str | None = None,
                         open_count: int = 0, exempt_open_pnl: float = 0.0,
@@ -155,13 +168,9 @@ class RiskManager:
         ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
         (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
         from account equity before the drawdown check so nothing of theirs ever trips the SPX limit."""
-        if halt:
-            return False, halt           # stale prices / expiring broker token: entries are halted whatever the strategy
-        if close_blocked:
-            return False, "CLOSE_BLOCKED (a close is failing at the broker: new entries are halted)"
-        open_cap = getattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
-        if open_cap and open_total >= open_cap:
-            return False, f"MAX_OPEN_POSITIONS ({open_total}/{open_cap})"
+        block = self.transient_block(open_total, close_blocked, halt)
+        if block:
+            return False, block
         s = self.state.for_strategy(strat)
         entries = max(s.entries_today, s.trades_today + open_count)
         if entries >= limit(strat, "MAX_TRADES_PER_DAY"):

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 import config
+import instance_lock
 import market_data
 import strategy
 from broker import Broker, BrokerError
@@ -48,6 +49,7 @@ class PendingMomentum:
 
 HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / config.LOG_DIR
+ES_CHASE_MIN = 5      # how long after an SPX candle a live-ES frame that is still behind it is looked at again, every tick
 TERMINAL = {"filled", "canceled", "rejected", "expired", "replaced", "dry_run"}
 
 log = logging.getLogger("0dte")
@@ -148,6 +150,8 @@ class Bot:
         self._eod_retry_at: datetime | None = None
         self._data_stale = False                      # an open position has no fresh price (see _check_marks)
         self._stale_alert_at: dict[str, datetime] = {}
+        self._entry_wait_end: datetime | None = None  # when the tick loop was last released from working an entry order
+        self._es_chase_until: datetime | None = None  # live ES was behind the SPX candle being evaluated: look again until then
         self._token_halt: str | None = None           # Schwab sim: the refresh token is expiring / dead
         self._token_checked_at: datetime | None = None
         self._token_warned_at: datetime | None = None
@@ -403,7 +407,7 @@ class Bot:
             is_stock = p.strategy in config.STOCK_STRATEGIES
             alert = config.F_MARK_STALE_ALERT_SEC if is_stock else config.MARK_STALE_ALERT_SEC
             flatten = config.F_MARK_STALE_FLATTEN_SEC if is_stock else config.MARK_STALE_FLATTEN_SEC
-            age = self.pm.mark_age(p, now)
+            age = self._mark_age(p, now)
             if age < alert:
                 continue
             last = self._stale_alert_at.get(key)
@@ -420,9 +424,21 @@ class Bot:
                     self.record_fills(self.pm.close_one(key, now, "STALE_DATA_FLATTEN"))
                 except BrokerError as e:
                     log.error("[%s] stale-data flatten failed: %s", key, e)
-        self._data_stale = any(self.pm.mark_age(p, now) >= (config.F_MARK_STALE_ALERT_SEC if p.strategy in config.STOCK_STRATEGIES
-                                                           else config.MARK_STALE_ALERT_SEC)
+        self._data_stale = any(self._mark_age(p, now) >= (config.F_MARK_STALE_ALERT_SEC if p.strategy in config.STOCK_STRATEGIES
+                                                         else config.MARK_STALE_ALERT_SEC)
                                for p in self.pm.positions.values())
+
+    def _mark_age(self, p: OpenSpread, now: datetime) -> float:
+        """Seconds since `p` was last priced -- but the loop is blocked while an entry order is worked (up to ENTRY_TIMEOUT_SEC,
+        longer than MARK_STALE_FLATTEN_SEC), during which no position can be priced, so that time is not a data outage: the clock
+        counts from the later of the last price and the moment the loop was released. The watchdog used to flatten a healthy
+        sibling position the instant a slow entry returned; now a position still unpriced MARK_STALE_FLATTEN_SEC after the loop is
+        released is flattened as before."""
+        age = self.pm.mark_age(p, now)
+        end = self._entry_wait_end
+        if end is not None and end <= now:
+            age = min(age, (now - end).total_seconds())
+        return age
 
     def _token_check(self, now: datetime) -> None:
         """Schwab sim only (the broker exposes token_status): warn as the 7-day refresh token ages, refuse new entries when it
@@ -506,10 +522,15 @@ class Bot:
         if self.pending_momentum:
             self.check_pending_momentum(now, ph)
         if ph in strategy.ENTRY_PHASES:
-            if new_candle and ph in strategy.OVERNIGHT_PHASES:
+            # 2026-10-08: with live ES the breakout setups are fed ES candles, which can arrive a few seconds after the SPX candle
+            # that triggers this evaluation (or the /ES request can fail once): while the ES frame is still behind, look again on
+            # the next ticks (_es_chase_until) rather than letting that candle go by and be replayed as a stale signal.
+            evaluate = new_candle or (self._es_chase_until is not None and now < self._es_chase_until)
+            self._es_chase_until = None          # set again below by whichever setup still finds the ES frame behind
+            if evaluate and ph in strategy.OVERNIGHT_PHASES:
                 self.try_on_break_entry(now, candles)   # OVERNIGHT retired 2026-09-24; ON_BREAK covers both A and B
-            if new_candle and (ph in strategy.OVERNIGHT_PHASES
-                               or strategy.minutes_since_open(now) < config.C_ENTRY_END_MIN):
+            if evaluate and (ph in strategy.OVERNIGHT_PHASES
+                             or strategy.minutes_since_open(now) < config.C_ENTRY_END_MIN):
                 self.try_es_break_entry(now, candles)   # Strategy C (config.C_ENTRY_END_MIN widens its window)
             if orb_signal is not None:
                 self.try_orb_entry(now, *orb_signal)
@@ -565,6 +586,34 @@ class Bot:
         return self.overnight.shifted(self.basis), config.SPX_SYMBOL
 
     # --------------------------------------------------------------- signals
+
+    def _levels_and_candles(self, now: datetime, spx_candles: pd.DataFrame):
+        """(levels, symbol, candles) for the overnight-level setups, or None when no level is usable yet. On live ES the candles are
+        ES's own: if that request has JUST failed (live ES is then switched off for ES_LIVE_RETRY_SEC) the same call carries on with
+        the SPX candles and the basis-shifted levels instead of evaluating nothing; and while the ES frame is merely behind the SPX
+        candle being evaluated (or the request failed and no SPX fallback exists yet) the evaluation is repeated on the next ticks."""
+        found = self.overnight_levels_for_signal()
+        if found is None:
+            if config.BREAKOUT_LEVEL_SOURCE == "ES_TO_SPX" and market_data.live_es_backoff_active():
+                self._chase_es(spx_candles)
+            return None
+        levels, symbol = found
+        if symbol == config.SPX_SYMBOL:
+            return levels, symbol, spx_candles
+        candles = market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
+        if candles.empty:
+            switched = self.overnight_levels_for_signal()
+            if switched is not None and switched[1] != symbol:       # the live-ES request failed a moment ago
+                return switched[0], switched[1], spx_candles
+        if config.BREAKOUT_LEVEL_SOURCE == "ES_TO_SPX" and not spx_candles.empty \
+                and (candles.empty or candles.index[-1] < spx_candles.index[-1]):
+            self._chase_es(spx_candles)
+        return levels, symbol, candles
+
+    def _chase_es(self, spx_candles: pd.DataFrame) -> None:
+        if not spx_candles.empty:
+            until = spx_candles.index[-1].to_pydatetime() + timedelta(minutes=ES_CHASE_MIN)
+            self._es_chase_until = until if self._es_chase_until is None else max(self._es_chase_until, until)
 
     def entry_possible(self, equity: float, setup: str | None = None,
                        strategies: tuple[str, ...] | None = None) -> bool:
@@ -632,10 +681,10 @@ class Bot:
         """Overnight high/low through the ORB state machine (break, then pullback or momentum). A only."""
         if not strategy.setup_allowed("ON_BREAK", now.date()):
             return
-        found = self.overnight_levels_for_signal()
-        if found is None:
+        inputs = self._levels_and_candles(now, spx_candles)
+        if inputs is None:
             return
-        levels, symbol = found
+        levels, symbol, candles = inputs
         if self.on_setup is None or self.on_setup_symbol != symbol:
             if self.on_setup is not None:
                 log.warning("ON_BREAK level source switched %s -> %s: rebuilding on_setup fresh.",
@@ -643,8 +692,6 @@ class Bot:
             self.on_setup = strategy.OrbSetup(levels.high, levels.low)
             self.on_setup_symbol = symbol
             self.last_on_candle = None
-        candles = spx_candles if symbol == config.SPX_SYMBOL else \
-            market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
         candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
         if self.last_on_candle is not None:
             candles = candles[candles.index > self.last_on_candle]
@@ -664,8 +711,9 @@ class Bot:
             log.info("SIGNAL ON_BREAK %s (%s) on %s candle %s vs overnight %.2f/%.2f", fired, kind,
                      config.CANDLE_INTERVAL, t.strftime("%H:%M"), levels.high, levels.low)
             self.journal.event("SIGNAL", now, setup="ON_BREAK", direction=fired, trigger=kind,
-                               candles=[self.last_on_candle], high=levels.high, low=levels.low)
-            self.dispatch_entry(now, "ON_BREAK", fired, kind, self.on_setup.break_close)
+                               candles=[self.last_on_candle], high=levels.high, low=levels.low,
+                               level_symbol=symbol, basis=self.basis)
+            self.dispatch_entry(now, "ON_BREAK", fired, kind, self._spx_terms(self.on_setup.break_close, symbol))
 
     def try_es_break_entry(self, now: datetime, spx_candles: pd.DataFrame) -> None:
         """Strategy C: the same overnight level as ON_BREAK, through strategy.TwoCandleBreak instead
@@ -674,10 +722,10 @@ class Bot:
             return
         if not strategy.setup_allowed("ES_BREAK", now.date()):
             return
-        found = self.overnight_levels_for_signal()
-        if found is None:
+        inputs = self._levels_and_candles(now, spx_candles)
+        if inputs is None:
             return
-        levels, symbol = found
+        levels, symbol, candles = inputs
         if self.es_setup is None or self.es_setup_symbol != symbol:
             if self.es_setup is not None:
                 log.warning("ES_BREAK level source switched %s -> %s: rebuilding es_setup fresh.",
@@ -685,8 +733,6 @@ class Bot:
             self.es_setup = strategy.TwoCandleBreak(levels.high, levels.low)
             self.es_setup_symbol = symbol
             self.last_es_candle = None
-        candles = spx_candles if symbol == config.SPX_SYMBOL else \
-            market_data.get_candles(symbol, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK_MIN, now)
         candles = candles[candles.index >= strategy.at_time(now, config.MARKET_OPEN)]
         if self.last_es_candle is not None:
             candles = candles[candles.index > self.last_es_candle]
@@ -705,7 +751,8 @@ class Bot:
             log.info("SIGNAL ES_BREAK %s on %s candle %s vs overnight %.2f/%.2f", fired,
                      config.CANDLE_INTERVAL, t.strftime("%H:%M"), levels.high, levels.low)
             self.journal.event("SIGNAL", now, setup="ES_BREAK", direction=fired,
-                               candles=[self.last_es_candle], high=levels.high, low=levels.low)
+                               candles=[self.last_es_candle], high=levels.high, low=levels.low,
+                               level_symbol=symbol, basis=self.basis)
             self.enter(now, "ES_BREAK", fired, strategies=("C",))
 
     def orb_signal(self, now: datetime) -> tuple[str, datetime, str | None] | None:
@@ -750,8 +797,16 @@ class Bot:
 
     # ----------------------------------------------------------------- entry
 
+    def _spx_terms(self, price: float | None, symbol: str | None) -> float | None:
+        """`price` (a level or a break close built on `symbol`'s candles) in SPX points. Only a live-ES setup is in ES terms (about
+        55 points above SPX): converting it needs the SPX-ES basis, which is None until Yahoo's delayed ES has the session's first
+        bar (about 09:40) -- then None is returned and the caller must not compare the price with an SPX quote."""
+        if price is None or symbol != config.ES_SYMBOL:
+            return price
+        return None if self.basis is None else price + self.basis
+
     def dispatch_entry(self, now: datetime, setup: str, direction: str, kind: str | None,
-                       break_close: float) -> None:
+                       break_close: float | None) -> None:
         """Route a fired signal to enter() now, except a MOMENTUM signal is split per strategy: any
         strategy with MOMENTUM_CONFIRM_ENABLED waits for 1-minute follow-through (see PendingMomentum)
         while the rest enter immediately, exactly as before."""
@@ -772,6 +827,11 @@ class Bot:
 
         confirm = tuple(s for s in strategy.spx_strategies() if wants_confirmation(s))
         immediate = tuple(s for s in strategy.spx_strategies() if s not in confirm)
+        if confirm and break_close is None:      # a live-ES break level whose SPX equivalent is not known yet
+            for s in confirm:
+                self.signal_skipped(now, s, setup, direction, kind,
+                                    "MOMENTUM_BASIS_UNKNOWN the break level is in ES terms and the SPX-ES basis is not known yet")
+            confirm = ()
         if immediate:
             self.enter(now, setup, direction, kind, strategies=immediate)
         if confirm:
@@ -854,17 +914,24 @@ class Bot:
             if last is not None and now - last < timedelta(minutes=config.REENTRY_PAUSE_MIN):
                 continue
             self.last_continuation_check[setup] = now
+            # 2026-10-08: an ON_BREAK setup built on live ES keeps its break close in ES points (~55 above SPX); it is compared
+            # with the SPX spot here, so it is converted first -- uncorrected, a bearish break "continued" at any price and a
+            # bullish one never did. No basis yet: skip this round (the pause timer already ran).
+            break_close = self._spx_terms(setup_obj.break_close, self.on_setup_symbol if setup == "ON_BREAK" else None)
+            if break_close is None:
+                log.debug("[%s] continuation check skipped: break level is in ES terms and the SPX-ES basis is not known yet", setup)
+                continue
             spot = self.broker.get_spot(config.UNDERLYING)
             sign = 1.0 if setup_obj.direction == strategy.BULLISH else -1.0
-            beat = sign * (spot - setup_obj.break_close)
+            beat = sign * (spot - break_close)
             if beat < config.MOMENTUM_CONFIRM_MARGIN:
                 log.debug("[%s] continuation check: spot %.2f vs break %.2f (%+.2f) -- move has stalled, no re-entry",
-                          setup, spot, setup_obj.break_close, beat)
+                          setup, spot, break_close, beat)
                 continue
             log.info("[%s] CONTINUATION re-entry for %s (%s): spot %.2f beats %.2f by %+.2f",
-                     setup, setup_obj.direction, "/".join(eligible), spot, setup_obj.break_close, beat)
+                     setup, setup_obj.direction, "/".join(eligible), spot, break_close, beat)
             self.journal.event("CONTINUATION_REENTRY", now, setup=setup, direction=setup_obj.direction,
-                               break_close=setup_obj.break_close, spot=spot, strategies=list(eligible))
+                               break_close=break_close, spot=spot, strategies=list(eligible))
             self.enter(now, setup, setup_obj.direction, "MOMENTUM", strategies=eligible, source="CONTINUATION")
 
     def check_mean_reversion_entry(self, now: datetime, ph: Phase) -> None:
@@ -1043,11 +1110,10 @@ class Bot:
         # "their" slice of what the broker sees as one combined position breaks its position_intent
         # inference on close ("inferred: buy_to_open, specified: buy_to_close"), leaving the position
         # stuck open after CLOSE_MAX_RETRIES. Refuse the second entry outright rather than risk that.
-        collision = next((s for s, p in self.pm.positions.items()
-                          if p.root == config.OPTION_ROOT and p.right == right and p.short_strike == short_strike
-                          and p.long_strike == long_strike and p.expiration == self.today), None)
+        # 2026-10-08: any SHARED strike counts, not only the identical pair (see PositionManager.find_collision)
+        collision = self.pm.find_collision(config.OPTION_ROOT, self.today, right, short_strike, long_strike)
         if collision:
-            reason = f"STRIKE_COLLISION {short_strike:g}/{long_strike:g}{right} already open under {collision}"
+            reason = self.pm.collision_reason(collision, right, short_strike, long_strike)
             log.info("[%s] ENTRY REJECTED %s %s: %s", strat, direction, right, reason)
             self.journal.event("ENTRY_REJECTED", now, strategy=strat, setup=setup, direction=direction,
                                right=right, short=short_strike, long=long_strike, reason=reason, quote=quote)
@@ -1087,6 +1153,14 @@ class Bot:
 
     def work_entry(self, order: dict, start_limit: float, floor_limit: float, step: float | None = None,
                    wait_sec: float | None = None, timeout_sec: float | None = None) -> dict:
+        """Work a resting credit order down toward floor_limit (see _work_entry); remembers when the loop was released."""
+        try:
+            return self._work_entry(order, start_limit, floor_limit, step, wait_sec, timeout_sec)
+        finally:
+            self._entry_wait_end = now_et()
+
+    def _work_entry(self, order: dict, start_limit: float, floor_limit: float, step: float | None = None,
+                    wait_sec: float | None = None, timeout_sec: float | None = None) -> dict:
         """Work a resting credit order down toward floor_limit. The SPX strategies use the config
         defaults; F passes its own width-scaled step and a shorter wait/timeout."""
         if order.get("status") == "dry_run":
@@ -1316,6 +1390,17 @@ class Bot:
             return [f"Schwab token: status unavailable ({e})"]
         return [f"Schwab token: {st['state']} -- {st['message']}"]
 
+    @staticmethod
+    def _live_es_report_line() -> str:
+        try:
+            usable, reason = market_data.live_es_status()
+        except Exception as e:      # noqa: BLE001 -- a report line must never stop the bot from starting
+            return f"Live ES (Schwab /ES): status unavailable ({type(e).__name__})"
+        if usable:
+            return f"Live ES (Schwab /ES): ON -- {reason}; breakouts are confirmed on ES candles"
+        return (f"Live ES (Schwab /ES): OFF -- {reason}; breakouts are confirmed on SPX candles against ES levels shifted by "
+                f"the SPX-ES basis (Yahoo ES=F, ~10 min delayed)")
+
     def report_start(self, now: datetime, acct: dict, positions: list[dict]) -> None:
         pnl = self.broker.get_pnl_summary()
         t = tier(acct["equity"])
@@ -1340,6 +1425,7 @@ class Bot:
             *(self.f.report_lines() if self.f is not None else []),
             f"Phase: {strategy.phase(now)}   News day: {strategy.is_news_day(now.date())} "
             f"(mode {config.NEWS_DAY_MODE})   Level source: {config.BREAKOUT_LEVEL_SOURCE}",
+            self._live_es_report_line(),
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
                 f"| {k}: trades {s.trades_today} losses-in-a-row {s.consecutive_losses} P/L {fmt_money(s.realized_pnl)}"
                 for k, s in day.strategies.items()),
@@ -1467,6 +1553,15 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging()
     install_signal_handlers()
+    if getattr(config, "SINGLE_INSTANCE_LOCK", True):
+        ok, holder = instance_lock.acquire(LOG_DIR, f"0dte_{config.TRADER_NAME.lower()}")
+        if not ok:
+            log.critical("%s is already running (%s): refusing to start a second copy against the same account. Close the other "
+                         "window first (or set SINGLE_INSTANCE_LOCK = False in config.py).", config.TRADER_NAME, holder,
+                         extra={"keep": True})
+            sys.exit(2)
+        if holder:
+            log.warning("Single-instance lock NOT enforced: %s", holder, extra={"keep": True})
     bot = Bot(dry_run=args.dry_run or config.DRY_RUN, once=args.once)
     try:
         bot.start()

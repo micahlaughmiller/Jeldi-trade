@@ -199,6 +199,7 @@ class StockOrbTrader:
         self.next_check: datetime | None = None          # _monitor pacing (watch list + open roots)
         self._candles_due: datetime | None = None        # refresh_candles pacing (open roots only)
         self.pending: list[StockSignal] = []
+        self._waiting_on: str | None = None           # the transient entry block the pending signals are waiting out (logged once)
         self.entries_by_ticker: dict[str, int] = {}
         self.errors = 0
         self._scan_future: Future | None = None
@@ -582,8 +583,14 @@ class StockOrbTrader:
     # ------------------------------------------------------------------ confirmation
 
     def _confirm_and_queue(self, sig: StockSignal, now: datetime) -> None:
-        if sig.key in self.bot.acted or any(p.symbol == sig.symbol for p in self.pending):
+        if sig.key in self.bot.acted:
             return
+        same = [p for p in self.pending if p.symbol == sig.symbol]
+        if any(p.key == sig.key for p in same):
+            return
+        for old in same:       # a signal waiting out a block (see _drain_pending) is replaced by the newer break on its ticker
+            self.pending.remove(old)
+            self._skip(now, old, f"SUPERSEDED by the {sig.kind} break of {sig.candle_time.strftime('%H:%M')}")
         log.info("SIGNAL STOCK_ORB %s %s (%s) on %dm candle %s vs OR %.2f/%.2f (scanner %s, rank %d)",
                  sig.symbol, sig.direction, sig.kind, sig.candle_minutes, sig.candle_time.strftime("%H:%M"),
                  sig.or_high, sig.or_low, sig.scanner_direction, sig.rank)
@@ -649,8 +656,25 @@ class StockOrbTrader:
             if now > sig.candle_end + ttl:
                 self.pending.remove(sig)
                 self._skip(now, sig, "SIGNAL_EXPIRED")
-        if not self.pending or self.bot.news_blackout_active(now):
+        if not self.pending:
+            self._waiting_on = None
             return
+        if self.bot.news_blackout_active(now):
+            return
+        # 2026-10-08: a block that clears by itself (the 2-open cap with B and another strategy holding the slots, a failing
+        # close, stale prices) keeps the confirmed signals pending until it clears or they expire (F_SIGNAL_TTL_MIN); they used
+        # to be taken off the list and written off as acted the moment they met it.
+        block = self.bot.risk.transient_block(open_total=self.bot.pm.open_total_count(),
+                                              close_blocked=self.bot.pm.any_close_blocked(), halt=self.bot.entry_halt_reason())
+        if block:
+            if block != self._waiting_on:
+                self._waiting_on = block
+                log.info("[F] %d confirmed signal(s) waiting: %s (they expire after %d min)", len(self.pending), block,
+                         config.F_SIGNAL_TTL_MIN)
+                self.bot.journal.event("F_WAITING", now, strategy=STRATEGY, reason=block,
+                                       tickers=[s.symbol for s in self.pending])
+            return
+        self._waiting_on = None
         cap = limit(STRATEGY, "MAX_CONCURRENT_POSITIONS", config.MAX_CONCURRENT_POSITIONS)
         for sig in list(self.pending):
             if self.bot.pm.has_root(sig.symbol):
@@ -741,7 +765,7 @@ class StockOrbTrader:
                                           f"{quote.ask_side - quote.bid_side:.2f} vs stop {stop_distance:.2f})", quote)
         collision = bot.pm.find_collision(sym, exp, right, short, long)
         if collision:
-            return self._reject(now, sig, f"STRIKE_COLLISION {short:g}/{long:g}{right} already open under {collision}", quote)
+            return self._reject(now, sig, bot.pm.collision_reason(collision, right, short, long), quote)
         open_risk = bot.pm.total_open_risk()
         qty = contracts_for(equity, width, quote.mid, open_risk, strategy.is_news_day(now.date()),
                             half_size=config.F_HALF_SIZE)

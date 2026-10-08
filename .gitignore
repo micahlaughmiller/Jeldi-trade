@@ -19,3 +19,6 @@ venv/
 .pytest_cache/
 .vscode/
 .idea/
+
+# shared market-data snapshots written by the bots at runtime
+shared_data/

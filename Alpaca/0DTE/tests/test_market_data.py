@@ -464,6 +464,7 @@ def test_get_spx_candles_via_alpaca_returns_none_on_network_failure(monkeypatch)
 
 
 def test_get_candles_tries_alpaca_first_then_falls_back_to_yfinance_for_spx(monkeypatch):
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "spy")      # these cover the older Alpaca-SPY path (rollback source)
     monkeypatch.setattr(market_data, "get_spx_candles_via_alpaca", lambda *a, **k: None)
     called = []
     monkeypatch.setattr(market_data, "_download", lambda *a, **k: called.append(a) or market_data._normalize(None))
@@ -472,6 +473,7 @@ def test_get_candles_tries_alpaca_first_then_falls_back_to_yfinance_for_spx(monk
 
 
 def test_get_candles_uses_alpaca_result_when_available_and_skips_yfinance(monkeypatch):
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "spy")      # these cover the older Alpaca-SPY path (rollback source)
     idx = pd.date_range("2026-10-01 09:00", periods=3, freq="5min", tz=config.ET)
     live = pd.DataFrame({"open": [1.0] * 3, "high": [1.0] * 3, "low": [1.0] * 3,
                         "close": [1.0] * 3, "volume": [1] * 3}, index=idx)

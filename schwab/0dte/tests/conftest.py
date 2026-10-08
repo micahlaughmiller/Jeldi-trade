@@ -40,6 +40,13 @@ def _pin_total_trade_cap_off(request, monkeypatch):
         monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
 
 
+@pytest.fixture(autouse=True)
+def _no_shared_snapshots(request, monkeypatch):
+    """Unit tests never touch the shared snapshot directory (shared_cache.py); test_shared_cache / test_data_consistency opt in."""
+    if request.module.__name__ not in ("test_shared_cache", "test_data_consistency"):
+        monkeypatch.setattr(config, "SHARED_DATA_ENABLED", False)
+
+
 @pytest.fixture
 def wind_down_times(monkeypatch):
     """The session end before the 2026-10-05 hard stop (last entry 15:00, force close 15:30), for the tests that

@@ -14,6 +14,7 @@ import requests
 import yfinance as yf
 
 import config
+import shared_cache
 from strategy import Levels, at_time
 
 log = logging.getLogger(__name__)
@@ -336,8 +337,43 @@ def _report_feed_health(feed_key: tuple, healthy: bool, err: Exception | None) -
     state["healthy"] = healthy
 
 
+_MINUTE_INTERVALS = {"1m", "2m", "5m"}
+
+
+def _in_session(wall_now: float) -> bool:
+    t = datetime.fromtimestamp(wall_now, tz=config.ET)
+    return t.weekday() < 5 and config.MARKET_OPEN <= t.time() < config.MARKET_CLOSE
+
+
+def _fresh(fetched_wall: float, interval: str, wall_now: float | None = None, df: pd.DataFrame | None = None,
+           prepost: bool = False) -> bool:
+    """Is a snapshot fetched at `fetched_wall` (epoch s) still usable? Within DATA_CACHE_SEC, and -- for minute-bar data -- not
+    fetched before the current minute's boundary + CANDLE_SETTLE_SEC once that moment has passed, so the bar that just closed
+    is picked up within a couple of seconds instead of up to DATA_CACHE_SEC later. If that bar is STILL missing from a regular-
+    hours snapshot (Yahoo publishes it a few seconds late) the snapshot is re-downloaded every CANDLE_RETRY_SEC until it arrives."""
+    wall_now = _time.time() if wall_now is None else wall_now
+    if wall_now - fetched_wall >= config.DATA_CACHE_SEC:
+        return False
+    if interval in _MINUTE_INTERVALS:
+        settle = float(getattr(config, "CANDLE_SETTLE_SEC", 2.0))
+        boundary = (wall_now // 60) * 60 + settle
+        if wall_now >= boundary and fetched_wall < boundary:
+            return False
+        if (df is not None and not df.empty and not prepost and wall_now >= boundary and _in_session(wall_now - 60)
+                and wall_now - fetched_wall >= float(getattr(config, "CANDLE_RETRY_SEC", 3.0))):
+            expected_end = datetime.fromtimestamp((wall_now // 60) * 60, tz=config.ET)       # the minute that just closed ends here
+            if df.index[-1] + timedelta(minutes=1) < expected_end:
+                return False
+    return True
+
+
 def _download(symbol: str, period: str, interval: str, prepost: bool) -> pd.DataFrame:
-    """2026-10-01: yfinance can come back EMPTY with no exception raised at all (Yahoo throttling/
+    return _download_snapshot(symbol, period, interval, prepost)[0]
+
+
+def _download_snapshot(symbol: str, period: str, interval: str, prepost: bool) -> tuple[pd.DataFrame, float]:
+    """(frame, fetched_at epoch seconds). Three layers: this process's memory cache, the snapshot file shared by every process in
+    the folder (shared_cache.py: one fetch for all personas), then Yahoo itself. 2026-10-01: yfinance can come back EMPTY with no exception raised at all (Yahoo throttling/
     outage -- yfinance prints its own "possibly delisted" message internally, which is not the same
     as a Python exception reaching us), so a plain try/except around yf.download() is not enough to
     detect a dead feed -- see config.py's DATA_DOWNLOAD_RETRIES section for the real incident this
@@ -347,26 +383,37 @@ def _download(symbol: str, period: str, interval: str, prepost: bool) -> pd.Data
     """
     key = (symbol, period, interval, prepost)
     hit = _CACHE.get(key)
-    if hit and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC:
-        return hit[1]
-    raw, last_err = None, None
-    for attempt in range(1, config.DATA_DOWNLOAD_RETRIES + 1):
-        try:
-            raw = yf.download(symbol, period=period, interval=interval, prepost=prepost,
-                              auto_adjust=False, progress=False, threads=False)
-        except Exception as e:
-            last_err = e
-            raw = None
-        if raw is not None and not raw.empty:
-            break
-        if attempt < config.DATA_DOWNLOAD_RETRIES:
-            _time.sleep(config.DATA_DOWNLOAD_RETRY_SEC)
-    if raw is None:
-        raw = pd.DataFrame()
-    _report_feed_health((symbol, interval), not raw.empty, last_err)
-    df = _normalize(raw)
-    _CACHE[key] = (_time.monotonic(), df)
-    return df
+    if hit:
+        fetched = hit[2] if len(hit) > 2 else _time.time() - (_time.monotonic() - hit[0])
+        if _time.monotonic() - hit[0] < config.DATA_CACHE_SEC and _fresh(fetched, interval, df=hit[1], prepost=prepost):
+            return hit[1], fetched
+
+    def fetch() -> pd.DataFrame:
+        raw, last_err = None, None
+        for attempt in range(1, config.DATA_DOWNLOAD_RETRIES + 1):
+            try:
+                raw = yf.download(symbol, period=period, interval=interval, prepost=prepost,
+                                  auto_adjust=False, progress=False, threads=False)
+            except Exception as e:
+                last_err = e
+                raw = None
+            if raw is not None and not raw.empty:
+                break
+            if attempt < config.DATA_DOWNLOAD_RETRIES:
+                _time.sleep(config.DATA_DOWNLOAD_RETRY_SEC)
+        if raw is None:
+            raw = pd.DataFrame()
+        _report_feed_health((symbol, interval), not raw.empty, last_err)
+        return _normalize(raw)
+
+    snap = shared_cache.shared_get(f"{symbol}_{period}_{interval}_{int(prepost)}",
+                                   lambda s: _fresh(s["fetched_at"], interval, df=s["df"], prepost=prepost), fetch)
+    if snap is None:                                   # the feed is down and there is nothing to fall back on
+        df, fetched = pd.DataFrame(columns=_COLUMNS), _time.time()
+    else:
+        df, fetched = snap["df"], snap["fetched_at"]
+    _CACHE[key] = (_time.monotonic(), df, fetched)
+    return df, fetched
 
 
 def _normalize(raw: pd.DataFrame) -> pd.DataFrame:
@@ -405,13 +452,14 @@ def get_overnight_levels(now: datetime | None = None) -> Levels | None:
 def get_spx_es_basis(now: datetime | None = None) -> float | None:
     now = _now(now)
     open_dt = at_time(now, config.MARKET_OPEN)
-    spx = _download(config.SPX_SYMBOL, "2d", "1m", False)
+    spx = _spx_1m()[0]
     es = _download(config.ES_SYMBOL, "2d", "1m", True)
     common = spx.index.intersection(es.index)
     common = common[(common >= open_dt) & (common <= now)]
     if common.empty:
         return None
-    t = common[-1]
+    t = common[0]       # 2026-10-08: the FIRST common minute from the open -- the same number for every persona and every
+                        # restart (it used to be the latest common minute at whenever each process happened to ask: 1-3 pt apart)
     return round(float(spx.loc[t, "close"] - es.loc[t, "close"]), 2)
 
 
@@ -422,6 +470,8 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
         live = get_es_candles_live(int(interval.rstrip("m")), lookback_min, now)
         if live is not None and not live.empty:
             return live
+    if symbol == config.SPX_SYMBOL and getattr(config, "SPX_CANDLE_SOURCE", "yahoo") == "yahoo":
+        return get_spx_candles_yahoo(int(interval.rstrip("m")), lookback_min, now)
     if symbol == config.SPX_SYMBOL:
         live = get_spx_candles_via_alpaca(int(interval.rstrip("m")), lookback_min, now)
         if live is not None and not live.empty:
@@ -439,13 +489,53 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
     return df
 
 
+def _spx_1m() -> tuple[pd.DataFrame, float]:
+    """The ONE SPX series: Yahoo ^GSPC 1-minute bars, 5 days (enough for a Monday's multi-session D/E window), shared by every
+    persona. Candles, the opening range, the spot and the basis all read this."""
+    return _download_snapshot(config.SPX_SYMBOL, "5d", "1m", False)
+
+
+def _candles_from_1m(df1: pd.DataFrame, fetched_wall: float, minutes: int, lookback_min: int, now: datetime) -> pd.DataFrame:
+    """Resample 1-minute bars into `minutes`-minute candles that are COMPLETE: every minute bar present, and the snapshot seen
+    at least CANDLE_SETTLE_SEC after the candle's last minute ended (so that bar is final, not still forming). A candle still
+    missing a bar CANDLE_GAP_TOLERANCE_SEC after it ended is accepted anyway (a data gap must not freeze the series)."""
+    if df1.empty:
+        return df1
+    settle = timedelta(seconds=float(getattr(config, "CANDLE_SETTLE_SEC", 2.0)))
+    cutoff = min(now, datetime.fromtimestamp(fetched_wall, tz=config.ET) - settle)
+    bars = df1[df1.index + timedelta(minutes=1) <= cutoff]
+    if bars.empty:
+        return bars
+    if minutes <= 1:
+        return bars[bars.index >= now - timedelta(minutes=lookback_min)]
+    grouped = bars.resample(f"{minutes}min")
+    candles = grouped.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    counts = grouped["close"].count()
+    candles = candles[counts > 0]
+    counts = counts[counts > 0]
+    ends = candles.index + timedelta(minutes=minutes)
+    gap_ok = ends <= cutoff - timedelta(seconds=float(getattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)))
+    keep = (ends <= cutoff) & ((counts.values >= minutes) | gap_ok)
+    candles = candles[keep]
+    return candles[candles.index >= now - timedelta(minutes=lookback_min)]
+
+
+def get_spx_candles_yahoo(minutes: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame:
+    """SPX candles from the single shared Yahoo ^GSPC 1-minute series, complete candles only (see _candles_from_1m)."""
+    now = _now(now)
+    df1, fetched = _spx_1m()
+    return _candles_from_1m(df1, fetched, minutes, lookback_min, now)
+
+
 def get_opening_range(now: datetime | None = None) -> Levels | None:
     now = _now(now)
     start = at_time(now, config.MARKET_OPEN)
     end = start + timedelta(minutes=config.OPENING_RANGE_MINUTES)
     if now < end:
         return None
-    df = _download(config.SPX_SYMBOL, "2d", "1m", False)
+    df, fetched = _spx_1m()
+    if fetched < end.timestamp() + float(getattr(config, "CANDLE_SETTLE_SEC", 2.0)):
+        return None         # the snapshot may still hold the last opening-range minute half-formed: wait for the next one
     window = df[(df.index >= start) & (df.index < end)]
     if window.empty:
         return None
@@ -454,7 +544,7 @@ def get_opening_range(now: datetime | None = None) -> Levels | None:
 
 def get_spot(symbol: str = "^GSPC", now: datetime | None = None) -> float | None:
     now = _now(now)
-    df = _download(symbol, "2d", "1m", symbol == config.ES_SYMBOL)
+    df = _spx_1m()[0] if symbol == config.SPX_SYMBOL else _download(symbol, "2d", "1m", symbol == config.ES_SYMBOL)
     df = df[df.index <= now]
     if df.empty:
         return None

@@ -206,6 +206,23 @@ ORB_CANDLE_INTERVAL = "5m"
 ORB_SETUP_TIMEOUT_CANDLES = 6
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
+# 2026-10-08: ONE index series, shared and complete. Every SPX candle, the opening range, the spot used by the data layer and
+# the SPX-ES basis now come from Yahoo ^GSPC 1-minute bars (candles are resampled from them), downloaded ONCE for all personas
+# into a shared snapshot (shared_cache.py) instead of once per persona, and a candle is emitted only when its LAST 1-minute bar
+# has been seen in a snapshot fetched at least CANDLE_SETTLE_SEC after that bar ended (it used to be emitted at the clock
+# boundary from whatever bars had arrived: the last minute moved a 5-minute close by >= 1 pt in 49% of candles).
+#   SPX_CANDLE_SOURCE "yahoo" (this) | "spy" (the older Alpaca SPY bars x a calibrated ratio, kept for rollback)
+SPX_CANDLE_SOURCE = "yahoo"
+CANDLE_SETTLE_SEC = 2.0
+# While the bar that just closed is still missing from a session snapshot, re-download at most this often (shared by all personas).
+CANDLE_RETRY_SEC = 3.0
+# A candle that is still missing a 1-minute bar this long after it ended is accepted as it is (a data gap must not freeze
+# the series, e.g. for D/E's multi-day EMA/Bollinger window); a younger incomplete candle is withheld.
+CANDLE_GAP_TOLERANCE_SEC = 180
+SHARED_DATA_ENABLED = True
+SHARED_DATA_DIR = "shared_data"      # relative to this folder; every process that runs from it shares the snapshots
+SHARED_LOCK_STALE_SEC = 30
+SHARED_WAIT_SEC = 6
 
 # 2026-10-01: a real live incident -- the SPX opening range broke hard downside at 10:00 ET and every
 # persona stayed completely silent (no entries, no rejections, nothing in the journal). Root cause:

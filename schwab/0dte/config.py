@@ -71,6 +71,25 @@ CLOSE_BLOCK_BACKOFF_SEC = (30, 60, 120, 300)
 # At the hard stop, positions that still will not close keep the bot alive: it retries this often until they are flat or
 # the session ends at MARKET_CLOSE (it used to give up after six passes and exit with the spread still open).
 EOD_CLOSE_RETRY_SEC = 60
+# 2026-10-08: data-failure safety. An open position whose price has not been refreshed for MARK_STALE_ALERT_SEC raises a
+# CRITICAL alert and halts new entries; after MARK_STALE_FLATTEN_SEC it is closed at its last known price (reason
+# STALE_DATA_FLATTEN) rather than left unmanaged -- a dead Schwab token, an Alpaca 429 burst or a Yahoo outage used to leave
+# every stop and the hard stop switched off. F is priced only every F_PRICE_EVERY_SEC, so it gets longer thresholds.
+STALE_MARK_FLATTEN_ENABLED = True
+MARK_STALE_ALERT_SEC = 20
+MARK_STALE_FLATTEN_SEC = 90
+F_MARK_STALE_ALERT_SEC = 60
+F_MARK_STALE_FLATTEN_SEC = 180
+# The "tick before the close" used for the official exit price must be this recent (seconds); older (it predates an outage)
+# and the trigger price is used instead. 0 = no limit.
+PREV_TICK_MAX_AGE_SEC = 300
+# A tick that raises something other than BrokerError no longer ends the process; its traceback is logged at most this often.
+TICK_EXCEPTION_LOG_SEC = 60
+# Schwab sim only: how often the refresh-token age is checked, and the day count at which it starts warning. Entries stop
+# when the token would expire before FORCE_CLOSE_TIME + TOKEN_ENTRY_MARGIN_MIN (see schwab_health.py).
+TOKEN_CHECK_SEC = 60
+TOKEN_WARN_DAYS = 5.0
+TOKEN_ENTRY_MARGIN_MIN = 30
 # 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
 # thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
 # spreads against what the broker actually holds; a position must look wrong on

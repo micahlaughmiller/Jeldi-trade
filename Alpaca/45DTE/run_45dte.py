@@ -51,7 +51,9 @@ def main() -> None:
     except BrokerError as exc:
         log.log_event("STARTUP_ERROR", str(exc))
         print(f"\n{LABEL} BROKER ERROR: {exc}")
-        if "401" in str(exc) or "unauthorized" in str(exc).lower():
+        if getattr(exc, "reauth_command", None):
+            print(f"{LABEL} The Schwab token is missing, expired or rejected. Re-login with:  {exc.reauth_command}")
+        elif "401" in str(exc) or "unauthorized" in str(exc).lower():
             print(f"{LABEL} The broker rejected the API keys. Open the .env file in this folder and check "
                   f"the key/secret values (no quotes, no spaces). If you rotated keys, paste the new ones.")
         else:

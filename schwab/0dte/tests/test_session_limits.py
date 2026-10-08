@@ -121,3 +121,17 @@ def test_entries_are_refused_while_a_close_is_failing():
 
 def test_shipped_close_failure_settings():
     assert tuple(config.CLOSE_BLOCK_BACKOFF_SEC) == (30, 60, 120, 300) and config.EOD_CLOSE_RETRY_SEC == 60
+
+
+def test_shipped_data_failure_settings():
+    assert (config.MARK_STALE_ALERT_SEC, config.MARK_STALE_FLATTEN_SEC) == (20, 90)
+    assert (config.F_MARK_STALE_ALERT_SEC, config.F_MARK_STALE_FLATTEN_SEC) == (60, 180)
+    assert config.STALE_MARK_FLATTEN_ENABLED is True and config.PREV_TICK_MAX_AGE_SEC == 300
+    assert (config.TOKEN_CHECK_SEC, config.TOKEN_WARN_DAYS, config.TOKEN_ENTRY_MARGIN_MIN) == (60, 5.0, 30)
+
+
+def test_a_halt_reason_stops_every_strategy():
+    rm = RiskManager(10_000)
+    for strat in "BCDEF":
+        assert rm.trading_allowed(strat, halt="TOKEN_DEAD (x): new entries halted") == (False, "TOKEN_DEAD (x): new entries halted")
+    assert rm.trading_allowed("B", halt=None)[0] is True

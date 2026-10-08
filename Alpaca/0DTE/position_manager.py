@@ -86,6 +86,10 @@ class OpenSpread:
     # when the next ordinary attempt may be made
     close_fail_count: int = 0
     close_blocked_until: datetime | None = None
+    # 2026-10-08: when a price for this position last arrived (any tick, even one the quote-jump gate then held), and when the
+    # prior tick (prev_price) was taken -- the staleness watchdog and the official-exit-price age limit read these
+    last_mark_at: datetime | None = None
+    prev_price_at: datetime | None = None
 
     @property
     def remaining(self) -> int:
@@ -141,6 +145,8 @@ class OpenSpread:
         d["stuck_since"] = self.stuck_since.isoformat() if self.stuck_since else None
         d["stop_first_at"] = self.stop_first_at.isoformat() if self.stop_first_at else None
         d["close_blocked_until"] = self.close_blocked_until.isoformat() if self.close_blocked_until else None
+        d["last_mark_at"] = self.last_mark_at.isoformat() if self.last_mark_at else None
+        d["prev_price_at"] = self.prev_price_at.isoformat() if self.prev_price_at else None
         return d
 
     @classmethod
@@ -160,6 +166,9 @@ class OpenSpread:
             kw["stop_first_at"] = datetime.fromisoformat(kw["stop_first_at"])
         if kw.get("close_blocked_until"):
             kw["close_blocked_until"] = datetime.fromisoformat(kw["close_blocked_until"])
+        for name in ("last_mark_at", "prev_price_at"):
+            if kw.get(name):
+                kw[name] = datetime.fromisoformat(kw[name])
         return cls(**kw)
 
 
@@ -348,6 +357,7 @@ class PositionManager:
         for key, p in list(self.positions.items()):
             if key not in prices:
                 continue
+            p.last_mark_at = now
             c = (candles_by_key or {}).get(key) if p.strategy in config.STOCK_STRATEGIES else candles
             fills += self._tick_position(p, now, prices[key], c)
         return fills
@@ -495,10 +505,12 @@ class PositionManager:
             self._set_floor(p, now, strategy.exit_setting(p.strategy, "STALE_FLOOR", 0.05), f"STALE_TIMER {timer}m")
 
     def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame | None) -> list[dict]:
+        tick_before_at = p.last_tick_at     # when the price we are about to call "the tick before" was accepted
         spread_price = self._sanitize_quote(p, now, spread_price)
         if spread_price is None:
             return []   # unconfirmed quote jump -- sit this tick out entirely, see _sanitize_quote
         p.prev_price = p.current_price
+        p.prev_price_at = tick_before_at
         p.current_price = spread_price
         if p.worst_price is None or spread_price > p.worst_price:
             p.worst_price = spread_price
@@ -702,6 +714,19 @@ class PositionManager:
         return fills
 
     # ----------------------------------------------- manual-override safety (2026-10-02)
+
+    def mark_age(self, p: OpenSpread, now: datetime) -> float:
+        """Seconds since this position last had a price (its entry counts as the first one)."""
+        ref = p.last_mark_at or p.last_tick_at or p.entry_time
+        return max((now - ref).total_seconds(), 0.0)
+
+    def close_one(self, key: str, now: datetime, reason: str, override_hold: bool = False) -> list[dict]:
+        """Close a single position at its last known price (used by the stale-data watchdog)."""
+        p = self.positions.get(key)
+        if p is None:
+            return []
+        return self._close(p, p.remaining, reason, now, p.current_price, override_hold=override_hold,
+                           retry_latched=True)
 
     def any_close_blocked(self) -> bool:
         """True while any open position has a close that failed on every attempt (new entries are halted meanwhile)."""
@@ -966,6 +991,10 @@ class PositionManager:
         # prior tick), separate from exit_slippage (which is fill vs. THIS tick's decision). None on
         # the very first tick after entry (no prior tick yet) or on a force-close (no tick preceded it).
         prev_price = p.prev_price
+        max_age = getattr(config, "PREV_TICK_MAX_AGE_SEC", 0)
+        if prev_price is not None and max_age and p.prev_price_at is not None \
+                and (now - p.prev_price_at).total_seconds() > max_age:
+            prev_price = None   # 2026-10-08: that tick predates an outage: price the exit at the trigger, not at the pre-outage mark
         prev_tick_pnl = round((p.entry_credit - prev_price) * 100 * fill_qty, 2) if prev_price is not None else None
         prev_tick_jump = round(spread_price - prev_price, 2) if prev_price is not None else None
         # 2026-10-01, revised same day: the bot's OWN official P/L (pnl, realized_pnl -- everything

@@ -161,6 +161,15 @@ MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
 EOD_TIME = "16:05"
 LOOP_SLEEP_SEC = 15
+# 2026-10-08: data-failure safety (the 0DTE bots have the same settings). A position not priced for MARK_STALE_ALERT_SEC raises
+# a CRITICAL alert and halts new entries (no automatic close: the positions are long-dated and their exits rest at the
+# broker). A tick that raises anything but BrokerError no longer ends the process. Schwab sim: the 7-day refresh token's age
+# is checked every TOKEN_CHECK_SEC; entries stop when it would expire before the session ends (+ margin).
+MARK_STALE_ALERT_SEC = 600
+TICK_EXCEPTION_LOG_SEC = 300
+TOKEN_CHECK_SEC = 60
+TOKEN_WARN_DAYS = 5.0
+TOKEN_ENTRY_MARGIN_MIN = 30
 IDLE_LOG_INTERVAL_SEC = 300
 
 MARKET_HOLIDAYS = [

@@ -80,6 +80,11 @@ class PaperBroker:
     def _cfg(self, key: str, default: Any) -> Any:
         return getattr(self.config, key, default)
 
+    def token_status(self, now: datetime | None = None) -> dict:
+        """The wrapped Schwab data broker's token health (a data broker without a token reports OK)."""
+        fn = getattr(self.data, "token_status", None)
+        return fn(now) if fn is not None else {"state": "OK", "message": "no Schwab token in use"}
+
     @staticmethod
     def _pick_logger(log: Any) -> Callable[[str], None]:
         # Strategies pass a plain callable (0DTE: log.info, 45DTE: a lambda); tests pass a Logger.

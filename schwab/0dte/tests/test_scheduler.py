@@ -1335,3 +1335,139 @@ def test_the_account_check_runs_at_startup_and_a_refusal_stops_the_bot(bot, monk
     monkeypatch.setattr(bot.broker, "preflight_account", refuse, raising=False)
     with pytest.raises(AccountNotTradable):
         bot._account_preflight({"equity": 1000.0})
+
+
+# ------------------------------------------------- data-failure safety: stale marks, tick exceptions, token (2026-10-08)
+
+def test_a_tick_that_raises_anything_does_not_end_the_loop(bot, monkeypatch):
+    calls = []
+
+    def boom(now):
+        calls.append(now)
+        if len(calls) < 3:
+            raise ValueError("a non-BrokerError, like an authlib OAuthError")
+        bot.done = True
+    monkeypatch.setattr(bot, "tick", boom)
+    monkeypatch.setattr(scheduler.time, "sleep", lambda s: None)
+    bot.once = False
+    bot.loop()
+    assert len(calls) == 3 and bot.done is True
+    assert [e["type"] for e in events(bot, "TICK_EXCEPTION")] == ["ValueError"]     # logged once per TICK_EXCEPTION_LOG_SEC
+
+
+def _open_both(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A", "B"}
+    for p in bot.pm.positions.values():
+        p.last_mark_at = et(10, 15)
+
+
+def test_a_position_with_no_fresh_price_raises_an_alert_and_halts_entries(bot):
+    _open_both(bot)
+    bot._check_marks(et(10, 15, 10))
+    assert bot._data_stale is False and bot.entry_halt_reason() is None            # 10 s old: fine
+    bot._check_marks(et(10, 15, 25))
+    assert bot._data_stale is True and "DATA_STALE" in bot.entry_halt_reason()
+    assert {e["key"] for e in events(bot, "STALE_MARK")} == {"A", "B"}
+    bot.pm.positions.pop("B")
+    bot.enter(et(10, 15, 26), "ORB", BULLISH)                                        # B's slot is free, but entries are halted
+    assert "B" not in bot.pm.positions
+    assert {r["reason_code"] for r in skipped(bot) if r["strategy"] == "B"} == {"DATA_STALE"}
+    for p in bot.pm.positions.values():
+        p.last_mark_at = et(10, 15, 27)                                              # prices are flowing again
+    bot._check_marks(et(10, 15, 28))
+    assert bot._data_stale is False and bot.entry_halt_reason() is None
+
+
+def test_a_position_stale_for_ninety_seconds_is_flattened_at_its_last_known_price(bot):
+    _open_both(bot)
+    bot._check_marks(et(10, 16, 15))                                                 # 75 s: alert only
+    assert set(bot.pm.positions) == {"A", "B"}
+    bot._check_marks(et(10, 16, 31))                                                 # 91 s: closed
+    assert bot.pm.positions == {}
+    reasons = {e["exit_reason"] for e in events(bot, "EXIT")}
+    assert reasons == {"STALE_DATA_FLATTEN"}
+
+
+def test_the_stale_flatten_respects_a_manual_hold_and_can_be_switched_off(bot, monkeypatch):
+    _open_both(bot)
+    monkeypatch.setattr(config, "STALE_MARK_FLATTEN_ENABLED", False)
+    bot._check_marks(et(10, 20))
+    assert set(bot.pm.positions) == {"A", "B"} and bot._data_stale is True            # alert and halt only
+    monkeypatch.setattr(config, "STALE_MARK_FLATTEN_ENABLED", True)
+    monkeypatch.setattr(bot.pm, "manual_hold", lambda: True)
+    bot._check_marks(et(10, 20, 5))
+    assert set(bot.pm.positions) == {"A", "B"}                                        # the owner said: no closes
+
+
+def test_marks_are_stamped_when_prices_arrive_and_the_watchdog_ignores_a_fresh_position(bot):
+    _open_both(bot)
+    bot.pm.on_tick(et(10, 16), {"A": 3.0, "B": 0.9}, None)
+    assert {p.last_mark_at for p in bot.pm.positions.values()} == {et(10, 16)}
+    bot._check_marks(et(10, 16, 15))
+    assert bot._data_stale is False
+    never_priced = bot.pm.positions["B"]
+    never_priced.last_mark_at, never_priced.last_tick_at, never_priced.entry_time = None, None, et(10, 15)
+    assert bot.pm.mark_age(never_priced, et(10, 16, 30)) == 90.0                      # its entry counts as its first price
+
+
+def test_the_hard_stop_flattens_even_when_every_data_call_fails(bot, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    monkeypatch.setattr(config, "CLOSE_RETRY_SEC", 0)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    from broker import BrokerError
+
+    def dead(*a, **k):
+        raise BrokerError("data feed down")
+    monkeypatch.setattr(bot.broker, "get_spot", dead)
+    monkeypatch.setattr(bot, "spread_prices", dead)
+    assert bot.end_of_day(et(13, 0, 0)) is True and bot.pm.positions == {}          # closed at the last known prices
+
+
+def test_the_staleness_watchdog_runs_even_when_the_tick_raised(bot, monkeypatch):
+    _open_both(bot)
+    monkeypatch.setattr(scheduler, "now_et", lambda: et(10, 17, 5))                  # 125 s after the last price
+    calls = []
+
+    def boom(now):
+        calls.append(now)
+        if len(calls) == 2:
+            bot.done = True
+        raise RuntimeError("tick blew up")
+    monkeypatch.setattr(bot, "tick", boom)
+    monkeypatch.setattr(scheduler.time, "sleep", lambda s: None)
+    bot.once = False
+    bot.loop()
+    assert bot.pm.positions == {}                                                    # 125 s without a price: flattened anyway
+
+
+def test_the_token_check_halts_entries_when_the_token_is_expiring_and_clears_when_fixed(bot, monkeypatch):
+    state = {"state": "EXPIRING", "message": "token is 6.9 days old", "relogin": "cd x && python schwab_login.py --force",
+             "age_days": 6.9, "expires_at": "2026-10-09T10:00:00-04:00"}
+    monkeypatch.setattr(bot.broker, "token_status", lambda now: dict(state), raising=False)
+    bot._token_check(et(9, 31))
+    assert "TOKEN_EXPIRING" in bot.entry_halt_reason()
+    assert events(bot, "TOKEN_STATUS")[-1]["state"] == "EXPIRING"
+    bot.enter(et(9, 32), "ORB", BULLISH)
+    assert bot.pm.positions == {} and {r["reason_code"] for r in skipped(bot)} == {"TOKEN_EXPIRING"}
+    state.update(state="OK", message="token is 0.1 days old")
+    bot._token_check(et(9, 31, 30))                                                  # within TOKEN_CHECK_SEC: not re-read yet
+    assert bot._token_halt is not None
+    bot._token_check(et(9, 32, 5))
+    assert bot._token_halt is None and bot.entry_halt_reason() is None
+
+
+def test_a_token_warning_does_not_halt_entries_and_a_broken_check_never_raises(bot, monkeypatch):
+    monkeypatch.setattr(bot.broker, "token_status", lambda now: {"state": "WARN", "message": "5.2 days old"}, raising=False)
+    bot._token_check(et(9, 31))
+    assert bot.entry_halt_reason() is None
+    monkeypatch.setattr(bot.broker, "token_status", lambda now: 1 / 0, raising=False)
+    bot._token_checked_at = None
+    bot._token_check(et(9, 40))                                                      # swallowed and logged
+
+
+def test_the_start_report_shows_the_token_line_when_the_broker_has_one(bot, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(bot.broker, "token_status", lambda now: {"state": "WARN", "message": "5.2 days old"}, raising=False)
+    bot.report_start(et(9, 25), bot.broker.get_account(), [])
+    assert any("Schwab token: WARN -- 5.2 days old" in r.getMessage() for r in caplog.records)

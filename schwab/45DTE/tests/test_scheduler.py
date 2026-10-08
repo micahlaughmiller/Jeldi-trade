@@ -223,3 +223,82 @@ def test_the_account_check_runs_at_startup_and_a_refusal_propagates(tmp_path, mo
     monkeypatch.setattr(broker, "preflight_account", refuse, raising=False)
     with pytest.raises(BrokerError, match="refusing to trade"):
         scheduler.start_of_day_report()
+
+
+# ------------------------------------------------- data-failure safety (2026-10-08)
+
+def _hold_a_position(clock, broker, om):
+    from test_order_manager import spec
+    oid = om.submit_entry(spec(1.60), 1)
+    broker.fill_order(oid, 1.60)
+    om.poll_entries()
+    return om.positions[0]
+
+
+def test_a_tick_that_raises_anything_does_not_end_the_loop(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        if len(calls) < 3:
+            raise ValueError("not a BrokerError")
+        scheduler.eod_done_for = clock.now.date()
+    monkeypatch.setattr(scheduler, "tick", boom)
+    scheduler.once = True
+    scheduler.run()
+    assert len(calls) == 3
+    events = [json.loads(l) for l in (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()]
+    assert [e["type"] for e in events].count("TICK_EXCEPTION") == 1                 # logged once per TICK_EXCEPTION_LOG_SEC
+
+
+def test_an_unpriced_position_raises_a_stale_alert_and_halts_entries(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    scheduler.start_of_day_report()
+    pos = _hold_a_position(clock, broker, om)
+    pos["price_at"] = (clock.now - timedelta(seconds=300)).isoformat()
+    scheduler._check_marks(clock.now)
+    assert scheduler._data_stale is False and scheduler.entry_halt_reason() is None
+    pos["price_at"] = (clock.now - timedelta(seconds=700)).isoformat()
+    scheduler._check_marks(clock.now)
+    assert scheduler._data_stale is True and "data stale" in scheduler.entry_halt_reason()
+    events = [json.loads(l) for l in (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()]
+    assert any(e["type"] == "STALE_MARK" for e in events)
+    scheduler.try_enter({"broker_symbol": "XYZ"}, clock.now.date())
+    events = [json.loads(l) for l in (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()]
+    assert any("data stale" in str(e) and e["type"] == "RISK_CHECK" for e in events)
+    pos["price_at"] = clock.now.isoformat()                                          # prices flow again
+    scheduler._check_marks(clock.now)
+    assert scheduler.entry_halt_reason() is None
+
+
+def test_the_stale_check_stays_quiet_outside_the_session(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    pos = _hold_a_position(clock, broker, om)
+    pos["price_at"] = (clock.now - timedelta(hours=18)).isoformat()                  # yesterday's close
+    scheduler._check_marks(datetime(2026, 9, 17, 8, 0, tzinfo=ET))
+    assert scheduler._data_stale is False
+
+
+def test_the_token_check_halts_entries_when_expiring_and_clears_when_fixed(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    state = {"state": "DEAD", "message": "token is 8.0 days old", "relogin": "cd 45DTE && python schwab_login.py --force",
+             "age_days": 8.0, "expires_at": "2026-09-16T10:00:00-04:00"}
+    monkeypatch.setattr(broker, "token_status", lambda now: dict(state), raising=False)
+    scheduler.start_of_day_report()                                                  # the start-up check runs unthrottled
+    assert "TOKEN_DEAD" in scheduler.entry_halt_reason()
+    events = [json.loads(l) for l in (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()]
+    assert any(e["type"] == "TOKEN_STATUS" and "re-login" in e["message"] for e in events)
+    state.update(state="OK", message="fresh")
+    scheduler._token_check(clock.now + timedelta(seconds=10))                        # throttled: not re-read yet
+    assert scheduler._token_halt is not None
+    scheduler._token_check(clock.now + timedelta(seconds=90))
+    assert scheduler.entry_halt_reason() is None
+
+
+def test_a_broken_token_check_never_raises_and_brokers_without_one_are_skipped(tmp_path, monkeypatch):
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    scheduler._token_check(clock.now)                                                # the fake has no token_status
+    monkeypatch.setattr(broker, "token_status", lambda now: 1 / 0, raising=False)
+    scheduler._token_check(clock.now + timedelta(minutes=5))
+    assert scheduler.entry_halt_reason() is None

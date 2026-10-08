@@ -486,3 +486,102 @@ def test_order_id_from_location_header():
     resp = _resp(201, headers={"Location": "https://api.schwabapi.com/trader/v1/accounts/HASH0/orders/1004055538123"})
     assert Broker._order_id_from_response(resp) == "1004055538123"
     assert Broker._order_id_from_response(_resp(201)) is None
+
+
+# ------------------------------------------------- token failures are BrokerErrors, fail fast, and heal (2026-10-08)
+
+class _OAuthError(Exception):
+    __module__ = "authlib.integrations.base_client.errors"
+
+
+def test_a_dead_refresh_token_becomes_a_schwab_auth_error_not_a_crash(brk):
+    def refresh_fails(*a, **k):
+        raise _OAuthError("invalid_grant: Refresh token is invalid, expired or revoked")
+    with pytest.raises(broker_mod.SchwabAuthError) as ei:
+        brk._request(refresh_fails)
+    assert isinstance(ei.value, BrokerError) and "re-login" in str(ei.value) and "schwab_login.py --force" in str(ei.value)
+
+
+def test_a_non_json_token_response_is_also_an_auth_failure(brk):
+    def bad_body(*a, **k):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+    with pytest.raises(broker_mod.SchwabAuthError):
+        brk._request(bad_body)
+
+
+def test_http_401_is_an_auth_error_and_other_errors_are_not(brk):
+    with pytest.raises(broker_mod.SchwabAuthError, match="HTTP 401"):
+        brk._request(lambda: _resp(401, {"error": "unauthorized"}))
+    brk._auth_dead_until = 0.0
+    with pytest.raises(BrokerError) as ei:
+        brk._request(lambda: _resp(400, {"error": "bad"}))
+    assert not isinstance(ei.value, broker_mod.SchwabAuthError)
+
+
+def test_an_unexpected_exception_is_a_plain_broker_error(brk):
+    def broken(*a, **k):
+        raise KeyError("some bug")
+    with pytest.raises(BrokerError) as ei:
+        brk._request(broken)
+    assert not isinstance(ei.value, broker_mod.SchwabAuthError) and "KeyError" in str(ei.value)
+
+
+def test_after_an_auth_failure_schwab_is_not_called_again_until_the_probe_window_passes(brk, monkeypatch):
+    calls = []
+
+    def refresh_fails(*a, **k):
+        calls.append(1)
+        raise _OAuthError("invalid_grant")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(broker_mod.time, "monotonic", lambda: clock["t"])
+    with pytest.raises(broker_mod.SchwabAuthError):
+        brk._request(refresh_fails)
+    assert len(calls) == 1
+    for _ in range(5):                                                       # a dead token costs nothing per call now
+        with pytest.raises(broker_mod.SchwabAuthError, match="next attempt in"):
+            brk._request(refresh_fails)
+    assert len(calls) == 1
+    clock["t"] += 61                                                         # probe window over: one real attempt
+    with pytest.raises(broker_mod.SchwabAuthError):
+        brk._request(refresh_fails)
+    assert len(calls) == 2
+
+
+def test_a_successful_call_clears_the_dead_flag(brk, monkeypatch):
+    monkeypatch.setattr(broker_mod.time, "monotonic", lambda: 5000.0)
+    brk._auth_dead_until = 4000.0                                            # already past
+    assert brk._request(lambda: _resp(200, {"ok": 1})).status_code == 200 and brk._auth_dead_until == 0.0
+
+
+def test_a_replaced_token_file_reloads_the_client_without_a_restart(tmp_path, monkeypatch):
+    import json
+    cfg = make_config(tmp_path)
+    monkeypatch.setenv("SCHWAB_APP_KEY", "k")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "s")
+    b = Broker(cfg, dry_run=True, log=logging.getLogger("t"))
+    sb = getattr(b, "data", b)
+    token = tmp_path / "t.json"
+    sb.token_path = token
+    token.write_text(json.dumps({"creation_timestamp": 1_000_000.0, "token": {}}))
+    built = []
+    monkeypatch.setattr(broker_mod, "client_from_token_file", lambda *a, **k: built.append(a) or object())
+    first = sb._get_client()
+    assert sb._get_client() is first and len(built) == 1                     # same login: the client is reused
+    token.write_text(json.dumps({"creation_timestamp": 2_000_000.0, "token": {}}))     # schwab_login.py ran again
+    assert sb._get_client() is not first and len(built) == 2
+
+
+def test_token_status_reads_this_bots_token_and_its_hard_stop(tmp_path, monkeypatch):
+    import json
+    from datetime import timedelta
+    cfg = make_config(tmp_path)
+    b = Broker(cfg, dry_run=True, log=logging.getLogger("t"))
+    sb = getattr(b, "data", b)
+    sb.token_path = tmp_path / "t.json"
+    assert sb.token_status()["state"] == "MISSING"
+    created = datetime.now(broker_mod.ET) - timedelta(days=5, hours=1)
+    sb.token_path.write_text(json.dumps({"creation_timestamp": created.timestamp(), "token": {}}))
+    st = sb.token_status()
+    assert st["state"] in ("WARN", "EXPIRING") and "schwab_login.py --force" in st["relogin"]
+    if hasattr(b, "token_status"):
+        assert b.token_status()["state"] == st["state"]                      # the simulated broker reports its data broker's token

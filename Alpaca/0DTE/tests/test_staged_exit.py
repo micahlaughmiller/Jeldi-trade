@@ -360,3 +360,40 @@ def test_the_latch_survives_a_state_round_trip(pm, broker):
     assert (again.close_fail_count, again.close_blocked_until) == (2, et(10, 7))
     p.close_blocked_until = None
     assert OpenSpread.from_dict(p.to_dict()).close_blocked_until is None
+
+
+# ------------------------------------------------- the "tick before" must not predate an outage (2026-10-08)
+
+def test_a_prior_tick_from_before_an_outage_is_not_used_for_the_official_exit_price(pm, broker):
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    assert tick(pm, et(10, 5, 0), 2.10, flat()) == []                    # last good tick: 2.10
+    assert tick(pm, et(10, 5, 1), 2.12, flat()) == []
+    assert tick(pm, et(10, 40, 0), 2.60, flat()) == []                    # data is back 35 minutes later: the first quote is held ...
+    fills = tick(pm, et(10, 40, 2), 2.60, flat())                         # ... confirmed 2 s later: the stop fires
+    assert fills[0]["exit_reason"] == "STOP_LOSS"
+    assert fills[0]["prev_tick_price"] is None and fills[0]["realistic_exit_price"] == 2.60   # not the 2.12 from before the gap
+
+
+def test_a_fresh_prior_tick_is_still_used(pm, broker):
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    tick(pm, et(10, 5, 0), 2.10, flat())
+    tick(pm, et(10, 5, 1), 2.30, flat())
+    fills = tick(pm, et(10, 5, 2), 2.45, flat())                          # through the 2.40 stop, a jump the gate accepts
+    assert fills[0]["prev_tick_price"] == 2.30 and fills[0]["realistic_exit_price"] == 2.30
+
+
+def test_mark_and_prior_tick_times_survive_a_state_round_trip(pm, broker):
+    p = open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    tick(pm, et(10, 5, 0), 2.10, flat())
+    tick(pm, et(10, 5, 1), 2.12, flat())
+    again = OpenSpread.from_dict(p.to_dict())
+    assert (again.last_mark_at, again.prev_price_at) == (et(10, 5, 1), et(10, 5, 0))
+    assert OpenSpread.from_dict({**p.to_dict(), "last_mark_at": None, "prev_price_at": None}).last_mark_at is None
+
+
+def test_close_one_closes_a_single_position_at_its_last_known_price(pm, broker):
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    open_spread(pm, broker, strategy="C", qty=1, credit=2.00, width=5.0, right="C")
+    rows = pm.close_one("B", et(10, 30), "STALE_DATA_FLATTEN")
+    assert [r["exit_reason"] for r in rows] == ["STALE_DATA_FLATTEN"] and set(pm.positions) == {"C"}
+    assert pm.close_one("B", et(10, 31), "x") == []

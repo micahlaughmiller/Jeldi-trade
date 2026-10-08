@@ -146,6 +146,13 @@ class Bot:
         self._saved_spxw: set[tuple] = set()       # SPXW contracts today's saved state says THIS bot opened
         self._hold_alert_at: datetime | None = None
         self._eod_retry_at: datetime | None = None
+        self._data_stale = False                      # an open position has no fresh price (see _check_marks)
+        self._stale_alert_at: dict[str, datetime] = {}
+        self._token_halt: str | None = None           # Schwab sim: the refresh token is expiring / dead
+        self._token_checked_at: datetime | None = None
+        self._token_warned_at: datetime | None = None
+        self._last_good_spot: float | None = None
+        self._tick_exc_logged: datetime | None = None
         self._f_last_priced: dict[str, float] = {}              # Strategy F chain-mark throttle, per ticker
         self.f: StockOrbTrader | None = None
         if "F" in config.STRATEGIES:
@@ -376,6 +383,72 @@ class Bot:
                 return
             time.sleep(config.TICK_SECONDS)
 
+    def entry_halt_reason(self) -> str | None:
+        """Why no strategy may open a position right now (None = no data/auth reason)."""
+        if self._data_stale:
+            return f"DATA_STALE (an open position has had no fresh price for {config.MARK_STALE_ALERT_SEC}s+: entries halted)"
+        return self._token_halt
+
+    def _check_marks(self, now: datetime) -> None:
+        """Staleness watchdog: an open position that has not been priced for MARK_STALE_ALERT_SEC raises a CRITICAL alert and
+        halts new entries; after MARK_STALE_FLATTEN_SEC it is closed at its last known price. Runs after every tick, including
+        ticks that raised, so a data outage can no longer leave stops and the hard stop switched off."""
+        if not self.pm.positions or strategy.phase(now) not in (Phase.OVERNIGHT_ONLY, Phase.ORB_ONLY, Phase.NO_NEW_ENTRIES):
+            self._data_stale = False
+            return
+        for key in list(self.pm.positions):
+            p = self.pm.positions.get(key)
+            if p is None:
+                continue
+            is_stock = p.strategy in config.STOCK_STRATEGIES
+            alert = config.F_MARK_STALE_ALERT_SEC if is_stock else config.MARK_STALE_ALERT_SEC
+            flatten = config.F_MARK_STALE_FLATTEN_SEC if is_stock else config.MARK_STALE_FLATTEN_SEC
+            age = self.pm.mark_age(p, now)
+            if age < alert:
+                continue
+            last = self._stale_alert_at.get(key)
+            if last is None or (now - last).total_seconds() >= 60:
+                self._stale_alert_at[key] = now
+                log.critical("[%s] STALE DATA: no fresh price for %.0fs (alert %ds, flatten %ds)%s", key, age, alert, flatten,
+                             "" if config.STALE_MARK_FLATTEN_ENABLED else " [flatten disabled]", extra={"keep": True})
+                self.journal.event("STALE_MARK", now, strategy=p.strategy, key=key, age_sec=round(age, 1),
+                                   alert_sec=alert, flatten_sec=flatten)
+            if config.STALE_MARK_FLATTEN_ENABLED and age >= flatten:
+                log.critical("[%s] STALE DATA for %.0fs: closing at the last known price (%.2f)", key, age, p.current_price,
+                             extra={"keep": True})
+                try:
+                    self.record_fills(self.pm.close_one(key, now, "STALE_DATA_FLATTEN"))
+                except BrokerError as e:
+                    log.error("[%s] stale-data flatten failed: %s", key, e)
+        self._data_stale = any(self.pm.mark_age(p, now) >= (config.F_MARK_STALE_ALERT_SEC if p.strategy in config.STOCK_STRATEGIES
+                                                           else config.MARK_STALE_ALERT_SEC)
+                               for p in self.pm.positions.values())
+
+    def _token_check(self, now: datetime) -> None:
+        """Schwab sim only (the broker exposes token_status): warn as the 7-day refresh token ages, refuse new entries when it
+        would expire before the hard stop, and say so loudly so a human re-runs schwab_login.py."""
+        status_fn = getattr(self.broker, "token_status", None)
+        if status_fn is None:
+            return
+        if self._token_checked_at is not None and (now - self._token_checked_at).total_seconds() < config.TOKEN_CHECK_SEC:
+            return
+        self._token_checked_at = now
+        try:
+            st = status_fn(now)
+        except Exception as e:                      # a broken health check must never take the bot down
+            log.error("token check failed: %s", e)
+            return
+        state = st["state"]
+        self._token_halt = None
+        if state in ("EXPIRING", "DEAD", "MISSING"):
+            self._token_halt = f"TOKEN_{state} ({st['message']}): new entries halted"
+        if state != "OK" and (self._token_warned_at is None or (now - self._token_warned_at).total_seconds() >= 900):
+            self._token_warned_at = now
+            level = log.warning if state == "WARN" else log.critical
+            level("SCHWAB TOKEN %s: %s -- re-login: %s", state, st["message"], st.get("relogin", "python schwab_login.py --force"),
+                  extra={"keep": True})
+            self.journal.event("TOKEN_STATUS", now, **{k: v for k, v in st.items() if k in ("state", "age_days", "expires_at", "message")})
+
     def loop(self) -> None:
         while not self.done:
             now = now_et()
@@ -384,6 +457,17 @@ class Bot:
             except BrokerError as e:
                 log.error("Broker error during tick: %s", e)
                 self.journal.event("BROKER_ERROR", now, error=str(e))
+            except Exception as e:      # noqa: BLE001 -- 2026-10-08: nothing but Ctrl+C may end the loop with positions open
+                if self._tick_exc_logged is None or (now - self._tick_exc_logged).total_seconds() >= config.TICK_EXCEPTION_LOG_SEC:
+                    self._tick_exc_logged = now
+                    log.critical("TICK EXCEPTION %s: %s (the bot keeps running)", type(e).__name__, e, exc_info=True,
+                                 extra={"keep": True})
+                    self.journal.event("TICK_EXCEPTION", now, type=type(e).__name__, error=repr(e)[:300])
+            try:
+                self._token_check(now)
+                self._check_marks(now_et())
+            except Exception as e:      # noqa: BLE001 -- the watchdog itself must not be able to kill the loop either
+                log.error("watchdog error: %s: %s", type(e).__name__, e)
             if self.once:
                 log.info("--once: single tick complete.")
                 return
@@ -500,7 +584,8 @@ class Bot:
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
                                                         exempt_open_pnl=exempt_open, open_spx=self.pm.open_spx_count(),
                                                         open_total=self.pm.open_total_count(),
-                                                        close_blocked=self.pm.any_close_blocked())
+                                                        close_blocked=self.pm.any_close_blocked(),
+                                                        halt=self.entry_halt_reason())
             if allowed:
                 return True
             reasons.append(reason)
@@ -862,6 +947,7 @@ class Bot:
                 self.signal_skipped(now, strat, setup, direction, kind, "NO_EXPIRATION no SPXW expiration today", source)
             return
         spot = self.broker.get_spot(config.UNDERLYING)
+        self._last_good_spot = spot
         width = strategy.width_for_tier(tier(equity))
         right = strategy.direction_to_spread(direction)
         em = self.expected_move(spot)
@@ -928,7 +1014,8 @@ class Bot:
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup,
                                                     exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT),
                                                     open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count(),
-                                                    close_blocked=self.pm.any_close_blocked())
+                                                    close_blocked=self.pm.any_close_blocked(),
+                                                    halt=self.entry_halt_reason())
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":
@@ -1143,6 +1230,25 @@ class Bot:
                 log.error("Could not cancel order %s: %s", order["id"], e)
         return cancelled
 
+    def _spot_or_last(self) -> float:
+        """SPX spot for adoption at the hard stop: live if available, else the last good one (a data outage must not stop
+        the flatten)."""
+        try:
+            self._last_good_spot = self.broker.get_spot(config.UNDERLYING)
+        except Exception as e:      # noqa: BLE001
+            log.error("spot unavailable at the hard stop (%s: %s); using the last good one", type(e).__name__, e)
+        return self._last_good_spot or 0.0
+
+    def _prices_or_none(self) -> dict:
+        """Chain prices for the hard-stop close, or {} when the data feed is down: force_close then closes at each position's
+        last known price instead of aborting."""
+        try:
+            return self.spread_prices(force=True)
+        except Exception as e:      # noqa: BLE001
+            log.error("chain prices unavailable at the hard stop (%s: %s); closing at the last known prices",
+                      type(e).__name__, e, extra={"keep": True})
+            return {}
+
     def end_of_day(self, now: datetime) -> bool:
         """The hard stop (FORCE_CLOSE_TIME): cancel orders, close everything, report, and the bot is done -- a
         MANUAL_HOLD file does not delay it unless config.MANUAL_HOLD_DELAYS_FORCE_CLOSE. In that older mode it returns
@@ -1172,9 +1278,9 @@ class Bot:
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):
             legs = self.bot_legs(self.broker.get_positions())
             if legs:
-                self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING))
+                self.pm.adopt_from_broker(legs, now, self._spot_or_last())
             if self.pm.positions:
-                self.record_fills(self.pm.force_close(now, self.spread_prices(force=True), override_hold=override))
+                self.record_fills(self.pm.force_close(now, self._prices_or_none(), override_hold=override))
             legs = self.bot_legs(self.broker.get_positions())
             if not legs and not self.pm.positions:
                 break
@@ -1200,6 +1306,16 @@ class Bot:
 
     # --------------------------------------------------------------- reports
 
+    def _token_report_lines(self, now: datetime) -> list[str]:
+        status_fn = getattr(self.broker, "token_status", None)
+        if status_fn is None:
+            return []
+        try:
+            st = status_fn(now)
+        except Exception as e:      # noqa: BLE001
+            return [f"Schwab token: status unavailable ({e})"]
+        return [f"Schwab token: {st['state']} -- {st['message']}"]
+
     def report_start(self, now: datetime, acct: dict, positions: list[dict]) -> None:
         pnl = self.broker.get_pnl_summary()
         t = tier(acct["equity"])
@@ -1214,6 +1330,7 @@ class Bot:
             f"({'PAPER' if self.broker.is_paper else 'LIVE'}){'  DRY-RUN' if self.broker.dry_run else ''}",
             f"Equity {fmt_money(acct['equity'])}  Cash {fmt_money(acct['cash'])}  "
             f"Options BP {fmt_money(acct['options_buying_power'])}",
+            *self._token_report_lines(now),
             f"P/L  YTD {fmt_money(pnl['ytd'])}  MTD {fmt_money(pnl['mtd'])}  Today {fmt_money(pnl['today'])}",
             f"Open positions: {len(positions)}" + "".join(
                 f"\n   {p['symbol']} qty {p['qty']} avg {p['avg_price']}" for p in positions),
@@ -1357,7 +1474,9 @@ def main() -> None:
         bot.on_interrupt()
     except BrokerError as exc:
         log.error("BROKER ERROR: %s", exc)
-        if "401" in str(exc) or "unauthorized" in str(exc).lower():
+        if getattr(exc, "reauth_command", None):
+            log.error("The Schwab token is missing, expired or rejected. Re-login with:  %s", exc.reauth_command)
+        elif "401" in str(exc) or "unauthorized" in str(exc).lower():
             log.error("The broker rejected the API keys. Open the .env file in this folder and check the "
                       "key/secret values (no quotes, no spaces). If you rotated keys, paste the new ones.")
         else:

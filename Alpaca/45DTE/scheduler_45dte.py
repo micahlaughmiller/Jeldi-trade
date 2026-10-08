@@ -60,6 +60,12 @@ class Scheduler:
         self.equity: float | None = None
         self._skip_logged: set[tuple[date, str]] = set()
         self._cooldown_logged = False   # the manual-close cool-down is reported once per scan, not once per signal
+        self._data_stale = False
+        self._stale_alert_at: dict[str, datetime] = {}
+        self._token_halt: str | None = None
+        self._token_checked_at: datetime | None = None
+        self._token_warned_at: datetime | None = None
+        self._tick_exc_logged: datetime | None = None
         self.orders.on_position_change = self.print_report
 
     # ---------------------------------------------------------------- reports
@@ -78,9 +84,62 @@ class Scheduler:
         result = check(account)
         self.log.log_event("ACCOUNT_CHECK", result["summary"], problems=result["problems"], warnings=result["warnings"])
 
+    def entry_halt_reason(self) -> str | None:
+        """Why no new entry may be placed right now (stale prices on an open position, or the Schwab token expiring)."""
+        if self._data_stale:
+            return f"data stale: an open position has had no fresh price for {self.config.MARK_STALE_ALERT_SEC}s+; entries halted"
+        return self._token_halt
+
+    def _check_marks(self, now: datetime) -> None:
+        """An open position whose price (refresh_price stamps `price_at`) is older than MARK_STALE_ALERT_SEC raises a CRITICAL
+        STALE_MARK event and halts new entries until prices flow again. Only inside the session."""
+        cfg = self.config
+        in_session = is_trading_day(now.date(), cfg) and parse_hhmm(cfg.MARKET_OPEN) <= now.time() < parse_hhmm(cfg.MARKET_CLOSE)
+        stale = False
+        if in_session:
+            for p in self.orders.positions:
+                ref = p.get("price_at") or p.get("opened_at")
+                try:
+                    age = (now - datetime.fromisoformat(str(ref))).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                if age < cfg.MARK_STALE_ALERT_SEC:
+                    continue
+                stale = True
+                last = self._stale_alert_at.get(p["id"])
+                if last is None or (now - last).total_seconds() >= 900:
+                    self._stale_alert_at[p["id"]] = now
+                    self.log.log_event("STALE_MARK", f"{p['broker_symbol']} {p['id']}: no fresh price for {age:.0f}s "
+                                       f"(alert at {cfg.MARK_STALE_ALERT_SEC}s); new entries halted", spread_id=p["id"],
+                                       age_sec=round(age, 1))
+        self._data_stale = stale
+
+    def _token_check(self, now: datetime, force: bool = False) -> None:
+        """Schwab sim only (the broker exposes token_status): see the 0DTE scheduler's _token_check."""
+        status_fn = getattr(self.broker, "token_status", None)
+        if status_fn is None:
+            return
+        if not force and self._token_checked_at is not None \
+                and (now - self._token_checked_at).total_seconds() < self.config.TOKEN_CHECK_SEC:
+            return
+        self._token_checked_at = now
+        try:
+            st = status_fn(now)
+        except Exception as exc:     # noqa: BLE001 -- a broken health check must never take the bot down
+            self.log.log_event("TOKEN_CHECK_ERROR", str(exc))
+            return
+        state = st["state"]
+        self._token_halt = f"TOKEN_{state} ({st['message']}): new entries halted" if state in ("EXPIRING", "DEAD", "MISSING") else None
+        if state != "OK" and (force or self._token_warned_at is None or (now - self._token_warned_at).total_seconds() >= 900):
+            self._token_warned_at = now
+            self.log.log_event("TOKEN_STATUS", f"SCHWAB TOKEN {state}: {st['message']} -- re-login: "
+                               f"{st.get('relogin', 'python schwab_login.py --force')}",
+                               state=state, age_days=st.get("age_days"), expires_at=st.get("expires_at"))
+
     def start_of_day_report(self) -> None:
         account = self.refresh_account()
         self._account_preflight(account)
+        self._token_check(self.now_fn(), force=True)
         self.orders.roll_day(self.equity)
         pnl = self.broker.get_pnl_summary()
         adopt = self.orders.adopt()
@@ -140,6 +199,10 @@ class Scheduler:
         symbol = row["broker_symbol"]
         if self.risk.breaker_tripped:
             self.log.risk_check(symbol, False, 0, "circuit breaker tripped (run with --reset-breaker to clear)")
+            return
+        halt = self.entry_halt_reason()
+        if halt:
+            self.log.risk_check(symbol, False, 0, halt)
             return
         paused_until = self.orders.manual_cooldown_until(self.now_fn())
         if paused_until is not None:
@@ -254,6 +317,18 @@ class Scheduler:
                 self.tick()
             except BrokerError as exc:
                 self.log.log_event("BROKER_ERROR", str(exc))
+            except Exception as exc:     # noqa: BLE001 -- 2026-10-08: nothing but Ctrl+C may end the loop with positions open
+                now = self.now_fn()
+                if self._tick_exc_logged is None or (now - self._tick_exc_logged).total_seconds() >= self.config.TICK_EXCEPTION_LOG_SEC:
+                    self._tick_exc_logged = now
+                    import traceback
+                    self.log.log_event("TICK_EXCEPTION", f"{type(exc).__name__}: {exc} (the bot keeps running)",
+                                       exc_type=type(exc).__name__, traceback=traceback.format_exc()[-1500:])
+            try:
+                self._token_check(self.now_fn())
+                self._check_marks(self.now_fn())
+            except Exception as exc:     # noqa: BLE001
+                self.log.log_event("WATCHDOG_ERROR", f"{type(exc).__name__}: {exc}")
             if self.once and self.eod_done_for == self.now_fn().date():
                 self.log.log_event("ONCE_EXIT", "--once: end-of-day complete, exiting")
                 return

@@ -70,6 +70,11 @@ class BrokerError(Exception):
     pass
 
 
+class AccountNotTradable(BrokerError):
+    """A LIVE account that the bots must not trade (blocked, not active, options level too low, flagged as a pattern day
+    trader). Raised at startup by Broker.preflight_account so the process stops before sending an order."""
+
+
 def occ_symbol(root: str, expiration: date, right: str, strike: float) -> str:
     right = right.upper()[0]
     if right not in ("P", "C"):
@@ -97,6 +102,13 @@ def normalize_status(raw: str | None) -> str:
     if not raw:
         return "unknown"
     return _STATUS_MAP.get(str(raw).lower(), "unknown")
+
+
+def _opt_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _f(value: Any) -> float | None:
@@ -152,7 +164,19 @@ class Broker:
         log_dir = getattr(config_module, "LOG_DIR", None) or "logs"
         self.log_dir = Path(log_dir) if Path(log_dir).is_absolute() else _HERE / log_dir
 
-        self.api_key, self.secret_key, self.trader = self._resolve_keys(config_module)
+        # 2026-10-08: the paper/live flag and the URL must agree (an ALPACA_BASE_URL override used to be able to point a
+        # "paper" run at the live API), and a live run never borrows another persona's keys.
+        flag = getattr(config_module, "PAPER_TRADING", None)
+        if flag is not None and bool(flag) != self.is_paper:
+            raise BrokerError(f"PAPER_TRADING is {'on' if flag else 'off'} but the trading URL {self.base_url} is "
+                              f"{'a paper' if self.is_paper else 'the LIVE'} endpoint: refusing to start")
+        self.api_key, self.secret_key, self.trader = self._resolve_keys(config_module, self.is_paper)
+        configured = (os.getenv("ACTIVE_TRADER") or getattr(config_module, "ACTIVE_TRADER", None) or "ASTRA").upper()
+        if self.trader != configured and self.api_key:
+            self.log(f"WARNING: no API key for {configured}; trading with {self.trader}'s keys (paper only)")
+        generic, own = os.getenv("ALPACA_API_KEY"), getattr(config_module, "ALPACA_API_KEY", None)
+        if generic and own and generic != own:
+            self.log(f"WARNING: the generic ALPACA_API_KEY environment variable overrides the key configured for {configured}")
         if not self.api_key or not self.secret_key:
             raise BrokerError("Alpaca API keys not found (ALPACA_API_KEY/ALPACA_SECRET_KEY or ASTRA_*/CLAUDE_* in .env)")
 
@@ -162,7 +186,7 @@ class Broker:
         self._exp_cache: dict[tuple, tuple[float, dict[date, set[str]]]] = {}
 
     @staticmethod
-    def _resolve_keys(config_module: Any) -> tuple[str | None, str | None, str]:
+    def _resolve_keys(config_module: Any, paper: bool = True) -> tuple[str | None, str | None, str]:
         key = os.getenv("ALPACA_API_KEY") or getattr(config_module, "ALPACA_API_KEY", None)
         sec = os.getenv("ALPACA_SECRET_KEY") or getattr(config_module, "ALPACA_SECRET_KEY", None)
         trader = (os.getenv("ACTIVE_TRADER") or getattr(config_module, "ACTIVE_TRADER", None) or "ASTRA").upper()
@@ -170,6 +194,11 @@ class Broker:
             return key, sec, trader
         if trader == "CLAUDE":
             return os.getenv("CLAUDE_API_KEY"), os.getenv("CLAUDE_API_SECRET"), trader
+        if trader == "ASTRA":
+            return os.getenv("ASTRA_API_KEY"), os.getenv("ASTRA_API_SECRET"), "ASTRA"
+        if not paper:
+            # a blank persona key used to fall through to ASTRA's keys silently: on a live account that trades the wrong account
+            raise BrokerError(f"no API key for {trader}: a LIVE run never falls back to another persona's keys")
         return os.getenv("ASTRA_API_KEY"), os.getenv("ASTRA_API_SECRET"), "ASTRA"
 
     # ------------------------------------------------------------------ HTTP
@@ -231,7 +260,51 @@ class Broker:
             "buying_power": _f(a.get("buying_power")) or 0.0,
             "options_buying_power": _f(a.get("options_buying_power")) or 0.0,
             "account_id": str(a.get("id", "")),
+            # 2026-10-08: account state the bots never looked at (None when the API omits a field)
+            "status": a.get("status"),
+            "trading_blocked": a.get("trading_blocked"),
+            "account_blocked": a.get("account_blocked"),
+            "pattern_day_trader": a.get("pattern_day_trader"),
+            "daytrade_count": _opt_int(a.get("daytrade_count")),
+            "multiplier": a.get("multiplier"),
+            "options_approved_level": _opt_int(a.get("options_approved_level")),
+            "options_trading_level": _opt_int(a.get("options_trading_level")),
         }
+
+    def preflight_account(self, acct: dict) -> dict:
+        """Judge the account state at startup. Returns {"summary", "problems", "warnings"}. On a LIVE account any problem
+        raises AccountNotTradable (the process must not trade it); on paper the same problems come back as warnings only,
+        so paper trading is never stopped by this check."""
+        problems: list[str] = []
+        warnings: list[str] = []
+        status = acct.get("status")
+        level = acct.get("options_trading_level")
+        if level is None:
+            level = acct.get("options_approved_level")
+        equity = float(acct.get("equity") or 0.0)
+        if acct.get("trading_blocked"):
+            problems.append("trading is blocked on this account")
+        if acct.get("account_blocked"):
+            problems.append("the account is blocked")
+        if status is not None and str(status).upper() != "ACTIVE":
+            problems.append(f"the account status is {status}, not ACTIVE")
+        if level is not None and level < 3:
+            problems.append(f"options level {level}: credit spreads need level 3")
+        if acct.get("pattern_day_trader"):
+            problems.append("the account is flagged as a pattern day trader")
+        day_trades = acct.get("daytrade_count")
+        if day_trades is not None and day_trades >= 3 and equity < 25_000:
+            warnings.append(f"{day_trades} day trades in the last 5 business days on an account under $25,000: "
+                            f"the next same-day round trip may be rejected or flag the account")
+        elif equity < 25_000 and not self.is_paper:
+            warnings.append("account under $25,000: check Alpaca's current pattern-day-trader rule, this bot opens and "
+                            "closes spreads the same day")
+        summary = (f"{'PAPER' if self.is_paper else 'LIVE'} account {acct.get('account_id') or '?'}: status {status}, "
+                   f"options level {level}, pattern day trader {acct.get('pattern_day_trader')}, day trades "
+                   f"{day_trades}, trading blocked {acct.get('trading_blocked')}, equity {equity:,.2f}")
+        if problems and not self.is_paper:
+            raise AccountNotTradable(f"refusing to trade: {'; '.join(problems)} ({summary})")
+        return {"summary": summary, "problems": problems, "warnings": warnings}
 
     def get_pnl_summary(self) -> dict:
         now = datetime.now(ET)

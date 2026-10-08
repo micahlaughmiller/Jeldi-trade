@@ -201,3 +201,25 @@ def test_no_cooldown_without_a_manual_close(tmp_path, monkeypatch):
     om.roll_day(scheduler.equity)
     scheduler.try_enter(signal_row(), clock.now.date())
     assert [e["broker_symbol"] for e in om.working_entries] == ["XYZ"] and not risk_checks(tmp_path)
+
+
+def test_the_account_check_runs_at_startup_and_a_refusal_propagates(tmp_path, monkeypatch):
+    import pytest
+    from broker import BrokerError
+    clock, broker, om, scheduler, scans = make(tmp_path, datetime(2026, 9, 17, 10, 7, tzinfo=ET), monkeypatch)
+    scheduler.start_of_day_report()                                         # a broker without the check (the fake): fine
+    monkeypatch.setattr(broker, "preflight_account", lambda a: {"summary": "PAPER account x: ACTIVE", "problems": ["p"],
+                                                                "warnings": ["w"]}, raising=False)
+    scheduler.start_of_day_report()
+    events = [json.loads(l) for l in (tmp_path / "session_2026-09-17.jsonl").read_text().splitlines()]
+    check = [e for e in events if e["type"] == "ACCOUNT_CHECK"]
+    assert len(check) == 1 and check[0]["problems"] == ["p"] and "PAPER account x" in check[0]["message"]
+
+    class Refused(BrokerError):
+        pass
+
+    def refuse(account):
+        raise Refused("refusing to trade: blocked")
+    monkeypatch.setattr(broker, "preflight_account", refuse, raising=False)
+    with pytest.raises(BrokerError, match="refusing to trade"):
+        scheduler.start_of_day_report()

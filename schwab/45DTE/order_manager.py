@@ -919,9 +919,36 @@ class OrderManager:
 
     # -------------------------------------------------------------------- adopt
 
+    def _tracked_leg_symbols(self) -> set[str]:
+        """OCC symbols of both legs of every position already in state: those are this bot's whatever their DTE."""
+        out: set[str] = set()
+        for p in self.state["positions"].values():
+            exp = _exp(p["expiration"])
+            for strike in (p["short_strike"], p["long_strike"]):
+                out.add(self.broker.occ_symbol(p["broker_symbol"], exp, p["right"], strike))
+        return out
+
+    def _adoptable_leg(self, leg: dict[str, Any], tracked: set[str]) -> bool:
+        """An option leg this bot may build a position from: already tracked, or on a universe name that expires more than
+        ADOPT_MIN_DTE days out. Everything else (SPXW, the 0DTE bot's short-dated stock spreads, the owner's own trades)
+        is left alone so the 45DTE exit rules can never touch it."""
+        if leg["symbol"] in tracked:
+            return True
+        exp = leg.get("expiration")
+        if leg["underlying"] not in self.universe or exp is None:
+            return False
+        return (exp - self.now_fn().date()).days > getattr(self.config, "ADOPT_MIN_DTE", 7)
+
     def adopt(self) -> dict[str, Any]:
         """Rebuild spreads from broker legs, match their close orders, flag unpaired legs."""
-        legs = [p for p in self.broker.get_positions() if p["asset_class"] == "option"]
+        all_legs = [p for p in self.broker.get_positions() if p["asset_class"] == "option"]
+        tracked = self._tracked_leg_symbols()
+        legs = [leg for leg in all_legs if self._adoptable_leg(leg, tracked)]
+        if len(legs) != len(all_legs):
+            ignored = [leg["symbol"] for leg in all_legs if not self._adoptable_leg(leg, tracked)]
+            self.log.log_event("FOREIGN_LEGS_IGNORED", f"{len(ignored)} option leg(s) in the account are not this bot's "
+                               f"(not a universe name, or expiring within {getattr(self.config, 'ADOPT_MIN_DTE', 7)} days "
+                               f"and untracked); leaving them alone: {ignored}", symbols=ignored)
         open_orders = self.broker.get_open_orders()
         groups: dict[tuple[str, date, str], list[dict[str, Any]]] = defaultdict(list)
         for leg in legs:
@@ -1051,8 +1078,11 @@ class OrderManager:
             buy = next((l for l in order["legs"] if l["side"] == "buy"), None)
             s = self.broker.parse_occ(sell["symbol"]) if sell else None
             l = self.broker.parse_occ(buy["symbol"]) if buy else None
+            client_id = str(order.get("client_order_id") or (order.get("raw") or {}).get("client_order_id") or "")
             adoptable = (
                 s is not None and l is not None and s["root"] in self.universe
+                and not client_id.startswith("0dte-")     # the 0DTE bot's own entry (an F spread), never this bot's
+                and (s["expiration"] - self.now_fn().date()).days > getattr(self.config, "ADOPT_MIN_DTE", 7)
                 and sell["symbol"] not in held and buy["symbol"] not in held
                 and s["right"] == l["right"] and s["expiration"] == l["expiration"]
                 and any(abs(abs(s["strike"] - l["strike"]) - w) < 1e-6 for w in self.config.SPREAD_WIDTHS)

@@ -16,7 +16,19 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-PAPER_TRADING = os.getenv("ALPACA_PAPER", "true").strip().lower() in ("1", "true", "yes")
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Strict boolean from the environment. Unset or blank gives `default` (paper); anything that is not clearly true or
+    false raises, so a typo can never switch a bot to live trading (it used to: any value but 1/true/yes meant LIVE)."""
+    raw = os.getenv(name)
+    value = (str(default) if raw is None or not raw.strip() else raw).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={raw!r} is not a recognised true/false value (use true or false)")
+
+PAPER_TRADING = _env_flag("ALPACA_PAPER", True)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv(
@@ -67,6 +79,11 @@ DAILY_LOSS_ALERT_PCT = 0.03
 
 PROFIT_TARGET_PCT = 0.50
 EXIT_DTE = 7
+# 2026-10-08: adopt() takes over an untracked option spread only when it is on a universe name AND expires more than this
+# many days out. The account may be shared with the 0DTE bot (SPXW, and its stock-ORB "F" spreads on 0-7 DTE expirations
+# of the same big names): adopting those would put them under this bot's DTE<=EXIT_DTE exit and close them. Positions
+# already in state.json are always kept, whatever their DTE.
+ADOPT_MIN_DTE = 7
 MAX_LOSS_EXIT = True
 # 2026-09-25: motivated by a real trade that reached 0.48 (40% of max profit, entry 0.80, target
 # 0.40 = 50% of max) then reversed straight through entry to 0.95 -- a near-winner that round-

@@ -69,8 +69,18 @@ class Scheduler:
         self.equity = float(account["equity"])
         return account
 
+    def _account_preflight(self, account: dict[str, Any]) -> None:
+        """Log the account's state; on a LIVE account that cannot trade, Broker.preflight_account raises (AccountNotTradable,
+        a BrokerError) before any order is sent. On paper problems are warnings only. Brokers without the check skip it."""
+        check = getattr(self.broker, "preflight_account", None)
+        if check is None:
+            return
+        result = check(account)
+        self.log.log_event("ACCOUNT_CHECK", result["summary"], problems=result["problems"], warnings=result["warnings"])
+
     def start_of_day_report(self) -> None:
         account = self.refresh_account()
+        self._account_preflight(account)
         self.orders.roll_day(self.equity)
         pnl = self.broker.get_pnl_summary()
         adopt = self.orders.adopt()

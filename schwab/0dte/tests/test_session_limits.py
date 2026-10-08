@@ -109,3 +109,15 @@ def test_the_open_cap_is_independent_of_the_daily_trade_counts():
     rm = RiskManager(10_000)
     rm.record_trade("B", 10.0)
     assert rm.trading_allowed("C", open_total=1)[0] is True and rm.trading_allowed("C", open_total=2)[0] is False
+
+
+def test_entries_are_refused_while_a_close_is_failing():
+    rm = RiskManager(10_000)
+    for strat in "BCDEF":
+        ok, reason = rm.trading_allowed(strat, close_blocked=True)
+        assert ok is False and reason.startswith("CLOSE_BLOCKED"), strat
+    assert rm.trading_allowed("B", close_blocked=False)[0] is True
+
+
+def test_shipped_close_failure_settings():
+    assert tuple(config.CLOSE_BLOCK_BACKOFF_SEC) == (30, 60, 120, 300) and config.EOD_CLOSE_RETRY_SEC == 60

@@ -93,6 +93,11 @@ DAILY_LOSS_ALERT_PCT = 0.03
 
 PROFIT_TARGET_PCT = 0.50
 EXIT_DTE = 7
+# 2026-10-08: adopt() takes over an untracked option spread only when it is on a universe name AND expires more than this
+# many days out. The account may be shared with the 0DTE bot (SPXW, and its stock-ORB "F" spreads on 0-7 DTE expirations
+# of the same big names): adopting those would put them under this bot's DTE<=EXIT_DTE exit and close them. Positions
+# already in state.json are always kept, whatever their DTE.
+ADOPT_MIN_DTE = 7
 # 2026-10-02, Schwab only (the user's call after a position was stopped out at max loss with plenty of
 # time left to recover): the ONLY exits are (1) the GTC close at PROFIT_TARGET_PCT of max profit and
 # (2) the tick trail below. No DTE force-close and no max-loss stop -- a position that is under water

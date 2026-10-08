@@ -20,6 +20,12 @@ from strategy import exit_levels as strategy_exit_levels
 TODAY = date(2026, 9, 17)
 
 
+def events(journal, kind):
+    import json
+    rows = [json.loads(line) for path in sorted(journal.dir.glob("events_*.jsonl")) for line in path.read_text().splitlines()]
+    return [r for r in rows if r["event"] == kind]
+
+
 @pytest.fixture
 def broker() -> FakeBroker:
     return FakeBroker(equity=10_000, today=TODAY)
@@ -298,3 +304,59 @@ def test_force_close_continues_past_a_broker_error_in_one_position(pm, broker, m
     monkeypatch.setattr(pm, "_close", boom)
     fills = pm.force_close(et(13, 0), {"B": 2.0, "C": 2.0}, override_hold=True)
     assert [f["strategy"] for f in fills] == ["C"] and set(pm.positions) == {"B"}
+
+
+# ------------------------------------------------- a close that fails on every attempt is latched (2026-10-08)
+
+def test_a_failed_close_pass_is_latched_with_a_backoff_and_halts_entries(pm, broker, journal, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 2)
+    p = open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    broker.close_failures = 99
+    assert tick(pm, et(10, 5, 0), 2.40, flat()) == []                   # stop: the close fails on both attempts
+    assert (p.close_fail_count, p.close_blocked_until) == (1, et(10, 5, 30)) and pm.any_close_blocked() is True
+    assert len(broker.close_calls) == 2
+    assert tick(pm, et(10, 5, 10), 2.45, flat()) == [] and len(broker.close_calls) == 2        # latched: nothing is sent
+    assert [e["fail_count"] for e in events(journal, "CLOSE_BLOCKED")] == [1]
+    assert tick(pm, et(10, 5, 31), 2.45, flat()) == [] and len(broker.close_calls) == 4        # backoff over: one more pass
+    assert (p.close_fail_count, p.close_blocked_until) == (2, et(10, 6, 31))                    # 60 s this time
+    assert [e["fail_count"] for e in events(journal, "CLOSE_BLOCKED")] == [1, 2]
+
+
+def test_the_backoff_grows_and_then_repeats_its_last_step(pm, broker, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    p = open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    broker.close_failures = 99
+    now, waits = et(10, 5, 0), []
+    for _ in range(6):
+        tick(pm, now, 2.40, flat())
+        waits.append(int((p.close_blocked_until - now).total_seconds()))
+        now = p.close_blocked_until
+    assert waits == [30, 60, 120, 300, 300, 300]
+
+
+def test_a_later_successful_close_clears_the_latch(pm, broker, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    p = open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    broker.close_failures = 1
+    assert tick(pm, et(10, 5, 0), 2.40, flat()) == [] and p.close_fail_count == 1
+    fills = tick(pm, et(10, 5, 31), 2.40, flat())
+    assert fills and fills[0]["exit_reason"] == "STOP_LOSS" and pm.positions == {} and pm.any_close_blocked() is False
+
+
+def test_the_hard_stop_and_force_close_ignore_the_latch(pm, broker, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    broker.close_failures = 1
+    tick(pm, et(10, 5, 0), 2.40, flat())
+    assert pm.any_close_blocked() is True
+    rows = pm.force_close(et(10, 5, 5), {"B": 2.4}, override_hold=True)         # 25 s into the backoff, but this is the last resort
+    assert [r["exit_reason"] for r in rows] == ["FORCE_CLOSE"] and pm.positions == {}
+
+
+def test_the_latch_survives_a_state_round_trip(pm, broker):
+    p = open_spread(pm, broker, strategy="B", qty=1, credit=2.00, width=5.0)
+    p.close_fail_count, p.close_blocked_until = 2, et(10, 7)
+    again = OpenSpread.from_dict(p.to_dict())
+    assert (again.close_fail_count, again.close_blocked_until) == (2, et(10, 7))
+    p.close_blocked_until = None
+    assert OpenSpread.from_dict(p.to_dict()).close_blocked_until is None

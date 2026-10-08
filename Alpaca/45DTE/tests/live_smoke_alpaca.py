@@ -67,6 +67,8 @@ def wait_until_open() -> None:
 
 
 b = Broker(CFG, dry_run=False, log=log)
+if not b.is_paper:   # this script cancels EVERY order on the account (cancel_all_orders): never against a live account
+    raise SystemExit("refusing to run: this smoke test is for the PAPER account only")
 print(f"broker={b.name} paper={b.is_paper} trader={b.trader} base={b.base_url} now_ET={datetime.now(ET):%Y-%m-%d %H:%M:%S}")
 today = datetime.now(ET).date()
 

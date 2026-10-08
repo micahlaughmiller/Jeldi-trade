@@ -82,6 +82,10 @@ class OpenSpread:
     sync_obs_count: int = 0
     # 2026-10-07: when the price first sat at/above the stop in the current run (STOP_CONFIRM_TIME_SEC); None when it is below
     stop_first_at: datetime | None = None
+    # 2026-10-08: a close that failed on every attempt (see config.CLOSE_BLOCK_BACKOFF_SEC): how many passes in a row, and
+    # when the next ordinary attempt may be made
+    close_fail_count: int = 0
+    close_blocked_until: datetime | None = None
 
     @property
     def remaining(self) -> int:
@@ -136,6 +140,7 @@ class OpenSpread:
         d["pending_quote_since"] = self.pending_quote_since.isoformat() if self.pending_quote_since else None
         d["stuck_since"] = self.stuck_since.isoformat() if self.stuck_since else None
         d["stop_first_at"] = self.stop_first_at.isoformat() if self.stop_first_at else None
+        d["close_blocked_until"] = self.close_blocked_until.isoformat() if self.close_blocked_until else None
         return d
 
     @classmethod
@@ -153,6 +158,8 @@ class OpenSpread:
             kw["stuck_since"] = datetime.fromisoformat(kw["stuck_since"])
         if kw.get("stop_first_at"):
             kw["stop_first_at"] = datetime.fromisoformat(kw["stop_first_at"])
+        if kw.get("close_blocked_until"):
+            kw["close_blocked_until"] = datetime.fromisoformat(kw["close_blocked_until"])
         return cls(**kw)
 
 
@@ -203,6 +210,7 @@ class PositionManager:
         self.positions: dict[str, OpenSpread] = {}
         self._last_sync: datetime | None = None
         self._hold_logged: datetime | None = None
+        self._latch_logged: dict[str, datetime] = {}
 
     def open(self, spread: OpenSpread) -> str:
         key = self._store(spread)
@@ -686,7 +694,7 @@ class PositionManager:
             price = prices.get(key)
             try:
                 fills += self._close(p, p.remaining, reason, now, price if price is not None else p.current_price,
-                                     override_hold=override_hold)
+                                     override_hold=override_hold, retry_latched=True)
             except BrokerError as e:   # one position's broker error must not stop the others from closing
                 log.critical("[%s] force close hit a broker error: %s -- continuing with the other positions", key, e,
                              extra={"keep": True})
@@ -694,6 +702,10 @@ class PositionManager:
         return fills
 
     # ----------------------------------------------- manual-override safety (2026-10-02)
+
+    def any_close_blocked(self) -> bool:
+        """True while any open position has a close that failed on every attempt (new entries are halted meanwhile)."""
+        return any(p.close_fail_count > 0 for p in self.positions.values())
 
     def open_total_count(self) -> int:
         """Every open position, stock (F) or SPX: what MAX_OPEN_POSITIONS_TOTAL is checked against."""
@@ -859,10 +871,17 @@ class PositionManager:
         return max((abs(leg["qty"]) for leg in legs), default=0)
 
     def _close(self, p: OpenSpread, qty: int, reason: str, now: datetime, spread_price: float,
-               override_hold: bool = False) -> list[dict]:
+               override_hold: bool = False, retry_latched: bool = False) -> list[dict]:
         if qty <= 0:
             return []
         key = self.key_of(p)
+        if not retry_latched and p.close_blocked_until is not None and now < p.close_blocked_until:
+            # a close failed on every attempt a moment ago: wait out the backoff instead of hammering the broker each tick
+            if self._latch_logged.get(key) is None or (now - self._latch_logged[key]).total_seconds() >= 60:
+                self._latch_logged[key] = now
+                log.warning("[%s] close (%s) held back until %s after %d failed pass(es)", key, reason,
+                            p.close_blocked_until.strftime("%H:%M:%S"), p.close_fail_count, extra={"keep": True})
+            return []
         if self.manual_hold() and not override_hold:
             if self._hold_logged is None or (now - self._hold_logged).total_seconds() >= 60:
                 self._hold_logged = now
@@ -924,7 +943,17 @@ class PositionManager:
         else:
             log.critical("[%s] CLOSE_FAILED: %s legs still open after %d attempts -- MANUAL ACTION REQUIRED",
                          key, p.root, config.CLOSE_MAX_RETRIES)
+            p.close_fail_count += 1
+            backoff = tuple(config.CLOSE_BLOCK_BACKOFF_SEC) or (60,)
+            delay = backoff[min(p.close_fail_count, len(backoff)) - 1]
+            p.close_blocked_until = now + timedelta(seconds=delay)
+            self.journal.event("CLOSE_BLOCKED", now, strategy=p.strategy, key=key, fail_count=p.close_fail_count,
+                               retry_at=p.close_blocked_until, backoff_sec=delay, reason=reason)
+            log.critical("[%s] close latched for %ds (pass %d): new entries are halted until it closes", key, delay,
+                         p.close_fail_count, extra={"keep": True})
             return pre_rows
+        p.close_fail_count = 0           # the close went through (fully or in part): clear the latch
+        p.close_blocked_until = None
         exit_price = order.get("filled_avg_price") if order else None
         exit_price = float(exit_price) if exit_price is not None else spread_price
         fill_qty = p.remaining - left

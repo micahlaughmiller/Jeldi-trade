@@ -25,7 +25,8 @@ BROKER_SPECIFIC = {
 }
 BROKER_SPECIFIC_TESTS = {"test_broker_alpaca.py", "test_broker_schwab.py", "live_smoke_alpaca.py",
                          "test_alpaca_exit_rules.py", "test_schwab_exit_rules.py",
-                         "test_alpaca_adoption_rules.py", "test_schwab_adoption_rules.py"}
+                         "test_alpaca_adoption_rules.py", "test_schwab_adoption_rules.py",
+                         "test_live_guards.py"}
 
 # Deliberate, documented Schwab-vs-Alpaca strategy-config differences:
 # label -> {key: (alpaca value, schwab value, reason)}, values as ast.unparse() prints them. A key only

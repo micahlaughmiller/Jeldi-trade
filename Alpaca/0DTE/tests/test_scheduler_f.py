@@ -403,7 +403,9 @@ def test_force_close_closes_f_with_ab_and_reports_stuck_stock_legs(bot, data, mo
     bot2.pm.open(f_spread("TSLA"))
     bot2.broker.add_spread_position("P", 417.5, 412.5, 1, 1.85, 1.05, EXP, root="TSLA")
     bot2.broker.close_failures = 99
-    bot2.end_of_day(et(15, 30))
+    assert bot2.end_of_day(et(15, 30)) is False        # 2026-10-08: before the session ends the bot stays up and retries
+    assert events(bot2, "EOD_CLOSE_STILL_OPEN")
+    assert bot2.end_of_day(et(16, 1)) is True           # the session is over: report what is left and finish
     assert "F:TSLA" in bot2.pm.positions and len(option_legs(bot2.broker.get_positions(), {"TSLA"})) == 2
     end = events(bot2, "END")[-1]
     assert any("broker still holds option legs" in m and "TSLA" in m for m in end["mismatches"])

@@ -15,6 +15,18 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 ET = ZoneInfo("US/Eastern")
 
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Strict boolean from the environment. Unset or blank gives `default` (paper); anything that is not clearly true or
+    false raises, so a typo can never switch a bot to live trading (it used to: any value but 1/true/yes meant LIVE)."""
+    raw = os.getenv(name)
+    value = (str(default) if raw is None or not raw.strip() else raw).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={raw!r} is not a recognised true/false value (use true or false)")
+
 # The selected persona determines both the Alpaca credentials and the names of
 # all local state/log files. Run one process per persona/account.
 # 2026-10-02: cut from nine personas to these five (CLAUDE, JAMES, SARAH, MARCUS dropped; their
@@ -32,7 +44,7 @@ ALPACA_API_KEY = os.getenv(f"{ACTIVE_TRADER}_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv(f"{ACTIVE_TRADER}_API_SECRET", "").strip()
 TRADER_NAME = ACTIVE_TRADER
 
-PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("1", "true", "yes")
+PAPER_TRADING = _env_flag("PAPER_TRADING", True)
 ALPACA_BASE_URL = os.getenv(
     "ALPACA_BASE_URL",
     "https://paper-api.alpaca.markets" if PAPER_TRADING else "https://api.alpaca.markets",
@@ -53,6 +65,14 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-08: a close that failed on EVERY attempt (a rejection for permissions / buying power / day-trade protection, an
+# outage) is latched: that position is not retried for these many seconds (the n-th failure waits the n-th value, the last
+# one repeats), new entries are halted while any close is latched, and a CRITICAL "MANUAL ACTION REQUIRED" is logged. It used
+# to be retried every tick (6 attempts, 18 HTTP calls) with no pause and no halt.
+CLOSE_BLOCK_BACKOFF_SEC = (30, 60, 120, 300)
+# At the hard stop, positions that still will not close keep the bot alive: it retries this often until they are flat or
+# the session ends at MARKET_CLOSE (it used to give up after six passes and exit with the spread still open).
+EOD_CLOSE_RETRY_SEC = 60
 # 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
 # thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
 # spreads against what the broker actually holds; a position must look wrong on

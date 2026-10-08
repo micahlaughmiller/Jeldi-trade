@@ -145,7 +145,7 @@ class RiskManager:
     def trading_allowed(self, strat: str, equity: float | None = None,
                         now: datetime | None = None, setup: str | None = None,
                         open_count: int = 0, exempt_open_pnl: float = 0.0,
-                        open_spx: int = 0, open_total: int = 0) -> tuple[bool, str]:
+                        open_spx: int = 0, open_total: int = 0, close_blocked: bool = False) -> tuple[bool, str]:
         """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
         the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
         different ORB signal that represented the morning's move continuing into the day) -- if either the
@@ -154,6 +154,8 @@ class RiskManager:
         ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
         (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
         from account equity before the drawdown check so nothing of theirs ever trips the SPX limit."""
+        if close_blocked:
+            return False, "CLOSE_BLOCKED (a close is failing at the broker: new entries are halted)"
         open_cap = getattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
         if open_cap and open_total >= open_cap:
             return False, f"MAX_OPEN_POSITIONS ({open_total}/{open_cap})"

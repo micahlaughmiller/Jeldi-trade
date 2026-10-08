@@ -66,12 +66,21 @@ def set_chain(broker: FakeBroker, short_mid: float, long_mid: float, symbol="XYZ
     ]
 
 
+# The real universe plus the made-up tickers these tests use (adoption is limited to universe names since 2026-10-08).
+TEST_TICKERS = {"ABC", "LONE", "GHOST", "DEF", "FOO", "BAR", "MULTI", "XYZ", "AAA", "BBB", "CCC"}
+
+
+def make_test_universe() -> set[str]:
+    from market_data_handler import load_universe
+    return set(load_universe(config=config_45dte)) | TEST_TICKERS
+
+
 @pytest.fixture
 def env(tmp_path):
     clock = Clock(datetime(2026, 9, 17, 10, 0, tzinfo=ET))
     broker = FakeBroker(now=clock.now)
     log = TradingLogger(tmp_path, now_fn=clock, echo=False)
-    om = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp_path / "state.json")
+    om = OrderManager(broker, log, config_45dte, now_fn=clock, state_path=tmp_path / "state.json", universe=make_test_universe())
     om.roll_day(25_000.0)
     return clock, broker, log, om, tmp_path
 
@@ -1585,3 +1594,63 @@ class TestOfficialExitPrice:
         rows = list((tmp / "trades_2026-09-17.csv").open(newline=""))
         parsed = list(csv.reader(rows))
         assert ",".join(parsed[0]) == old_header and len(parsed) > 1 and all(len(r) == 14 for r in parsed)
+
+
+class TestAdoptOnlyOwnLegs:
+    """2026-10-08: the 45DTE bot may share an account with the 0DTE bot (SPXW, and F's short-dated spreads on the same big names)."""
+
+    def test_an_spxw_spread_is_left_alone(self, env):
+        clock, broker, log, om, tmp = env
+        today = clock.now.date()
+        broker.add_position("SPXW", today, "C", 7800.0, -1, 1.20)
+        broker.add_position("SPXW", today, "C", 7805.0, 1, 0.70)
+        summary = om.adopt()
+        assert summary["adopted"] == 0 and om.positions == [] and om.blocked_symbols == set()
+        events = [json.loads(l) for l in (tmp / "session_2026-09-17.jsonl").read_text().splitlines()]
+        assert any(e["type"] == "FOREIGN_LEGS_IGNORED" for e in events)
+        om.maintain()
+        assert not any(c[0] == "close_spread_at_market" for c in broker.calls)       # nothing to exit, nothing closed
+
+    def test_a_short_dated_spread_on_a_universe_name_is_left_alone(self, env):
+        clock, broker, log, om, tmp = env
+        near = clock.now.date() + timedelta(days=3)                                  # the 0DTE bot's F window (0-7 DTE)
+        broker.add_position("AAPL", near, "P", 95.0, -2, 0.40)
+        broker.add_position("AAPL", near, "P", 94.0, 2, 0.20)
+        om.adopt()
+        assert om.positions == [] and "AAPL" not in om.blocked_symbols
+
+    def test_an_untracked_spread_beyond_the_min_dte_is_still_adopted(self, env):
+        clock, broker, log, om, tmp = env
+        broker.add_position("AAPL", EXP, "P", 95.0, -2, 3.10)
+        broker.add_position("AAPL", EXP, "P", 90.0, 2, 1.50)
+        assert om.adopt()["adopted"] == 1 and om.positions[0]["broker_symbol"] == "AAPL"
+
+    def test_a_tracked_position_is_kept_even_when_it_has_run_into_the_dte_window(self, env):
+        clock, broker, log, om, tmp = env
+        pos = open_position(env, symbol="AAPL")
+        clock.now = datetime(2026, 11, 3, 10, 0, tzinfo=ET)                            # 3 DTE: inside the window
+        om.adopt()
+        assert len(om.positions) == 1 and om.positions[0]["id"] == pos["id"]           # not written off as vanished
+        assert not om.state["closed"]
+
+    def test_a_non_universe_option_is_ignored_and_does_not_block_anything(self, env):
+        clock, broker, log, om, tmp = env
+        broker.add_position("NOTINUNIVERSE", EXP, "P", 20.0, -1, 0.50)
+        om.adopt()
+        assert om.positions == [] and om.blocked_symbols == set()
+
+    def test_the_0dte_bots_working_entry_order_is_not_adopted(self, env):
+        clock, broker, log, om, tmp = env
+        near = clock.now.date() + timedelta(days=3)
+        f_order = broker.place_credit_spread("AAPL", near, "P", 95.0, 90.0, 2, limit_credit=0.60, time_in_force="day")
+        broker.orders[f_order["id"]]["client_order_id"] = "0dte-astra-f-stockorb-aapl-0123456789ab"
+        own = broker.place_credit_spread("AAPL", EXP, "P", 95.0, 90.0, 2, limit_credit=1.55, time_in_force="day")
+        om.adopt()
+        assert [e["order_id"] for e in om.working_entries] == [own["id"]]
+
+    def test_a_short_dated_entry_order_is_not_adopted_even_without_a_tag(self, env):
+        clock, broker, log, om, tmp = env
+        near = clock.now.date() + timedelta(days=2)
+        broker.place_credit_spread("AAPL", near, "P", 95.0, 90.0, 2, limit_credit=0.60, time_in_force="day")
+        om.adopt()
+        assert om.working_entries == []

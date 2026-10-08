@@ -1218,3 +1218,120 @@ def test_two_open_slots_let_both_strategies_in_and_a_closed_slot_frees_up(bot, m
     assert set(bot.pm.positions) == {"A", "B"}
     bot.pm.positions.pop("B")
     assert bot.entry_possible(10_000.0) is True and bot.pm.open_total_count() == 1
+
+
+# ------------------------------------------------- close failures, the hard stop, shared accounts, account check (2026-10-08)
+
+def test_entries_are_halted_while_a_close_is_latched(bot):
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.pm.positions.pop("B")
+    bot.pm.positions["A"].close_fail_count = 1                      # A's close keeps failing at the broker
+    bot.enter(et(10, 25), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A"}                           # B had a free slot but nothing enters
+    assert {r["reason_code"] for r in skipped(bot) if r["strategy"] == "B"} == {"CLOSE_BLOCKED"}
+
+
+def test_the_hard_stop_keeps_the_bot_up_while_a_close_keeps_failing(bot, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 2)
+    monkeypatch.setattr(config, "CLOSE_RETRY_SEC", 0)
+    monkeypatch.setattr(config, "EOD_CLOSE_RETRY_SEC", 60)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.broker.close_failures = 10_000
+    assert bot.end_of_day(et(13, 0, 0)) is False                    # used to return True and exit with both spreads open
+    assert set(bot.pm.positions) == {"A", "B"} and events(bot, "END") == []
+    calls = len(bot.broker.close_calls)
+    assert bot.end_of_day(et(13, 0, 30)) is False and len(bot.broker.close_calls) == calls     # waiting out the 60 s
+    assert bot.end_of_day(et(13, 1, 5)) is False and len(bot.broker.close_calls) > calls       # next pass
+    assert events(bot, "EOD_CLOSE_STILL_OPEN")
+    bot.broker.close_failures = 0
+    assert bot.end_of_day(et(13, 2, 10)) is True and bot.pm.positions == {}                     # flat: finished normally
+    assert events(bot, "END")
+
+
+def test_the_tick_after_the_hard_stop_does_not_finish_the_day_while_positions_are_stuck(bot, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    monkeypatch.setattr(config, "CLOSE_RETRY_SEC", 0)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.broker.close_failures = 10_000
+    bot.tick(et(13, 0, 5))
+    assert bot.done is False and bot.pm.positions
+    bot.broker.close_failures = 0
+    bot.tick(et(13, 2, 5))
+    assert bot.done is True and bot.pm.positions == {}
+
+
+def test_after_the_session_ends_a_stuck_close_is_reported_and_the_bot_finishes(bot, monkeypatch):
+    monkeypatch.setattr(config, "CLOSE_MAX_RETRIES", 1)
+    monkeypatch.setattr(config, "CLOSE_RETRY_SEC", 0)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    bot.broker.close_failures = 10_000
+    assert bot.end_of_day(et(16, 1)) is True
+    assert events(bot, "END")[-1]["mismatches"]
+
+
+def _leg_symbols(legs):
+    return {leg["symbol"] for leg in legs}
+
+
+def test_a_45dte_spread_on_a_tracked_f_ticker_is_not_this_bots_to_close(bot):
+    from datetime import timedelta
+    from test_position_manager import f_spread
+    near, far = TODAY + timedelta(days=2), TODAY + timedelta(days=52)
+    bot.pm.open(f_spread("TSLA"))                                        # F holds TSLA (expiry from f_spread's own date)
+    f_exp = bot.pm.positions["F:TSLA"].expiration
+    bot.broker.add_spread_position("P", 100.0, 99.0, 1, 0.5, 0.32, f_exp, root="TSLA")      # F's legs
+    bot.broker.add_spread_position("P", 300.0, 295.0, 1, 4.0, 2.5, far, root="TSLA")        # the 45DTE bot's, same ticker
+    mine = bot.bot_legs(bot.broker.get_positions())
+    assert {leg["expiration"] for leg in mine if leg["underlying"] == "TSLA" or "TSLA" in leg["symbol"]} == {f_exp}
+    foreign = bot.foreign_legs(bot.broker.get_positions())
+    assert any(leg["expiration"] == far for leg in foreign) and not any(leg["expiration"] == f_exp for leg in foreign)
+
+
+def test_order_is_mine_ignores_the_45dte_bots_resting_orders(bot, monkeypatch):
+    from datetime import timedelta
+    from broker import occ_symbol
+    spx_today = {"legs": [{"symbol": occ_symbol("SPXW", TODAY, "P", 7500.0)}, {"symbol": occ_symbol("SPXW", TODAY, "P", 7495.0)}]}
+    far = TODAY + timedelta(days=52)
+    near = TODAY + timedelta(days=2)
+    gtc_close = {"legs": [{"symbol": occ_symbol("TSLA", far, "P", 300.0)}, {"symbol": occ_symbol("TSLA", far, "P", 295.0)}]}
+    f_order = {"legs": [{"symbol": occ_symbol("TSLA", near, "P", 300.0)}, {"symbol": occ_symbol("TSLA", near, "P", 295.0)}]}
+    assert bot.order_is_mine(spx_today) is True and bot.order_is_mine(gtc_close) is False
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B", "F"))
+    assert bot.order_is_mine(f_order) is True and bot.order_is_mine(f_order, {"AAPL"}) is False
+    assert bot.order_is_mine(gtc_close) is False and bot.order_is_mine({"legs": []}) is False
+    monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
+    assert bot.order_is_mine(f_order) is False                       # F not configured: stock orders are never ours
+
+
+def test_the_end_of_day_report_does_not_count_the_45dte_bots_resting_orders(bot):
+    from datetime import timedelta
+    far = TODAY + timedelta(days=52)
+    bot.broker.get_open_orders = lambda: [{"id": "g1", "status": "new", "symbol": "TSLA", "qty": 1, "limit_price": 0.8,
+                                           "legs": [{"symbol": f"TSLA{far.strftime('%y%m%d')}P00300000"},
+                                                    {"symbol": f"TSLA{far.strftime('%y%m%d')}P00295000"}]}]
+    bot.report_end(et(13, 0, 5))
+    assert events(bot, "END")[-1]["mismatches"] == []                # it used to log a CRITICAL "open orders remain" every day
+
+
+def test_the_account_check_runs_at_startup_and_a_refusal_stops_the_bot(bot, monkeypatch, caplog):
+    from broker import BrokerError
+
+    class AccountNotTradable(BrokerError):           # stands in for the Alpaca broker's exception (Schwab has no such check)
+        pass
+    caplog.set_level("INFO")
+    bot._account_preflight({"equity": 1000.0})                      # a broker without the check (the fake): nothing happens
+    seen = []
+
+    def fine(acct):
+        seen.append(acct)
+        return {"summary": "PAPER account x: status ACTIVE", "problems": ["trading is blocked"], "warnings": ["small account"]}
+    monkeypatch.setattr(bot.broker, "preflight_account", fine, raising=False)
+    bot._account_preflight({"equity": 1000.0})
+    assert seen and any("Account check: PAPER account x" in r.getMessage() for r in caplog.records)
+    assert any("trading is blocked" in r.getMessage() for r in caplog.records)          # on paper a problem is just a warning
+
+    def refuse(acct):
+        raise AccountNotTradable("refusing to trade: blocked")
+    monkeypatch.setattr(bot.broker, "preflight_account", refuse, raising=False)
+    with pytest.raises(AccountNotTradable):
+        bot._account_preflight({"equity": 1000.0})

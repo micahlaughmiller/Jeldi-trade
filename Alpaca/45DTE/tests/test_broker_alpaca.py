@@ -118,7 +118,9 @@ def test_missing_keys_raise(monkeypatch):
 def test_get_account(b):
     b._session.add("GET", "/v2/account", body={"equity": "10123.45", "cash": "9000", "buying_power": "20000", "options_buying_power": "9000", "id": "abc"})
     a = b.get_account()
-    assert a == {"equity": 10123.45, "cash": 9000.0, "buying_power": 20000.0, "options_buying_power": 9000.0, "account_id": "abc"}
+    assert a == {"equity": 10123.45, "cash": 9000.0, "buying_power": 20000.0, "options_buying_power": 9000.0, "account_id": "abc",
+                 "status": None, "trading_blocked": None, "account_blocked": None, "pattern_day_trader": None,
+                 "daytrade_count": None, "multiplier": None, "options_approved_level": None, "options_trading_level": None}
     assert b._session.calls[0]["headers"]["APCA-API-KEY-ID"] == "k"
 
 
@@ -433,3 +435,114 @@ def test_record_daily_equity(b, tmp_path):
     b.record_daily_equity()
     lines = (tmp_path / "equity_history.csv").read_text().strip().splitlines()
     assert lines[0] == "date,equity" and len(lines) == 2 and lines[1].endswith("10500.00")
+
+
+# ------------------------------------------------- account state, live guards and key resolution (2026-10-08)
+
+ACCOUNT_OK = {"equity": "50000", "cash": "50000", "buying_power": "100000", "options_buying_power": "50000", "id": "acct-1",
+              "status": "ACTIVE", "trading_blocked": False, "account_blocked": False, "pattern_day_trader": False,
+              "daytrade_count": "0", "multiplier": "2", "options_approved_level": 3, "options_trading_level": "3"}
+
+
+def live_broker(cfg, monkeypatch, **flags):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    cfg.PAPER_TRADING = False
+    bk = Broker(cfg, dry_run=False, log=lambda m: None)
+    bk._session = FakeSession()
+    return bk
+
+
+def test_get_account_exposes_the_account_state_fields(b):
+    b._session.add("GET", "/v2/account", body=ACCOUNT_OK)
+    a = b.get_account()
+    assert (a["status"], a["trading_blocked"], a["account_blocked"], a["pattern_day_trader"]) == ("ACTIVE", False, False, False)
+    assert (a["daytrade_count"], a["options_approved_level"], a["options_trading_level"], a["multiplier"]) == (0, 3, 3, "2")
+
+
+def test_a_paper_account_with_problems_only_warns(b):
+    acct = {"equity": 1000.0, "status": "ACCOUNT_UPDATED", "trading_blocked": True,
+            "options_trading_level": 1, "pattern_day_trader": True, "account_id": "p"}
+    out = b.preflight_account(acct)                                   # paper: never raises, never stops paper trading
+    assert b.is_paper and len(out["problems"]) == 4 and "PAPER" in out["summary"]
+
+
+def test_a_live_account_that_cannot_trade_is_refused(cfg, monkeypatch):
+    bk = live_broker(cfg, monkeypatch)
+    assert not bk.is_paper
+    good = {"equity": 50_000.0, "status": "ACTIVE", "options_trading_level": 3, "pattern_day_trader": False,
+            "trading_blocked": False, "account_blocked": False, "daytrade_count": 0, "account_id": "x"}
+    assert bk.preflight_account(good)["problems"] == []
+    for change, text in ((dict(trading_blocked=True), "blocked"), (dict(account_blocked=True), "blocked"),
+                         (dict(status="ACCOUNT_CLOSED"), "ACTIVE"), (dict(options_trading_level=2), "level 3"),
+                         (dict(options_trading_level=None, options_approved_level=1), "level 3"),
+                         (dict(pattern_day_trader=True), "pattern day trader")):
+        with pytest.raises(br.AccountNotTradable) as ei:
+            bk.preflight_account({**good, **change})
+        assert text in str(ei.value), change
+
+
+def test_a_live_account_under_25k_gets_a_day_trade_warning_not_a_refusal(cfg, monkeypatch):
+    bk = live_broker(cfg, monkeypatch)
+    acct = {"equity": 1000.0, "status": "ACTIVE", "options_trading_level": 3, "pattern_day_trader": False,
+            "trading_blocked": False, "account_blocked": False, "daytrade_count": 0, "account_id": "x"}
+    out = bk.preflight_account(acct)
+    assert out["problems"] == [] and any("under $25,000" in w for w in out["warnings"])
+    out = bk.preflight_account({**acct, "daytrade_count": 3})
+    assert any("3 day trades" in w for w in out["warnings"])
+    assert bk.preflight_account({**acct, "equity": 60_000.0})["warnings"] == []
+
+
+def test_missing_account_fields_are_not_treated_as_problems(cfg, monkeypatch):
+    bk = live_broker(cfg, monkeypatch)
+    out = bk.preflight_account({"equity": 60_000.0, "account_id": "x"})      # an API that omits every new field
+    assert out["problems"] == []
+
+
+def test_the_paper_flag_and_the_url_must_agree(cfg, monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    cfg.PAPER_TRADING = True                                                 # says paper, URL is the live API
+    with pytest.raises(BrokerError, match="refusing to start"):
+        Broker(cfg, dry_run=False, log=lambda m: None)
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    cfg.PAPER_TRADING = False                                                # says live, URL is paper
+    with pytest.raises(BrokerError, match="refusing to start"):
+        Broker(cfg, dry_run=False, log=lambda m: None)
+    cfg.PAPER_TRADING = True
+    assert Broker(cfg, dry_run=False, log=lambda m: None).is_paper is True
+
+
+def test_a_blank_persona_key_falls_back_to_astra_on_paper_only(cfg, monkeypatch):
+    for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ACTIVE_TRADER", "ARIA")
+    monkeypatch.setenv("ASTRA_API_KEY", "astra-k")
+    monkeypatch.setenv("ASTRA_API_SECRET", "astra-s")
+    assert Broker._resolve_keys(cfg, True) == ("astra-k", "astra-s", "ASTRA")           # paper: legacy fallback kept
+    with pytest.raises(BrokerError, match="never falls back"):
+        Broker._resolve_keys(cfg, False)                                                # live: never another persona's keys
+    monkeypatch.setenv("ACTIVE_TRADER", "ASTRA")
+    assert Broker._resolve_keys(cfg, False) == ("astra-k", "astra-s", "ASTRA")          # ASTRA's own keys are fine live
+    cfg.ALPACA_API_KEY, cfg.ALPACA_SECRET_KEY = "own-k", "own-s"
+    monkeypatch.setenv("ACTIVE_TRADER", "ARIA")
+    assert Broker._resolve_keys(cfg, False) == ("own-k", "own-s", "ARIA")               # the persona's own key wins
+
+
+def test_a_paper_fallback_and_a_generic_key_override_are_called_out(cfg, monkeypatch):
+    messages = []
+    for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ACTIVE_TRADER", "ARIA")
+    monkeypatch.setenv("ASTRA_API_KEY", "astra-k")
+    monkeypatch.setenv("ASTRA_API_SECRET", "astra-s")
+    Broker(cfg, dry_run=False, log=messages.append)
+    assert any("no API key for ARIA; trading with ASTRA's keys" in m for m in messages)
+    messages.clear()
+    cfg.ALPACA_API_KEY, cfg.ALPACA_SECRET_KEY = "own-k", "own-s"
+    monkeypatch.setenv("ALPACA_API_KEY", "generic-k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "generic-s")
+    Broker(cfg, dry_run=False, log=messages.append)
+    assert any("generic ALPACA_API_KEY environment variable overrides" in m for m in messages)

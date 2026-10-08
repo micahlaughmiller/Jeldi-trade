@@ -145,6 +145,7 @@ class Bot:
         self.news_blackout_was_active: bool = False
         self._saved_spxw: set[tuple] = set()       # SPXW contracts today's saved state says THIS bot opened
         self._hold_alert_at: datetime | None = None
+        self._eod_retry_at: datetime | None = None
         self._f_last_priced: dict[str, float] = {}              # Strategy F chain-mark throttle, per ticker
         self.f: StockOrbTrader | None = None
         if "F" in config.STRATEGIES:
@@ -170,7 +171,10 @@ class Bot:
         already tracks, and -- whenever F is configured, whether or not StockOrbTrader built today --
         stock legs inside F's DTE window. Keyed on the persona's config, not on self.f, so a day F fails
         to construct still re-adopts, marks and force-closes the stock spreads it left at the broker."""
-        tracked = {config.OPTION_ROOT} | {p.root for p in self.pm.positions.values()}
+        # 2026-10-08: tracked stock legs are matched by contract, not by root alone -- "root in tracked" also swept up a
+        # 45DTE spread on the same ticker (52 DTE) and force-closed it at the hard stop
+        tracked_legs = {(p.root, p.right, p.expiration, float(k)) for p in self.pm.positions.values()
+                        if p.root != config.OPTION_ROOT for k in (p.short_strike, p.long_strike)}
         f_on = "F" in config.STRATEGIES
 
         def mine(leg: dict) -> bool:
@@ -183,7 +187,9 @@ class Bot:
                 # (tracked now, or in today's saved state) -- unless adopting untracked legs is switched on
                 return config.ADOPT_UNTRACKED_SPXW or \
                     (leg["right"], float(leg["strike"]), leg["expiration"]) in self._known_spxw()
-            return root in tracked or (f_on and self.f_owns_expiration(leg.get("expiration")))
+            if (root, leg["right"], leg.get("expiration"), float(leg["strike"])) in tracked_legs:
+                return True
+            return f_on and self.f_owns_expiration(leg.get("expiration"))
 
         return [leg for leg in option_legs(positions) if mine(leg)]
 
@@ -202,9 +208,21 @@ class Bot:
 
     # ------------------------------------------------------------ lifecycle
 
+    def _account_preflight(self, acct: dict) -> None:
+        """Log the account's state and refuse to go on when a LIVE account cannot trade (Broker.preflight_account raises
+        AccountNotTradable). On paper every problem is only a warning. Brokers without the check (Schwab) skip it."""
+        check = getattr(self.broker, "preflight_account", None)
+        if check is None:
+            return
+        result = check(acct)
+        log.info("Account check: %s", result["summary"], extra={"keep": True})
+        for text in result["warnings"] + result["problems"]:
+            log.warning("Account check: %s", text, extra={"keep": True})
+
     def start(self) -> None:
         now = now_et()
         acct = self.broker.get_account()
+        self._account_preflight(acct)
         saved = self.journal.load_state()
         saved_today = saved if saved and saved.get("date") == self.today.isoformat() else None
         self._saved_spxw = {(d["right"], float(d[k]), date.fromisoformat(d["expiration"]))
@@ -481,7 +499,8 @@ class Bot:
                 continue
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
                                                         exempt_open_pnl=exempt_open, open_spx=self.pm.open_spx_count(),
-                                                        open_total=self.pm.open_total_count())
+                                                        open_total=self.pm.open_total_count(),
+                                                        close_blocked=self.pm.any_close_blocked())
             if allowed:
                 return True
             reasons.append(reason)
@@ -908,7 +927,8 @@ class Bot:
                 return f"skip: DAY_GATE ER={0.0 if day_er is None else day_er:.2f} < {min_er:.2f} (choppy)", 0.0
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup,
                                                     exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT),
-                                                    open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count())
+                                                    open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count(),
+                                                    close_blocked=self.pm.any_close_blocked())
         if not allowed:
             return f"skip: {reason}", 0.0
         if strat == "A":
@@ -1088,30 +1108,33 @@ class Bot:
 
     # ------------------------------------------------------------ end of day
 
+    def order_is_mine(self, order: dict, stock_roots: set[str] | None = None) -> bool:
+        """An open order on contracts this bot trades: SPXW expiring today, or a stock option inside F's DTE window (on a root
+        in `stock_roots`; None = any root while F is configured). Orders on anything else (the 45DTE bot's resting GTC closes,
+        the owner's own orders) are not this bot's. An order whose legs cannot be read is not mine."""
+        legs = order.get("legs") or []
+        if not legs:
+            return False
+        for leg in legs:
+            root, exp = occ_root(leg["symbol"]), occ_expiration(leg["symbol"])
+            if root == config.OPTION_ROOT:
+                ok = exp == self.today
+            else:
+                roots_ok = ("F" in config.STRATEGIES) if stock_roots is None else root in stock_roots
+                ok = roots_ok and exp is not None and self.f_owns_expiration(exp)
+            if not ok:
+                return False
+        return True
+
     def cancel_own_orders(self) -> int:
         """Cancel the open orders on contracts this bot trades (SPXW expiring today, and F's stock options inside
         its DTE window on roots it holds) -- not every order in the account: a Schwab account is shared with the
         45DTE bot's resting GTC closes and with whatever the owner has working by hand in the broker UI. An
         order whose legs we cannot read is left alone."""
         stock_roots = {p.root for p in self.pm.positions.values()}
-
-        def mine(order: dict) -> bool:
-            legs = order.get("legs") or []
-            if not legs:
-                return False
-            for leg in legs:
-                root, exp = occ_root(leg["symbol"]), occ_expiration(leg["symbol"])
-                if root == config.OPTION_ROOT:
-                    ok = exp == self.today
-                else:
-                    ok = root in stock_roots and exp is not None and self.f_owns_expiration(exp)
-                if not ok:
-                    return False
-            return True
-
         cancelled = 0
         for order in self.broker.get_open_orders():
-            if not mine(order):
+            if not self.order_is_mine(order, stock_roots):
                 continue
             try:
                 self.broker.cancel_order(order["id"])
@@ -1125,6 +1148,8 @@ class Bot:
         MANUAL_HOLD file does not delay it unless config.MANUAL_HOLD_DELAYS_FORCE_CLOSE. In that older mode it returns
         False (nothing done) while the file is present and positions are open before the session ends: the bot stays
         up and closes them the moment the file goes."""
+        if self._eod_retry_at is not None and now < self._eod_retry_at:
+            return False        # a close is still failing: the bot stays up, and waits out the backoff between passes
         hold = self.pm.manual_hold()
         if hold and config.MANUAL_HOLD_DELAYS_FORCE_CLOSE and self.pm.positions and now.time() < config.MARKET_CLOSE:
             if self._hold_alert_at is None or (now - self._hold_alert_at).total_seconds() >= 60:
@@ -1156,6 +1181,19 @@ class Bot:
             log.critical("CLOSE_FAILED: option legs still at broker after attempt %d: %s",
                          attempt, [(l["symbol"], l["qty"]) for l in legs])
             time.sleep(config.CLOSE_RETRY_SEC)
+        stuck = self.bot_legs(self.broker.get_positions()) or self.pm.positions
+        if stuck and now.time() < config.MARKET_CLOSE:
+            # 2026-10-08: exiting here left the spread open to expiry (max loss). Stay up and try again until it is flat
+            # or the session ends; every pass is journaled and CRITICAL-logged.
+            self._eod_retry_at = now + timedelta(seconds=config.EOD_CLOSE_RETRY_SEC)
+            log.critical("HARD STOP: %d position(s) still open after %d passes -- MANUAL ACTION REQUIRED. The bot stays up "
+                         "and retries every %ds until flat or %s.", len(self.pm.positions), config.CLOSE_MAX_RETRIES,
+                         config.EOD_CLOSE_RETRY_SEC, config.MARKET_CLOSE.strftime("%H:%M"), extra={"keep": True})
+            self.journal.event("EOD_CLOSE_STILL_OPEN", now, positions=sorted(self.pm.positions),
+                               retry_at=self._eod_retry_at)
+            self.save_state()
+            return False
+        self._eod_retry_at = None
         self.report_end(now_et())
         self.save_state()
         return True
@@ -1197,7 +1235,7 @@ class Bot:
     def report_end(self, now: datetime) -> None:
         acct = self.broker.get_account()
         positions = self.broker.get_positions()
-        orders = self.broker.get_open_orders()
+        orders = [o for o in self.broker.get_open_orders() if self.order_is_mine(o)]   # not the 45DTE bot's GTC closes
         legs = self.bot_legs(positions)
         foreign = self.foreign_legs(positions)
         s = self.risk.state

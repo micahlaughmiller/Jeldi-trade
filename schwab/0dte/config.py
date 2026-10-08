@@ -63,6 +63,14 @@ CLOSE_SLIPPAGE = 0.03
 # watch for MORE "MANUAL ACTION REQUIRED" gives-up events if 12s turns out to be too short in practice.
 CLOSE_RETRY_SEC = 2
 CLOSE_MAX_RETRIES = 6
+# 2026-10-08: a close that failed on EVERY attempt (a rejection for permissions / buying power / day-trade protection, an
+# outage) is latched: that position is not retried for these many seconds (the n-th failure waits the n-th value, the last
+# one repeats), new entries are halted while any close is latched, and a CRITICAL "MANUAL ACTION REQUIRED" is logged. It used
+# to be retried every tick (6 attempts, 18 HTTP calls) with no pause and no halt.
+CLOSE_BLOCK_BACKOFF_SEC = (30, 60, 120, 300)
+# At the hard stop, positions that still will not close keep the bot alive: it retries this often until they are flat or
+# the session ends at MARKET_CLOSE (it used to give up after six passes and exit with the spread still open).
+EOD_CLOSE_RETRY_SEC = 60
 # 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
 # thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
 # spreads against what the broker actually holds; a position must look wrong on

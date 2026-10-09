@@ -14,6 +14,7 @@ import requests
 import yfinance as yf
 
 import config
+import schwab_keeper
 import shared_cache
 from strategy import Levels, at_time
 
@@ -34,13 +35,12 @@ _FEED_STATE: dict[tuple, dict] = {}
 # import error, or API error just returns None, and the caller falls back to the existing yfinance
 # path -- this must never be able to crash the bot over an optional speed upgrade.
 #
-# 2026-10-01: this folder must NEVER be the one to call Schwab's refresh endpoint. Schwab refresh
-# tokens are single-use -- rotate on every call -- and up to 9 Alpaca personas plus the real Schwab
-# trading bot were all sharing ONE token.json, each independently letting schwab-py's OAuth2 client
-# auto-refresh whenever its own copy's access token expired. Any one of those refreshing invalidated
-# every other process's in-memory copy, repeatedly forcing a fresh login on the Schwab bot (which has
-# no fallback for its own primary auth, unlike this optional feature). User's explicit decision: only
-# the Schwab bot may ever refresh. _schwab_read_only_client() below builds a schwab-py Client around a
+# Who refreshes the token (history): 2026-10-01 the rule was "only the Schwab bot may ever refresh" -- up to 9 Alpaca personas plus the
+# Schwab bot all shared ONE token.json and each auto-refreshed its own copy, believed to invalidate the others (single-use rotation).
+# 2026-10-09: with only ASTRA running nothing refreshed it, so live ES lasted ~30 minutes after a login. The two token files in the
+# repo hold byte-identical refresh tokens despite independent refreshes (no rotation), and the owner decided ASTRA refreshes:
+# schwab_keeper.py (a background thread, one process, atomic writes) is now the ONLY refresher while ASTRA runs; THIS module still
+# never refreshes. _schwab_read_only_client() below builds a schwab-py Client around a
 # PLAIN, non-OAuth requests.Session carrying a static Bearer header read directly from the token file
 # -- BaseClient only ever needs session.get(url, params=...) (confirmed by reading the installed
 # schwab-py source directly: schwab.client.base.BaseClient.__init__ takes just an api_key and a
@@ -97,8 +97,7 @@ def _es_token_check():
     if _time.monotonic() < _ES_LIVE["fail_until"]:
         return None, _ES_BACKOFF
     try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        raw = schwab_keeper.read_token_file(token_path, attempts=2)   # tolerant of a write in flight; one short retry, never more
         token = raw["token"]
         access_token = token["access_token"]
         expires_at = float(token["expires_at"])
@@ -107,7 +106,7 @@ def _es_token_check():
     except Exception as e:
         return None, f"token file unreadable ({type(e).__name__})"
     if _time.time() >= expires_at - 30:   # expired, or close enough to expire mid-request -- do NOT refresh
-        return None, "access token expired (only a running Schwab bot refreshes it)"
+        return None, schwab_keeper.expired_reason()
     try:
         from schwab.client import Client
     except Exception:

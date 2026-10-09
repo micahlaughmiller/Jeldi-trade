@@ -23,6 +23,7 @@ import pandas as pd
 import config
 import instance_lock
 import market_data
+import schwab_keeper
 import strategy
 from broker import Broker, BrokerError
 from journal import Journal, format_close_card, format_day_table, format_entry_card
@@ -232,6 +233,7 @@ class Bot:
 
     def start(self) -> None:
         now = now_et()
+        schwab_keeper.start()           # ASTRA owns the Schwab token: a background thread keeps it fresh (a no-op for every other persona)
         acct = self.broker.get_account()
         self._account_preflight(acct)
         saved = self.journal.load_state()
@@ -259,6 +261,7 @@ class Bot:
             self.pm.adopt_from_broker(legs, now, self.broker.get_spot(config.UNDERLYING),
                                       saved_today.get("positions") if saved_today else None)
         self._reconcile_saved_positions(saved_today, positions, now)
+        schwab_keeper.wait_first(8.0)   # the access token is always expired at the morning start: let the first refresh land before the report
         self.report_start(now, acct, positions)
         self.broker.record_daily_equity()
         self.save_state()
@@ -383,6 +386,7 @@ class Bot:
                 self.log_levels("OVERNIGHT(ES)", self.overnight)
             if self.f is not None:
                 self.f.step(now)   # pre-open: only the F_PREWARM_TIME history warm-up can run here
+            self._keeper_events(now)
             if now >= strategy.at_time(now, config.MARKET_OPEN):
                 return
             time.sleep(config.TICK_SECONDS)
@@ -440,6 +444,15 @@ class Bot:
             age = min(age, (now - end).total_seconds())
         return age
 
+    def _keeper_events(self, now: datetime) -> None:
+        """Journal what the token-keeper thread queued (the journal file has no lock, so only this thread writes it)."""
+        for ev in schwab_keeper.drain_events():
+            kind = ev.pop("event", "SCHWAB_TOKEN_EVENT")
+            try:
+                self.journal.event(kind, now, **ev)
+            except Exception as e:      # noqa: BLE001 -- journaling a keeper event must never stop the loop
+                log.error("could not journal %s: %s", kind, e)
+
     def _token_check(self, now: datetime) -> None:
         """Schwab sim only (the broker exposes token_status): warn as the 7-day refresh token ages, refuse new entries when it
         would expire before the hard stop, and say so loudly so a human re-runs schwab_login.py."""
@@ -481,6 +494,7 @@ class Bot:
                     self.journal.event("TICK_EXCEPTION", now, type=type(e).__name__, error=repr(e)[:300])
             try:
                 self._token_check(now)
+                self._keeper_events(now)
                 self._check_marks(now_et())
             except Exception as e:      # noqa: BLE001 -- the watchdog itself must not be able to kill the loop either
                 log.error("watchdog error: %s: %s", type(e).__name__, e)
@@ -1391,6 +1405,13 @@ class Bot:
         return [f"Schwab token: {st['state']} -- {st['message']}"]
 
     @staticmethod
+    def _keeper_report_line() -> str:
+        try:
+            return schwab_keeper.report_line()
+        except Exception as e:      # noqa: BLE001 -- a report line must never stop the bot from starting
+            return f"Schwab token keeper: status unavailable ({type(e).__name__})"
+
+    @staticmethod
     def _live_es_report_line() -> str:
         try:
             usable, reason = market_data.live_es_status()
@@ -1426,6 +1447,7 @@ class Bot:
             f"Phase: {strategy.phase(now)}   News day: {strategy.is_news_day(now.date())} "
             f"(mode {config.NEWS_DAY_MODE})   Level source: {config.BREAKOUT_LEVEL_SOURCE}",
             self._live_es_report_line(),
+            self._keeper_report_line(),
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
                 f"| {k}: trades {s.trades_today} losses-in-a-row {s.consecutive_losses} P/L {fmt_money(s.realized_pnl)}"
                 for k, s in day.strategies.items()),
@@ -1577,6 +1599,8 @@ def main() -> None:
         else:
             log.error("Check the .env file in this folder and your internet connection, then start again.")
         sys.exit(1)
+    finally:
+        schwab_keeper.stop()
 
 
 if __name__ == "__main__":

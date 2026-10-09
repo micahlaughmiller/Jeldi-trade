@@ -98,6 +98,13 @@ ES_LIVE_RETRY_SEC = 60
 # Live /ES bars whose newest minute is older than this (during the regular session) mean the feed is stalled or delayed: treated as a
 # failed request, so breakouts are confirmed on SPX candles instead of on a stale ES series.
 ES_LIVE_MAX_BAR_AGE_SEC = 300
+# 2026-10-09: ASTRA owns the Schwab token (schwab_keeper.py). When the access token has this many seconds left the keeper refreshes it;
+# it looks every SCHWAB_KEEPER_POLL_SEC; a failed refresh is retried after SCHWAB_REFRESH_BACKOFF_SEC[n-1] seconds (the last value
+# repeats); a rejected refresh token (needs a human login) is retried every SCHWAB_AUTH_RETRY_SEC.
+SCHWAB_REFRESH_MARGIN_SEC = 600
+SCHWAB_KEEPER_POLL_SEC = 20
+SCHWAB_REFRESH_BACKOFF_SEC = (15, 30, 60, 120)
+SCHWAB_AUTH_RETRY_SEC = 900
 # One process per persona: a second launch against the same account would trade it with its own counters and caps. True = the
 # bot takes a lock file in logs/ at start and a second copy refuses to run.
 SINGLE_INSTANCE_LOCK = True
@@ -182,12 +189,22 @@ ES_SYMBOL = "ES=F"
 ES_SCHWAB_SYMBOL = "/ES"
 # Cross-broker, READ-ONLY market data credentials -- this folder never places a Schwab order.
 # SCHWAB_APP_KEY/SECRET must come from .env (never hardcode a real secret in this file, which is a
-# public repo). SCHWAB_TOKEN_PATH's hardcoded default points at the Schwab bot's OWN token file
-# (same account, same OAuth session) so every persona process and the Schwab bot share ONE file --
-# Schwab's refresh token rotates on each use, so separate copies would invalidate each other.
+# public repo). SCHWAB_TOKEN_PATH's default is the Schwab 0DTE folder's own token file next to this folder (same account, same OAuth
+# session): one file, never a copy. 2026-10-09: ASTRA OWNS that file's access token -- schwab_keeper.py refreshes it in a background
+# thread while ASTRA runs (it needs SCHWAB_APP_KEY AND SCHWAB_APP_SECRET); every other persona only reads it, and the Schwab sim bots
+# (which refresh it themselves) are not run alongside. The 7-day login (schwab_login.py in the Schwab folder) is still by hand.
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
-SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
+
+
+def _default_schwab_token_path() -> str:
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else parents[-1]      # <root>/Alpaca/0DTE/config.py -> <root>; never raises on a shallow folder
+    return str(root / "schwab" / "0dte" / "token.json")
+
+
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", "").strip() or _default_schwab_token_path()      # a blank .env line counts as unset
+SCHWAB_TOKEN_KEEPER = _env_flag("SCHWAB_TOKEN_KEEPER", ACTIVE_TRADER == "ASTRA")
 
 MARKET_OPEN = time(9, 30)
 # 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same
@@ -774,14 +791,18 @@ def _a(momentum_only=False, **extra) -> dict:
 # different personas. B is unchanged everywhere. 2026-10-06: F (stock ORB) now runs on EVERY persona (it was ASTRA only).
 # 2026-10-07: EVERY strategy (B, C, D, E, F) now runs on every persona; each persona keeps its own overrides above, so the
 # D and E variants a persona runs share that persona's D_* constants (E also has E_USE_TREND_GATE):
-#   ASTRA   D/E spec thresholds (BB 2.0 / %B 0.95 / chop 2.0), E trend-gated, C spec window
+#   ASTRA   D/E LOOSENED 2026-10-09 (BB 2.0 / %B 0.70 / chop 0.5, E ungated with a 3-candle confirm), C spec window. Replay of 57
+#           sessions: the spec set fired D on 2 sessions and trend-gated E on none; this set gives D ~1.6 and E ~2 signals a week
+#           (D 13 sessions, E 16, max 2 and 3 in a session). %B 0.70 == a 0.8-sigma touch (spec 0.95 == 1.8 sigma); 0.675 is the next
+#           notch if D stays quiet, below 0.65 E turns to noise. A signal replay says nothing about option P/L.
 #   ARIA    D/E BB 1.5 / %B 0.85 / chop 1.0, E trend-gated, C spec window
 #   ELENA   D/E BB 1.0 / %B 0.90 / chop 1.0, E trend-gated, C window to 10:30
 #   DAVID   D/E spec thresholds, E NO trend gate, C spec window
 #   JORDAN  D/E BB 2.0 / %B 0.85 / chop 2.0, E NO trend gate, C window to 10:30
 PERSONA_OVERRIDES: dict[str, dict] = {
     # 2026-09-28: ASTRA (the A/B control) additionally runs Strategy F. 2026-10-01: A removed.
-    "ASTRA":  {"STRATEGIES": ("B", "C", "D", "E", "F")},
+    "ASTRA":  {"STRATEGIES": ("B", "C", "D", "E", "F"),
+              "D_BAND_TOUCH_PCT_B": 0.70, "D_EMA_CHOP_THRESHOLD_PTS": 0.5, "E_USE_TREND_GATE": False, "E_CONFIRM_CANDLES": 3},
     "ARIA":   {**_a(PROFIT_FLOOR_BY_WIDTH={10: (0.20, 0.15), 5: (0.10, 0.05)}, momentum_only=True),   # method 1, $10-wide
               "STRATEGIES": ("B", "C", "D", "E", "F"),
               "D_BB_STD": 1.5, "D_BAND_TOUCH_PCT_B": 0.85, "D_EMA_CHOP_THRESHOLD_PTS": 1.0},

@@ -28,7 +28,9 @@ TRADER_NAME = os.getenv("TRADER_NAME", "SCHWAB").upper()
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
 SCHWAB_CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8080")
-SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", str(Path(__file__).resolve().parent / "token.json"))
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", "").strip() or str(Path(__file__).resolve().parent / "token.json")   # blank = unset
+# 2026-10-09: this bot's broker refreshes its own token; the ASTRA token keeper (schwab_keeper.py, shared code) must never run here
+SCHWAB_TOKEN_KEEPER = False
 SCHWAB_ACCOUNT_INDEX = int(os.getenv("SCHWAB_ACCOUNT_INDEX", "0"))
 PAPER_TRADING = False
 
@@ -96,6 +98,13 @@ ES_LIVE_RETRY_SEC = 60
 # Live /ES bars whose newest minute is older than this (during the regular session) mean the feed is stalled or delayed: treated as a
 # failed request, so breakouts are confirmed on SPX candles instead of on a stale ES series.
 ES_LIVE_MAX_BAR_AGE_SEC = 300
+# 2026-10-09: ASTRA owns the Schwab token (schwab_keeper.py). When the access token has this many seconds left the keeper refreshes it;
+# it looks every SCHWAB_KEEPER_POLL_SEC; a failed refresh is retried after SCHWAB_REFRESH_BACKOFF_SEC[n-1] seconds (the last value
+# repeats); a rejected refresh token (needs a human login) is retried every SCHWAB_AUTH_RETRY_SEC.
+SCHWAB_REFRESH_MARGIN_SEC = 600
+SCHWAB_KEEPER_POLL_SEC = 20
+SCHWAB_REFRESH_BACKOFF_SEC = (15, 30, 60, 120)
+SCHWAB_AUTH_RETRY_SEC = 900
 # One process per persona: a second launch against the same account would trade it with its own counters and caps. True = the
 # bot takes a lock file in logs/ at start and a second copy refuses to run.
 SINGLE_INSTANCE_LOCK = True

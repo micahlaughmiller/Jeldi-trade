@@ -53,10 +53,42 @@ def _no_live_es(request, monkeypatch):
     unless a test turns it on. test_market_data exercises the real token/status code against its own temp files."""
     import market_data
     market_data._ES_LIVE.update(state=None, fail_until=0.0)
-    if request.module.__name__ != "test_market_data":
+    if request.module.__name__ not in ("test_market_data", "test_schwab_keeper"):
         monkeypatch.setattr(market_data, "_es_token_check", lambda: (None, "unit tests: live ES off"))
     yield
     market_data._ES_LIVE.update(state=None, fail_until=0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_token_keeper(monkeypatch):
+    """No test ever starts the Schwab token keeper thread or touches a token file: the flag is off and the keeper's memory is clean.
+    test_schwab_keeper turns it on against temp files and a fake HTTP transport."""
+    import schwab_keeper
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_KEEPER", False, raising=False)
+    schwab_keeper.reset_state()
+    yield
+    schwab_keeper.reset_state()
+
+
+def _module_level_defaults(*names):
+    """What config.py assigns at module level, before PERSONA_OVERRIDES is applied for the ACTIVE_TRADER."""
+    import ast
+    tree = ast.parse(Path(config.__file__).read_text(encoding="utf-8"))
+    return {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in names}
+
+
+DE_SPEC = _module_level_defaults("D_BAND_TOUCH_PCT_B", "D_EMA_CHOP_THRESHOLD_PTS", "E_USE_TREND_GATE", "E_CONFIRM_CANDLES")
+
+
+@pytest.fixture(autouse=True)
+def _pin_spec_de_thresholds(request, monkeypatch):
+    """The shared suite predates ASTRA's loosened D/E thresholds (2026-10-09) and asserts the spec behaviour; it runs with the spec
+    values, tests of the shipped override read PERSONA_OVERRIDES / the real config (test_astra_loosened_de)."""
+    if request.module.__name__ != "test_astra_loosened_de":
+        for name, value in DE_SPEC.items():
+            monkeypatch.setattr(config, name, value)
 
 
 @pytest.fixture

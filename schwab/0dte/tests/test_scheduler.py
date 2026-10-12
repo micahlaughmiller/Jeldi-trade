@@ -2059,3 +2059,20 @@ def test_main_stops_the_keeper_on_every_way_out(monkeypatch):
 def test_the_module_level_d_e_defaults_are_still_the_spec_values():
     from conftest import DE_SPEC
     assert DE_SPEC == SPEC_DE                                            # the persona overrides change them per persona, never the default
+
+
+def test_a_weekend_start_says_why_it_exits_where_the_console_can_see_it(bot, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(bot, "loop", lambda: pytest.fail("a weekend start with nothing open must not run its loop"))
+    bot.run(et(10, 36, day=19))                                          # 2026-09-19 is a Saturday
+    lines = [r for r in caplog.records if "Weekend (Saturday)" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].keep is True                     # keep=True: the console filter shows only kept records
+    assert "exiting" in lines[0].getMessage() and "trading day" in lines[0].getMessage()
+
+
+def test_a_start_after_the_hard_stop_says_so_too(bot, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(bot, "loop", lambda: pytest.fail("a bot started after the hard stop with nothing open must not run its loop"))
+    bot.run(et(14, 0))
+    lines = [r for r in caplog.records if "Started after the hard stop" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].keep is True and "13:00" in lines[0].getMessage()

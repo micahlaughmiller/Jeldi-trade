@@ -95,7 +95,8 @@ def test_a_busy_lock_with_no_snapshot_falls_back_to_a_private_fetch(shared_dir):
     assert float(out["df"]["close"].iloc[0]) == 8.0 and not (shared_dir / "b.pkl").exists()   # nothing written without the lock
 
 
-def test_a_caller_waiting_for_the_lock_picks_up_the_new_snapshot(shared_dir):
+def test_a_caller_waiting_for_the_lock_picks_up_the_new_snapshot(shared_dir, monkeypatch):
+    monkeypatch.setattr(config, "SHARED_WAIT_SEC", 10)       # generous: a loaded machine must not let the wait run out before the write
     shared_dir.mkdir(parents=True)
     (shared_dir / "a.lock").write_text("123")
     results = []

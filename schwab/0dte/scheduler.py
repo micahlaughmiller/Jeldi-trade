@@ -357,13 +357,16 @@ class Bot:
 
     def run(self, now: datetime) -> None:
         if not market_data.is_trading_day(now) and not self.pm.positions:
-            log.info("Weekend (%s): nothing to do, exiting.", now.strftime("%A"))
+            # keep=True: the console only shows records tagged keep (or errors), and a bot that prints its start report and then exits
+            # without a word looks exactly like one that failed to start (a Saturday launch on 2026-10-10 did)
+            log.info("Weekend (%s): the market is closed, nothing to do -- exiting. Start the bot on a trading day.", now.strftime("%A"),
+                     extra={"keep": True})
             return
         ph = strategy.phase(now)
         if ph == Phase.CLOSED:
             if not self.pm.positions:
-                log.info("Started after FORCE_CLOSE_TIME %s with no open position: exiting.",
-                         config.FORCE_CLOSE_TIME)
+                log.info("Started after the hard stop (%s ET) with no open position: nothing to do today -- exiting.",
+                         config.FORCE_CLOSE_TIME.strftime("%H:%M"), extra={"keep": True})
                 return
             log.warning("Started after FORCE_CLOSE_TIME with open positions: closing them now.")
             if self.end_of_day(now_et()) is False:     # MANUAL_HOLD: stay up until it is lifted or the session ends

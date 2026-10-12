@@ -236,6 +236,8 @@ class SchwabBroker:
         token = self._cfg("SCHWAB_TOKEN_PATH", None) or os.getenv("SCHWAB_TOKEN_PATH") \
             or self._cfg("TOKEN_PATH", None) or "token.json"
         self.token_path = self._resolve_path(token)
+        if self.token_path.is_dir():                     # a FOLDER means the token.json inside it (opening a folder is a PermissionError on Windows)
+            self.token_path = self.token_path / "token.json"
 
     # ------------------------------------------------------------------ plumbing
 
@@ -259,8 +261,8 @@ class SchwabBroker:
 
     def _auth_error(self, name: str, detail: str) -> SchwabAuthError:
         self._auth_dead_until = time.monotonic() + self.AUTH_PROBE_SEC
-        return SchwabAuthError(f"Schwab {name} failed: {detail}. The token is invalid or expired -- re-login: "
-                               f"cd {HERE.name} && {SchwabAuthError.reauth_command}")
+        return SchwabAuthError(f"Schwab {name} failed: {detail}. The token is invalid or expired [token file: {self.token_path}] -- "
+                               f"re-login: cd {HERE.name} && {SchwabAuthError.reauth_command}")
 
     def _get_client(self) -> SchwabClient:
         created = schwab_health.token_created_at(self.token_path) if self.token_path.is_file() else None
@@ -289,7 +291,7 @@ class SchwabBroker:
         wait = self._auth_dead_until - time.monotonic()
         if wait > 0:
             raise SchwabAuthError(f"Schwab {name} skipped: the token was rejected a moment ago (next attempt in {wait:.0f}s) "
-                                  f"-- re-login: cd {HERE.name} && {SchwabAuthError.reauth_command}")
+                                  f"[token file: {self.token_path}] -- re-login: cd {HERE.name} && {SchwabAuthError.reauth_command}")
         last_exc: Exception | None = None
         for attempt in range(3):
             try:

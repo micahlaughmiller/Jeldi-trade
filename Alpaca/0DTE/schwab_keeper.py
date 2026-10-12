@@ -63,7 +63,8 @@ def _path() -> str:
 
 
 def _relogin_command() -> str:
-    folder = Path(_path()).parent if _path() else Path(".")
+    path = Path(_path()) if _path() else None
+    folder = Path(".") if path is None else (path if path.is_dir() else path.parent)       # schwab_login.py lives next to token.json
     return f'cd "{folder}" && python schwab_login.py --force'
 
 
@@ -286,8 +287,14 @@ def _cycle(now: float | None = None) -> None:
         st["unreadable"] += 1
         if st["unreadable"] >= 3:
             st["kind"], st["detail"] = "file", f"token file unreadable ({type(e).__name__})"
-            _say("unreadable", 900, logging.CRITICAL, now, "SCHWAB TOKEN FILE UNREADABLE (%s) for %d checks: live ES is off; a "
-                 "re-login rewrites it: %s", type(e).__name__, st["unreadable"], _relogin_command())
+            if os.path.isdir(path):
+                hint = (f"That path is a FOLDER, not the token file: set SCHWAB_TOKEN_PATH to {os.path.join(path, 'token.json')} "
+                        f"or delete the setting (.env and the Windows environment).")
+            else:
+                hint = (f"Another program (antivirus, a sync client, an open editor) may hold the file, or its permissions deny this user; "
+                        f"a re-login rewrites it: {_relogin_command()}")
+            _say("unreadable", 900, logging.CRITICAL, now, "SCHWAB TOKEN FILE UNREADABLE (%s) at %s for %d checks: live ES is off. %s",
+                 type(e).__name__, path, st["unreadable"], hint)
         return
     st["unreadable"] = 0
     sig = raw.get("creation_timestamp") if isinstance(raw, dict) else None
@@ -495,4 +502,4 @@ def report_line() -> str:
     valid = (f"; access token valid until {datetime.fromtimestamp(expires_at, schwab_health.ET).strftime('%H:%M')} ET"
              if expires_at and expires_at > time.time() else "; access token not valid right now")
     problem = f" -- LAST REFRESH FAILED ({_KEEPER['kind']}: {_KEEPER['detail']})" if _KEEPER["kind"] not in (None, "ok") else ""
-    return f"Schwab token keeper: ON -- {health.get('message', '')}{valid}{problem}"
+    return f"Schwab token keeper: ON [{_path()}] -- {health.get('message', '')}{valid}{problem}"

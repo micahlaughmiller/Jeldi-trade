@@ -6,6 +6,7 @@ cached for config.DATA_CACHE_SEC to avoid hammering Yahoo on a 15 s tick.
 
 import json
 import logging
+import os
 import time as _time
 from datetime import datetime, timedelta
 
@@ -96,6 +97,8 @@ def _es_token_check():
         return None, "SCHWAB_APP_KEY / SCHWAB_TOKEN_PATH not configured"
     if _time.monotonic() < _ES_LIVE["fail_until"]:
         return None, _ES_BACKOFF
+    if os.path.isdir(token_path):
+        return None, f"SCHWAB_TOKEN_PATH is a folder, not the token file: {token_path}"
     try:
         raw = schwab_keeper.read_token_file(token_path, attempts=2)   # tolerant of a write in flight; one short retry, never more
         token = raw["token"]

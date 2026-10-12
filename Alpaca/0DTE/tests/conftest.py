@@ -60,6 +60,13 @@ def _no_live_es(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_clock_check(request, monkeypatch):
+    """No test asks the internet what time it is (main() would, at start-up); test_clock_check turns the check on with a fake source."""
+    if request.module.__name__ != "test_clock_check":
+        monkeypatch.setattr(config, "CLOCK_CHECK_ENABLED", False, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_token_keeper(monkeypatch):
     """No test ever starts the Schwab token keeper thread or touches a token file: the flag is off and the keeper's memory is clean.
     test_schwab_keeper turns it on against temp files and a fake HTTP transport."""

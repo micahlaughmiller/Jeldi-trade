@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+import clock_check
 import config
 import instance_lock
 import market_data
@@ -1578,6 +1579,25 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging()
     install_signal_handlers()
+    if getattr(config, "CLOCK_CHECK_ENABLED", True):
+        try:
+            verdict = clock_check.check(max_skew=float(getattr(config, "CLOCK_MAX_SKEW_SEC", 120)))
+        except Exception as exc:        # noqa: BLE001 -- a bug in a safety CHECK must never keep the bot from starting
+            verdict = {"ok": None, "skew": None, "sources": 0, "detail": f"the clock check itself failed ({type(exc).__name__}: {exc})"}
+        if verdict["ok"] is False:
+            log.critical("THIS PC'S CLOCK IS WRONG: %s. The PC says %s but it is about %s. The bot schedules the market open, the entry window, "
+                         "the hard stop and the Schwab login age from this clock, so it will NOT start. Fix: Settings > Time & language > "
+                         "Date & time > turn on 'Set time automatically' and the Eastern time zone, click 'Sync now' (admin PowerShell: "
+                         "w32tm /resync), then start the bot again. (CLOCK_CHECK_ENABLED = False in config.py turns this check off.)",
+                         verdict["detail"], now_et().strftime("%a %Y-%m-%d %H:%M %Z"),
+                         datetime.fromtimestamp(time.time() - verdict["skew"], config.ET).strftime("%a %Y-%m-%d %H:%M %Z"),
+                         extra={"keep": True})
+            sys.exit(3)
+        if verdict["ok"] is None:
+            log.warning("Clock check skipped: %s. Make sure this PC's date and time are right.", verdict["detail"], extra={"keep": True})
+        else:
+            log.info("Clock check: %s (limit %ds): fine.", verdict["detail"], int(getattr(config, "CLOCK_MAX_SKEW_SEC", 120)),
+                     extra={"keep": True})
     if getattr(config, "SINGLE_INSTANCE_LOCK", True):
         ok, holder = instance_lock.acquire(LOG_DIR, f"0dte_{config.TRADER_NAME.lower()}")
         if not ok:

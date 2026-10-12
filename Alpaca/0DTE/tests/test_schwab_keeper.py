@@ -711,3 +711,162 @@ def test_the_default_token_path_is_the_schwab_folders_file_and_a_blank_setting_m
     env = {**os.environ, "SCHWAB_TOKEN_PATH": str(folder / "elsewhere.json")}
     out = subprocess.run([sys.executable, "-c", code], cwd=str(folder), env=env, capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == str(folder / "elsewhere.json")          # an explicit setting still wins
+
+
+# ---- 2026-10-12: SCHWAB_TOKEN_PATH set to the Schwab FOLDER (a PermissionError on Windows that looked like a locked file)
+
+def _config_path(env_value, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    folder = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "SCHWAB_TOKEN_PATH"}
+    if env_value is not None:
+        env["SCHWAB_TOKEN_PATH"] = env_value
+    out = subprocess.run([sys.executable, "-c", "import dotenv; dotenv.load_dotenv = lambda *a, **k: False; import config; "
+                          "print(config.SCHWAB_TOKEN_PATH)"], cwd=str(folder), env=env, capture_output=True, text=True, timeout=60)
+    return out.stdout.strip(), out.stderr
+
+
+def test_a_token_path_that_names_a_folder_means_the_token_json_inside_it(tmp_path):
+    folder = tmp_path / "0dte"
+    folder.mkdir()
+    path, err = _config_path(str(folder), tmp_path)
+    assert path == str(folder / "token.json"), err
+    file_path = tmp_path / "somewhere" / "my-token.json"
+    assert _config_path(str(file_path), tmp_path)[0] == str(file_path)              # a file path (even one that does not exist yet) is untouched
+
+
+def test_an_unreadable_token_path_is_named_and_a_folder_is_called_a_folder(harness, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))                  # set after config import: the check below still catches it
+    now = time.time()
+    for n in range(3):
+        keeper._cycle(now + 20 * n)
+    shouts = [r for r in caplog.records if "TOKEN FILE UNREADABLE" in r.getMessage()]
+    assert len(shouts) == 1 and shouts[0].levelno == logging.CRITICAL
+    text = shouts[0].getMessage()
+    assert str(folder) in text and "FOLDER" in text and str(folder / "token.json") in text and "SCHWAB_TOKEN_PATH" in text
+
+
+def test_an_unreadable_file_names_its_path_and_the_usual_culprits(harness, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    write_token(harness)
+
+    def locked(path, *a, **k):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(keeper, "read_token_file", locked)
+    now = time.time()
+    for n in range(3):
+        keeper._cycle(now + 20 * n)
+    text = next(r.getMessage() for r in caplog.records if "TOKEN FILE UNREADABLE" in r.getMessage())
+    assert str(harness) in text and "PermissionError" in text and "antivirus" in text and "schwab_login.py --force" in text
+
+
+def test_the_relogin_command_points_at_the_folder_holding_schwab_login(harness, monkeypatch):
+    assert keeper._relogin_command() == f'cd "{harness.parent}" && python schwab_login.py --force'
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))
+    assert keeper._relogin_command() == f'cd "{folder}" && python schwab_login.py --force'    # a folder path: that folder, not its parent
+
+
+def test_market_data_says_when_the_token_path_is_a_folder(harness, monkeypatch):
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))
+    client, why = market_data._es_token_check()
+    assert client is None and "is a folder" in why and str(folder) in why
+    assert market_data.live_es_status() == (False, why)
+
+
+def test_the_report_line_shows_which_token_file_the_keeper_watches(harness, monkeypatch):
+    write_token(harness, remaining=-30)
+    Http.handler = lambda request: httpx.Response(400, json={"error": "invalid_grant", "error_description": "dead"})
+    monkeypatch.setattr(config, "SCHWAB_KEEPER_POLL_SEC", 0.05)
+    keeper.start(wait_first_sec=5)
+    assert f"Schwab token keeper: ON [{harness}]" in keeper.report_line()
+    keeper.stop()
+
+
+# ---- 2026-10-12: SCHWAB_TOKEN_PATH set to the Schwab FOLDER (a PermissionError on Windows that looked like a locked file)
+
+def _config_path(env_value):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    folder = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "SCHWAB_TOKEN_PATH"}
+    if env_value is not None:
+        env["SCHWAB_TOKEN_PATH"] = env_value
+    out = subprocess.run([sys.executable, "-c", "import dotenv; dotenv.load_dotenv = lambda *a, **k: False; import config; "
+                          "print(config.SCHWAB_TOKEN_PATH)"], cwd=str(folder), env=env, capture_output=True, text=True, timeout=60)
+    return out.stdout.strip(), out.stderr
+
+
+def test_a_token_path_that_names_a_folder_means_the_token_json_inside_it(tmp_path):
+    folder = tmp_path / "0dte"
+    folder.mkdir()
+    path, err = _config_path(str(folder))
+    assert path == str(folder / "token.json"), err
+    assert _config_path(str(folder) + "\\")[0] == str(folder / "token.json") or _config_path(str(folder) + "/")[0] == str(folder / "token.json")
+    file_path = tmp_path / "somewhere" / "my-token.json"
+    assert _config_path(str(file_path))[0] == str(file_path)                        # a file path (even one that does not exist yet) is untouched
+
+
+def test_an_unreadable_token_path_is_named_and_a_folder_is_called_a_folder(harness, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))                  # set after config import: the check below still catches it
+    now = time.time()
+    for n in range(3):
+        keeper._cycle(now + 20 * n)
+    shouts = [r for r in caplog.records if "TOKEN FILE UNREADABLE" in r.getMessage()]
+    assert len(shouts) == 1 and shouts[0].levelno == logging.CRITICAL
+    text = shouts[0].getMessage()
+    assert str(folder) in text and "FOLDER" in text and str(folder / "token.json") in text and "SCHWAB_TOKEN_PATH" in text
+
+
+def test_an_unreadable_file_names_its_path_and_the_usual_culprits(harness, caplog, monkeypatch):
+    caplog.set_level("INFO")
+    write_token(harness)
+
+    def locked(path, *a, **k):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(keeper, "read_token_file", locked)
+    now = time.time()
+    for n in range(3):
+        keeper._cycle(now + 20 * n)
+    text = next(r.getMessage() for r in caplog.records if "TOKEN FILE UNREADABLE" in r.getMessage())
+    assert str(harness) in text and "PermissionError" in text and "antivirus" in text and "schwab_login.py --force" in text
+
+
+def test_the_relogin_command_points_at_the_folder_holding_schwab_login(harness, monkeypatch):
+    assert keeper._relogin_command() == f'cd "{harness.parent}" && python schwab_login.py --force'
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))
+    assert keeper._relogin_command() == f'cd "{folder}" && python schwab_login.py --force'    # a folder path: that folder, not its parent
+
+
+def test_market_data_says_when_the_token_path_is_a_folder(harness, monkeypatch):
+    folder = harness.parent / "0dte"
+    folder.mkdir()
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(folder))
+    client, why = market_data._es_token_check()
+    assert client is None and "is a folder" in why and str(folder) in why
+    assert market_data.live_es_status() == (False, why)
+
+
+def test_the_report_line_shows_which_token_file_the_keeper_watches(harness, monkeypatch):
+    write_token(harness, remaining=-30)
+    Http.handler = lambda request: httpx.Response(400, json={"error": "invalid_grant", "error_description": "dead"})
+    monkeypatch.setattr(config, "SCHWAB_KEEPER_POLL_SEC", 0.05)
+    keeper.start(wait_first_sec=5)
+    assert f"Schwab token keeper: ON [{harness}]" in keeper.report_line()
+    keeper.stop()

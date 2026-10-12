@@ -108,6 +108,11 @@ SCHWAB_AUTH_RETRY_SEC = 900
 # One process per persona: a second launch against the same account would trade it with its own counters and caps. True = the
 # bot takes a lock file in logs/ at start and a second copy refuses to run.
 SINGLE_INSTANCE_LOCK = True
+# 2026-10-12: at start-up the PC clock is compared with internet time (clock_check.py); the bot refuses to run when they differ by more than
+# CLOCK_MAX_SKEW_SEC -- it schedules the open, the entry window, the hard stop and the Schwab login age from this clock, and a PC with the wrong
+# date made a bot launched on a Monday see Saturday and exit silently. With no time source reachable it warns and carries on.
+CLOCK_CHECK_ENABLED = True
+CLOCK_MAX_SKEW_SEC = 120
 # 2026-10-02: manual-override safety (closing/cancelling a position by hand in the broker UI, e.g.
 # thinkorswim, while the bot is running). Every EXTERNAL_SYNC_SEC the bot compares its tracked
 # spreads against what the broker actually holds; a position must look wrong on
@@ -203,7 +208,14 @@ def _default_schwab_token_path() -> str:
     return str(root / "schwab" / "0dte" / "token.json")
 
 
-SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", "").strip() or _default_schwab_token_path()      # a blank .env line counts as unset
+def _token_file(raw: str, default: str) -> str:
+    """The token file to use. A blank setting means the default; a setting that names an existing FOLDER (the Schwab bot's own folder)
+    means the token.json inside it -- opening a folder as a file raises PermissionError on Windows, which once looked like a locked file."""
+    chosen = (raw or "").strip() or default
+    return str(Path(chosen) / "token.json") if Path(chosen).is_dir() else chosen
+
+
+SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), _default_schwab_token_path())   # blank = unset; a folder = its token.json
 SCHWAB_TOKEN_KEEPER = _env_flag("SCHWAB_TOKEN_KEEPER", ACTIVE_TRADER == "ASTRA")
 
 MARKET_OPEN = time(9, 30)

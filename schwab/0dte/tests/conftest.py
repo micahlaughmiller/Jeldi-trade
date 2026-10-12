@@ -53,7 +53,7 @@ def _no_live_es(request, monkeypatch):
     unless a test turns it on. test_market_data exercises the real token/status code against its own temp files."""
     import market_data
     market_data._ES_LIVE.update(state=None, fail_until=0.0)
-    if request.module.__name__ not in ("test_market_data", "test_schwab_keeper"):
+    if request.module.__name__ != "test_market_data":
         monkeypatch.setattr(market_data, "_es_token_check", lambda: (None, "unit tests: live ES off"))
     yield
     market_data._ES_LIVE.update(state=None, fail_until=0.0)
@@ -64,17 +64,6 @@ def _no_clock_check(request, monkeypatch):
     """No test asks the internet what time it is (main() would, at start-up); test_clock_check turns the check on with a fake source."""
     if request.module.__name__ != "test_clock_check":
         monkeypatch.setattr(config, "CLOCK_CHECK_ENABLED", False, raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _no_token_keeper(monkeypatch):
-    """No test ever starts the Schwab token keeper thread or touches a token file: the flag is off and the keeper's memory is clean.
-    test_schwab_keeper turns it on against temp files and a fake HTTP transport."""
-    import schwab_keeper
-    monkeypatch.setattr(config, "SCHWAB_TOKEN_KEEPER", False, raising=False)
-    schwab_keeper.reset_state()
-    yield
-    schwab_keeper.reset_state()
 
 
 def _module_level_defaults(*names):

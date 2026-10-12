@@ -1854,7 +1854,7 @@ def test_main_says_so_when_the_lock_cannot_be_used(monkeypatch, caplog):
     assert any("NOT enforced" in r.getMessage() and r.keep is True for r in caplog.records)
 
 
-# ---- 2026-10-09: ASTRA owns the Schwab token (keeper thread) and runs D/E loosened
+# ---- 2026-10-09: ASTRA runs D/E loosened
 
 def test_the_scheduler_honours_e_confirm_candles(bot, monkeypatch):
     monkeypatch.setattr(config, "STRATEGIES", ("E",))
@@ -1867,74 +1867,6 @@ def test_the_scheduler_honours_e_confirm_candles(bot, monkeypatch):
     monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: _de_candles_cross_session(3, "up"))
     bot.check_mean_reversion_entry(et(9, 45, day=17), scheduler.Phase.ORB_ONLY)
     assert set(bot.pm.positions) == {"E"}
-
-
-def test_start_launches_the_keeper_first_and_lets_it_finish_before_the_report(bot, monkeypatch):
-    order = []
-    monkeypatch.setattr(scheduler.schwab_keeper, "start", lambda *a, **k: order.append("keeper start") or True)
-    monkeypatch.setattr(scheduler.schwab_keeper, "wait_first", lambda timeout: order.append(("wait", timeout)) or True)
-    monkeypatch.setattr(bot, "report_start", lambda *a, **k: order.append("report"))
-    monkeypatch.setattr(bot, "run", lambda now: order.append("run"))
-    bot.start()
-    assert order == ["keeper start", ("wait", 8.0), "report", "run"]
-
-
-def test_keeper_events_are_journaled_on_the_main_thread(bot, monkeypatch):
-    queued = [{"event": "SCHWAB_TOKEN_REFRESHED", "expires_at": 1.0, "seconds": 0.1},
-              {"event": "SCHWAB_TOKEN_REFRESH_FAILED", "failure": "transient", "detail": "ConnectTimeout", "retry_in_sec": 15.0, "fails": 1},
-              {"event": "TOKEN_STATUS", "state": "WARN", "message": "token is 6.0 days old"}]
-    monkeypatch.setattr(scheduler.schwab_keeper, "drain_events", lambda: [dict(e) for e in queued])
-    bot._keeper_events(et(9, 40))
-    assert [e["expires_at"] for e in events(bot, "SCHWAB_TOKEN_REFRESHED")] == [1.0]
-    assert events(bot, "SCHWAB_TOKEN_REFRESH_FAILED")[0]["detail"] == "ConnectTimeout"
-    assert events(bot, "TOKEN_STATUS")[0]["state"] == "WARN"
-    monkeypatch.setattr(bot.journal, "event", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
-    bot._keeper_events(et(9, 41))                                       # a journal failure never stops the loop
-
-
-def test_the_loop_and_the_pre_open_wait_drain_the_keeper_events(bot, monkeypatch):
-    drained = []
-    monkeypatch.setattr(bot, "_keeper_events", lambda now: drained.append(now))
-    monkeypatch.setattr(bot, "tick", lambda now: setattr(bot, "done", True))
-    monkeypatch.setattr(scheduler.time, "sleep", lambda s: None)
-    bot.once = False
-    bot.loop()
-    assert len(drained) == 1
-    drained.clear()
-    monkeypatch.setattr(scheduler, "now_et", lambda: et(9, 31))         # the market is already open: one pass and out
-    bot.overnight = "levels already known"                              # no Yahoo call in a unit test
-    bot.wait_for_open()
-    assert len(drained) == 1
-
-
-def test_the_start_report_has_a_token_keeper_line(bot, caplog, monkeypatch):
-    caplog.set_level("INFO")
-    monkeypatch.setattr(scheduler.schwab_keeper, "report_line", lambda: "Schwab token keeper: ON -- token is 2.0 days old")
-    bot.report_start(et(9, 0), bot.broker.get_account(), [])
-    assert any("Schwab token keeper: ON -- token is 2.0 days old" in r.getMessage() for r in caplog.records)
-    monkeypatch.setattr(scheduler.schwab_keeper, "report_line", lambda: 1 / 0)
-    assert "status unavailable" in bot._keeper_report_line()
-
-
-def test_main_stops_the_keeper_however_the_bot_ends(monkeypatch):
-    import sys
-    stopped = []
-    monkeypatch.setattr(sys, "argv", ["scheduler.py", "--once"])
-    monkeypatch.setattr(scheduler, "setup_logging", lambda: None)
-    monkeypatch.setattr(scheduler, "install_signal_handlers", lambda: None)
-    monkeypatch.setattr(scheduler.instance_lock, "acquire", lambda directory, name: (True, ""))
-    monkeypatch.setattr(scheduler.schwab_keeper, "stop", lambda *a, **k: stopped.append(1))
-
-    class Bot:
-        def __init__(self, *a, **k):
-            pass
-
-        def start(self):
-            raise scheduler.BrokerError("boom")
-    monkeypatch.setattr(scheduler, "Bot", Bot)
-    with pytest.raises(SystemExit):
-        scheduler.main()
-    assert stopped == [1]
 
 
 # ---- review follow-ups (2026-10-09): the REAL, unmocked D/E logic with ASTRA's thresholds versus the spec ones
@@ -2021,39 +1953,6 @@ def test_the_exit_bollinger_touch_is_not_what_d_reads(bot, monkeypatch):
     monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: frame)
     bot.check_mean_reversion_entry(et(9, 45, day=17), scheduler.Phase.ORB_ONLY)
     assert set(bot.pm.positions) == {"D"}
-
-
-def test_main_stops_the_keeper_on_every_way_out(monkeypatch):
-    import sys
-    stopped = []
-    monkeypatch.setattr(sys, "argv", ["scheduler.py", "--once"])
-    monkeypatch.setattr(scheduler, "setup_logging", lambda: None)
-    monkeypatch.setattr(scheduler, "install_signal_handlers", lambda: None)
-    monkeypatch.setattr(scheduler.instance_lock, "acquire", lambda directory, name: (True, ""))
-    monkeypatch.setattr(scheduler.schwab_keeper, "stop", lambda *a, **k: stopped.append(1))
-
-    def make_bot(outcome):
-        class Bot:
-            def __init__(self, *a, **k):
-                pass
-
-            def start(self):
-                if outcome == "interrupt":
-                    raise KeyboardInterrupt
-                if outcome == "broker":
-                    raise scheduler.BrokerError("boom")
-
-            def on_interrupt(self):
-                pass
-        return Bot
-    monkeypatch.setattr(scheduler, "Bot", make_bot("normal"))
-    scheduler.main()
-    monkeypatch.setattr(scheduler, "Bot", make_bot("interrupt"))
-    scheduler.main()
-    monkeypatch.setattr(scheduler, "Bot", make_bot("broker"))
-    with pytest.raises(SystemExit):
-        scheduler.main()
-    assert stopped == [1, 1, 1]
 
 
 def test_the_module_level_d_e_defaults_are_still_the_spec_values():

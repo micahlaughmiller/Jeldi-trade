@@ -98,13 +98,6 @@ ES_LIVE_RETRY_SEC = 60
 # Live /ES bars whose newest minute is older than this (during the regular session) mean the feed is stalled or delayed: treated as a
 # failed request, so breakouts are confirmed on SPX candles instead of on a stale ES series.
 ES_LIVE_MAX_BAR_AGE_SEC = 300
-# 2026-10-09: ASTRA owns the Schwab token (schwab_keeper.py). When the access token has this many seconds left the keeper refreshes it;
-# it looks every SCHWAB_KEEPER_POLL_SEC; a failed refresh is retried after SCHWAB_REFRESH_BACKOFF_SEC[n-1] seconds (the last value
-# repeats); a rejected refresh token (needs a human login) is retried every SCHWAB_AUTH_RETRY_SEC.
-SCHWAB_REFRESH_MARGIN_SEC = 600
-SCHWAB_KEEPER_POLL_SEC = 20
-SCHWAB_REFRESH_BACKOFF_SEC = (15, 30, 60, 120)
-SCHWAB_AUTH_RETRY_SEC = 900
 # One process per persona: a second launch against the same account would trade it with its own counters and caps. True = the
 # bot takes a lock file in logs/ at start and a second copy refuses to run.
 SINGLE_INSTANCE_LOCK = True
@@ -194,29 +187,12 @@ ES_SYMBOL = "ES=F"
 ES_SCHWAB_SYMBOL = "/ES"
 # Cross-broker, READ-ONLY market data credentials -- this folder never places a Schwab order.
 # SCHWAB_APP_KEY/SECRET must come from .env (never hardcode a real secret in this file, which is a
-# public repo). SCHWAB_TOKEN_PATH's default is the Schwab 0DTE folder's own token file next to this folder (same account, same OAuth
-# session): one file, never a copy. 2026-10-09: ASTRA OWNS that file's access token -- schwab_keeper.py refreshes it in a background
-# thread while ASTRA runs (it needs SCHWAB_APP_KEY AND SCHWAB_APP_SECRET); every other persona only reads it, and the Schwab sim bots
-# (which refresh it themselves) are not run alongside. The 7-day login (schwab_login.py in the Schwab folder) is still by hand.
+# public repo). SCHWAB_TOKEN_PATH's hardcoded default points at the Schwab bot's OWN token file
+# (same account, same OAuth session) so every persona process and the Schwab bot share ONE file --
+# Schwab's refresh token rotates on each use, so separate copies would invalidate each other.
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
-
-
-def _default_schwab_token_path() -> str:
-    parents = Path(__file__).resolve().parents
-    root = parents[2] if len(parents) > 2 else parents[-1]      # <root>/Alpaca/0DTE/config.py -> <root>; never raises on a shallow folder
-    return str(root / "schwab" / "0dte" / "token.json")
-
-
-def _token_file(raw: str, default: str) -> str:
-    """The token file to use. A blank setting means the default; a setting that names an existing FOLDER (the Schwab bot's own folder)
-    means the token.json inside it -- opening a folder as a file raises PermissionError on Windows, which once looked like a locked file."""
-    chosen = (raw or "").strip() or default
-    return str(Path(chosen) / "token.json") if Path(chosen).is_dir() else chosen
-
-
-SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), _default_schwab_token_path())   # blank = unset; a folder = its token.json
-SCHWAB_TOKEN_KEEPER = _env_flag("SCHWAB_TOKEN_KEEPER", ACTIVE_TRADER == "ASTRA")
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
 
 MARKET_OPEN = time(9, 30)
 # 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same

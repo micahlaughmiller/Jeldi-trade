@@ -27,8 +27,7 @@ DEFAULT_CALLBACK_URL = "https://127.0.0.1:8080"
 def _token_path() -> Path:
     raw = os.getenv("SCHWAB_TOKEN_PATH", "token.json")
     path = Path(raw)
-    path = path if path.is_absolute() else (HERE / path).resolve()
-    return path / "token.json" if path.is_dir() else path      # a FOLDER means the token.json inside it
+    return path if path.is_absolute() else (HERE / path).resolve()
 
 
 def main(argv: list[str] | None = None) -> int:

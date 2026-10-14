@@ -628,3 +628,118 @@ def test_the_login_script_writes_the_token_json_inside_a_folder_path(tmp_path, m
     assert module._token_path() == folder / "token.json"
     monkeypatch.setenv("SCHWAB_TOKEN_PATH", str(tmp_path / "x.json"))
     assert module._token_path() == tmp_path / "x.json"
+
+
+# ------------------------------------------------- 2026-10-14: the Schwab bots share the NEWEST login (a new login cancels the older one)
+
+def _two_bots(tmp_path, monkeypatch, own_days_old=None, sibling_days_old=None, sibling_has_login_script=True):
+    """tmp/schwab/45DTE (this bot) and tmp/schwab/0dte (its sibling), each with a token.json of the given age in days (None = no file)."""
+    import json
+    import time
+    root = tmp_path / "schwab"
+    me, other = root / "45DTE", root / "0dte"
+    for folder in (me, other):
+        folder.mkdir(parents=True)
+    (me / "schwab_login.py").write_text("")
+    if sibling_has_login_script:
+        (other / "schwab_login.py").write_text("")
+
+    def login(folder, days_old):
+        if days_old is not None:
+            (folder / "token.json").write_text(json.dumps({"creation_timestamp": int(time.time() - days_old * 86400), "token": {}}))
+    login(me, own_days_old)
+    login(other, sibling_days_old)
+    monkeypatch.setattr(broker_mod, "HERE", me)
+    monkeypatch.setenv("SCHWAB_APP_KEY", "k")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "s")
+    monkeypatch.delenv("SCHWAB_TOKEN_PATH", raising=False)
+    built = []
+    monkeypatch.setattr(broker_mod, "client_from_token_file", lambda path, *a, **k: built.append(path) or object())
+    b = Broker(make_config(tmp_path), dry_run=True, log=logging.getLogger("t"))
+    return getattr(b, "data", b), me, other, built, login
+
+
+def test_a_newer_login_in_the_sibling_bots_folder_is_used(tmp_path, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=3, sibling_days_old=0.1)
+    sb._get_client()
+    assert built == [str(other / "token.json")] and sb.token_path == other / "token.json"
+    assert any("NEWER login" in r.getMessage() and str(other / "token.json") in r.getMessage() for r in caplog.records)
+
+
+def test_its_own_login_is_used_when_it_is_newer_or_equal(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=0.1, sibling_days_old=3)
+    sb._get_client()
+    assert built == [str(me / "token.json")]
+    sb, me, other, built, _ = _two_bots(tmp_path / "tie", monkeypatch, own_days_old=1, sibling_days_old=1)
+    sb._get_client()
+    assert built[0] in (str(me / "token.json"), str(other / "token.json"))        # equal to within the second: either is the same login age
+
+
+def test_the_siblings_login_is_used_when_this_bot_has_none(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=None, sibling_days_old=2)
+    sb._get_client()
+    assert built == [str(other / "token.json")]
+
+
+def test_with_no_login_anywhere_the_error_names_this_bots_own_file(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=None, sibling_days_old=None)
+    with pytest.raises(BrokerError, match="token file not found") as err:
+        sb._get_client()
+    assert str(me / "token.json") in str(err.value) and built == []
+
+
+def test_a_folder_without_its_own_login_script_is_not_a_sibling_bot(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=3, sibling_days_old=0.1, sibling_has_login_script=False)
+    sb._get_client()
+    assert built == [str(me / "token.json")]
+
+
+def test_an_explicit_token_path_is_used_exactly_as_given(tmp_path, monkeypatch):
+    sb, me, other, built, login = _two_bots(tmp_path, monkeypatch, own_days_old=3, sibling_days_old=0.1)
+    monkeypatch.setenv("SCHWAB_TOKEN_PATH", str(other / "token.json"))
+    login(me, 0.01)                                                                # the own file is now the newest -- still ignored
+    b = Broker(make_config(tmp_path), dry_run=True, log=logging.getLogger("t"))
+    explicit = getattr(b, "data", b)
+    explicit._get_client()
+    assert built[-1] == str(other / "token.json")
+
+
+def test_a_login_made_in_either_folder_later_is_picked_up_without_a_restart(tmp_path, monkeypatch):
+    sb, me, other, built, login = _two_bots(tmp_path, monkeypatch, own_days_old=1, sibling_days_old=3)
+    first = sb._get_client()
+    assert built == [str(me / "token.json")] and sb._get_client() is first and len(built) == 1
+    login(other, 0.001)                                                            # the user logged in from the sibling's folder
+    second = sb._get_client()
+    assert second is not first and built[-1] == str(other / "token.json") and sb.token_path == other / "token.json"
+    login(me, 0.0001)                                                              # ... then from this bot's folder again
+    third = sb._get_client()
+    assert third is not second and built[-1] == str(me / "token.json")
+
+
+def test_the_token_status_reports_the_login_that_is_actually_used(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=9, sibling_days_old=0.5)
+    status = sb.token_status()
+    assert status["state"] == "OK" and 0.4 < status["age_days"] < 0.6              # not the 9-day-old, dead own file
+
+
+def test_a_switch_to_the_sibling_rebuilds_the_client_even_when_both_logins_are_the_same(tmp_path, monkeypatch):
+    import shutil
+    sb, me, other, built, login = _two_bots(tmp_path, monkeypatch, own_days_old=1, sibling_days_old=1)
+    shutil.copyfile(me / "token.json", other / "token.json")                       # one login copied into both folders: same creation time
+    first = sb._get_client()
+    assert built[-1] == str(me / "token.json")
+    (me / "token.json").unlink()                                                   # the own file disappears: the sibling's copy takes over
+    second = sb._get_client()
+    assert second is not first and built[-1] == str(other / "token.json")          # refreshes must be saved to the file in use
+
+
+def test_a_sibling_token_file_without_a_creation_time_is_never_chosen(tmp_path, monkeypatch):
+    sb, me, other, built, _ = _two_bots(tmp_path, monkeypatch, own_days_old=2, sibling_days_old=0.1)
+    (other / "token.json").write_text("{}")                                        # no creation_timestamp: no way to know it is newer
+    sb._get_client()
+    assert built == [str(me / "token.json")]
+    sb, me, other, built, _ = _two_bots(tmp_path / "again", monkeypatch, own_days_old=None, sibling_days_old=0.1)
+    (other / "token.json").write_text("{}")
+    with pytest.raises(BrokerError, match="token file not found"):
+        sb._get_client()

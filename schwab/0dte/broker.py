@@ -207,6 +207,7 @@ class SchwabBroker:
         self._fallback_warned = False
         self._auth_dead_until = 0.0            # monotonic time before which Schwab is not called again (see SchwabAuthError)
         self._token_created: datetime | None = None
+        self._client_token_path: Path | None = None      # the token file the current client was built from
 
         mode = str(self._cfg("SCHWAB_MODE", "live")).strip().lower()
         requested = dry_run if dry_run is not None else bool(self._cfg("DRY_RUN", True))
@@ -238,6 +239,9 @@ class SchwabBroker:
         self.token_path = self._resolve_path(token)
         if self.token_path.is_dir():                     # a FOLDER means the token.json inside it (opening a folder is a PermissionError on Windows)
             self.token_path = self.token_path / "token.json"
+        # 2026-10-14: with no explicit SCHWAB_TOKEN_PATH this bot and its sibling Schwab bot (schwab/0dte <-> schwab/45DTE: same app, same
+        # account) share whichever login is NEWEST -- see _select_token_path
+        self._explicit_token_path = self.token_path != HERE / "token.json"
 
     # ------------------------------------------------------------------ plumbing
 
@@ -251,10 +255,38 @@ class SchwabBroker:
 
     AUTH_PROBE_SEC = 60.0
 
+    def _sibling_token_paths(self) -> list[Path]:
+        """token.json of the other Schwab bot folders next to this one (a folder with its own schwab_login.py)."""
+        found: list[Path] = []
+        try:
+            for folder in sorted(HERE.parent.iterdir()):
+                if folder != HERE and folder.is_dir() and (folder / "schwab_login.py").is_file() and (folder / "token.json").is_file():
+                    found.append(folder / "token.json")
+        except OSError:
+            pass
+        return found
+
+    def _select_token_path(self) -> Path:
+        """The token file to use right now. Logging in again appears to cancel the older login for the same Schwab app, so the bots must not
+        each cling to a file of their own: with no explicit SCHWAB_TOKEN_PATH this bot uses the NEWEST login among its own token.json and its
+        sibling bots' (a tie keeps its own). That is the valid one whether or not an older login is cancelled, and re-logging in from either
+        bot's folder keeps both working without restarting. An explicit SCHWAB_TOKEN_PATH, or a path set by hand, is used exactly as given."""
+        own = HERE / "token.json"
+        siblings = self._sibling_token_paths()
+        if self._explicit_token_path or self.token_path not in [own, *siblings]:
+            return self.token_path
+        best = own
+        best_created = schwab_health.token_created_at(own) if own.is_file() else None
+        for candidate in siblings:
+            created = schwab_health.token_created_at(candidate)
+            if created is not None and (best_created is None or created > best_created):
+                best, best_created = candidate, created
+        return best
+
     def token_status(self, now: datetime | None = None) -> dict:
         """schwab_health.assess for this bot's token file (state OK / WARN / EXPIRING / DEAD / MISSING)."""
         stop = self._cfg("FORCE_CLOSE_TIME", None) or schwab_health.DEFAULT_HARD_STOP
-        return schwab_health.assess(self.token_path, now, hard_stop=stop,
+        return schwab_health.assess(self._select_token_path(), now, hard_stop=stop,
                                     margin_min=float(self._cfg("TOKEN_ENTRY_MARGIN_MIN", 30)),
                                     warn_days=float(self._cfg("TOKEN_WARN_DAYS", 5.0)),
                                     relogin=f"cd {HERE.name} && {SchwabAuthError.reauth_command}")
@@ -265,8 +297,13 @@ class SchwabBroker:
                                f"re-login: cd {HERE.name} && {SchwabAuthError.reauth_command}")
 
     def _get_client(self) -> SchwabClient:
+        chosen = self._select_token_path()
+        if chosen != self.token_path:
+            self.log.warning("Schwab: using the NEWER login in %s (this bot's own token file is older or missing)", chosen)
+            self.token_path = chosen
         created = schwab_health.token_created_at(self.token_path) if self.token_path.is_file() else None
-        if self._client is not None and (self._token_created is None or created == self._token_created):
+        if self._client is not None and (self._token_created is None
+                                         or (created == self._token_created and self.token_path == self._client_token_path)):
             return self._client        # (an injected client, as the tests use, has no recorded token and is never replaced)
         if self._client is not None:
             self.log.warning("Schwab token file was replaced (new login): reloading the client")
@@ -283,6 +320,7 @@ class SchwabBroker:
             raise SchwabAuthError(f"could not load Schwab token from {self.token_path}: {exc} -- re-login: "
                                   f"cd {HERE.name} && {SchwabAuthError.reauth_command}") from exc
         self._token_created = created
+        self._client_token_path = self.token_path
         self._auth_dead_until = 0.0
         return self._client
 

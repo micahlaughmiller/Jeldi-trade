@@ -192,7 +192,14 @@ ES_SCHWAB_SYMBOL = "/ES"
 # Schwab's refresh token rotates on each use, so separate copies would invalidate each other.
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
-SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
+def _token_file(raw: str, default: str) -> str:
+    """The token file to use. A blank setting means the default; a setting that names an existing FOLDER (the Schwab bot's own folder)
+    means the token.json inside it -- opening a folder as a file raises PermissionError on Windows, which once looked like a locked file."""
+    chosen = (raw or "").strip() or default
+    return str(Path(chosen) / "token.json") if Path(chosen).is_dir() else chosen
+
+
+SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
 
 MARKET_OPEN = time(9, 30)
 # 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same

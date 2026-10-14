@@ -28,7 +28,14 @@ TRADER_NAME = os.getenv("TRADER_NAME", "SCHWAB").upper()
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
 SCHWAB_CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8080")
-SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", str(Path(__file__).resolve().parent / "token.json"))
+def _token_file(raw: str, default: str) -> str:
+    """The token file to use. A blank setting means the default; a setting that names an existing FOLDER (the Schwab bot's own folder)
+    means the token.json inside it -- opening a folder as a file raises PermissionError on Windows, which once looked like a locked file."""
+    chosen = (raw or "").strip() or default
+    return str(Path(chosen) / "token.json") if Path(chosen).is_dir() else chosen
+
+
+SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), str(Path(__file__).resolve().parent / "token.json"))
 SCHWAB_ACCOUNT_INDEX = int(os.getenv("SCHWAB_ACCOUNT_INDEX", "0"))
 PAPER_TRADING = False
 

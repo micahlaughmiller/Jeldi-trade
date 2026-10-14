@@ -585,3 +585,46 @@ def test_token_status_reads_this_bots_token_and_its_hard_stop(tmp_path, monkeypa
     assert st["state"] in ("WARN", "EXPIRING") and "schwab_login.py --force" in st["relogin"]
     if hasattr(b, "token_status"):
         assert b.token_status()["state"] == st["state"]                      # the simulated broker reports its data broker's token
+
+
+# ------------------------------------------------- 2026-10-12: which token file? (a folder path, and the file named in every auth error)
+
+def test_a_token_path_that_names_a_folder_means_the_token_json_inside_it(tmp_path, monkeypatch):
+    folder = tmp_path / "0dte"
+    folder.mkdir()
+    cfg = make_config(tmp_path)
+    cfg.SCHWAB_TOKEN_PATH = str(folder)
+    b = Broker(cfg, dry_run=True, log=logging.getLogger("t"))
+    sb = getattr(b, "data", b)
+    assert sb.token_path == folder / "token.json"
+    cfg.SCHWAB_TOKEN_PATH = str(tmp_path / "elsewhere.json")                  # a file path (existing or not) is left alone
+    b = Broker(cfg, dry_run=True, log=logging.getLogger("t"))
+    assert getattr(b, "data", b).token_path == tmp_path / "elsewhere.json"
+
+
+def test_every_auth_error_names_the_token_file_it_read(brk, monkeypatch):
+    brk.token_path = Path("C:/bots/schwab/45DTE/token.json")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(broker_mod.time, "monotonic", lambda: clock["t"])
+
+    def refresh_fails(*a, **k):
+        raise _OAuthError("invalid_grant")
+    with pytest.raises(broker_mod.SchwabAuthError) as first:
+        brk._request(refresh_fails)
+    with pytest.raises(broker_mod.SchwabAuthError) as skipped:
+        brk._request(refresh_fails)
+    for err in (first.value, skipped.value):
+        assert str(brk.token_path) in str(err) and "token file:" in str(err) and "schwab_login.py --force" in str(err)
+
+
+def test_the_login_script_writes_the_token_json_inside_a_folder_path(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("schwab_login_under_test", Path(__file__).resolve().parents[1] / "schwab_login.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    folder = tmp_path / "0dte"
+    folder.mkdir()
+    monkeypatch.setenv("SCHWAB_TOKEN_PATH", str(folder))
+    assert module._token_path() == folder / "token.json"
+    monkeypatch.setenv("SCHWAB_TOKEN_PATH", str(tmp_path / "x.json"))
+    assert module._token_path() == tmp_path / "x.json"

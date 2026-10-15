@@ -140,6 +140,8 @@ def make_config(tmp_path: Path, **overrides) -> types.ModuleType:
     cfg.CLOSE_RETRY_SEC = 0.01
     cfg.CLOSE_MAX_RETRIES = 2
     cfg.RISK_FREE_RATE = 0.04
+    cfg.SCHWAB_ACCOUNT_FILE = str(tmp_path / "selected_account.json")      # never the real folder's selection
+    cfg.SCHWAB_ACCOUNT_INDEX = 0                                           # nor whatever this machine's environment says
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg

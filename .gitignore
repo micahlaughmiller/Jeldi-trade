@@ -22,3 +22,6 @@ venv/
 
 # shared market-data snapshots written by the bots at runtime
 shared_data/
+
+# the Schwab account chosen for live orders (holds Schwab's opaque account hash)
+selected_account.json*

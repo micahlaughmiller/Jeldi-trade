@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browser", action="store_true",
                         help="use the browser-assisted flow (starts a local HTTPS listener on the callback port)")
     parser.add_argument("--force", action="store_true", help="overwrite an existing token without asking")
+    parser.add_argument("--no-select", action="store_true", help="do not offer the account choice after the login")
     args = parser.parse_args(argv)
 
     app_key = os.getenv("SCHWAB_APP_KEY", "").strip()
@@ -64,18 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         client = client_from_manual_flow(api_key=app_key, app_secret=app_secret,
                                          callback_url=callback_url, token_path=str(token_path))
 
-    resp = client.get_account_numbers()
-    if resp.status_code != 200:
-        print(f"Token written, but account lookup returned HTTP {resp.status_code}: {resp.text[:200]}",
-              file=sys.stderr)
-        return 1
-    accounts = resp.json()
-    print(f"\nSuccess. Token saved to {token_path}. {len(accounts)} linked account(s):")
-    for i, acct in enumerate(accounts):
-        number = str(acct.get("accountNumber", ""))
-        print(f"  index {i}: ...{number[-4:]}")
-    print("Set SCHWAB_ACCOUNT_INDEX in .env or config to pick the trading account (default 0).")
-    return 0
+    print(f"\nSuccess. Token saved to {token_path}.")
+    import schwab_accounts
+    return schwab_accounts.after_login(client, HERE, interactive=sys.stdin.isatty(), no_select=args.no_select)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ SchwabBroker, whatever the mode.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -42,9 +43,11 @@ with warnings.catch_warnings():
 
 try:
     from . import options_math
+    from . import schwab_accounts
     from . import schwab_health
 except ImportError:  # running as a plain script from the folder
     import options_math  # type: ignore
+    import schwab_accounts  # type: ignore
     import schwab_health  # type: ignore
 
 if TYPE_CHECKING:
@@ -210,6 +213,8 @@ class SchwabBroker:
         self._client_token_path: Path | None = None      # the token file the current client was built from
 
         mode = str(self._cfg("SCHWAB_MODE", "live")).strip().lower()
+        if mode not in ("sim", "dry_run", "live"):
+            raise BrokerError(f"SCHWAB_MODE={mode!r} is not one of sim, dry_run, live")
         requested = dry_run if dry_run is not None else bool(self._cfg("DRY_RUN", True))
         if mode in ("sim", "dry_run"):
             requested = True
@@ -242,6 +247,16 @@ class SchwabBroker:
         # 2026-10-14: with no explicit SCHWAB_TOKEN_PATH this bot and its sibling Schwab bot (schwab/0dte <-> schwab/45DTE: same app, same
         # account) share whichever login is NEWEST -- see _select_token_path
         self._explicit_token_path = self.token_path != HERE / "token.json"
+        # 2026-10-15 go-live safety. Active in the live and dry_run modes (never in the simulator): the account must be SELECTED (see
+        # schwab_accounts.py) before live orders, the capital the bot sees is capped (_with_guards) and opening orders are clamped to
+        # LIVE_MAX_CONTRACTS_PER_TRADE (place_credit_spread). The strategies' own sizing is capped by config.HARD_MAX_CONTRACTS too.
+        self._guards_active = mode != "sim"
+        self.selection_path = self._resolve_path(self._cfg("SCHWAB_ACCOUNT_FILE", None) or schwab_accounts.FILE_NAME)
+        self._selected_stamp: int | None = None            # mtime of the selection file the cached account hash was resolved from
+        self._account_entry: dict | None = None            # the linked account in use: {"last4", "type", "selected"}
+        self._capital: dict | None = None                  # today's capital state: {"date", "raw_start", "cap", "floor", "pct"}
+        self._last_account: dict | None = None             # the last get_account() result, for the start-of-day report
+        self._contract_cap()                                # an invalid cap stops the bot at start-up, not at the first order
 
     # ------------------------------------------------------------------ plumbing
 
@@ -324,19 +339,19 @@ class SchwabBroker:
         self._auth_dead_until = 0.0
         return self._client
 
-    def _request(self, fn, *args, allow: tuple[int, ...] = (), **kwargs) -> httpx.Response:
+    def _request(self, fn, *args, allow: tuple[int, ...] = (), attempts: int = 3, **kwargs) -> httpx.Response:
         name = getattr(fn, "__name__", str(fn))
         wait = self._auth_dead_until - time.monotonic()
         if wait > 0:
             raise SchwabAuthError(f"Schwab {name} skipped: the token was rejected a moment ago (next attempt in {wait:.0f}s) "
                                   f"[token file: {self.token_path}] -- re-login: cd {HERE.name} && {SchwabAuthError.reauth_command}")
         last_exc: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
                 resp = fn(*args, **kwargs)
             except (httpx.HTTPError, OSError) as exc:
                 last_exc = exc
-                self.log.warning("Schwab %s transport error (attempt %d/3): %s", name, attempt + 1, exc)
+                self.log.warning("Schwab %s transport error (attempt %d/%d): %s", name, attempt + 1, attempts, exc)
                 self._sleep(0.5 * (2 ** attempt))
                 continue
             except Exception as exc:     # 2026-10-08: the token refresh happens INSIDE the call; these used to kill the process
@@ -346,15 +361,15 @@ class SchwabBroker:
                 raise BrokerError(f"Schwab {name} failed: {detail}") from exc
             if resp.status_code == 401 and 401 not in allow:
                 raise self._auth_error(name, f"HTTP 401 {resp.text[:200]}")
-            if resp.status_code in _RETRY_STATUS and attempt < 2:
-                self.log.warning("Schwab %s HTTP %s (attempt %d/3)", name, resp.status_code, attempt + 1)
+            if resp.status_code in _RETRY_STATUS and attempt < attempts - 1:
+                self.log.warning("Schwab %s HTTP %s (attempt %d/%d)", name, resp.status_code, attempt + 1, attempts)
                 self._sleep(0.5 * (2 ** attempt))
                 continue
             if resp.is_error and resp.status_code not in allow:
                 raise BrokerError(f"Schwab {name} failed: HTTP {resp.status_code} {resp.text[:400]}")
             self._auth_dead_until = 0.0
             return resp
-        raise BrokerError(f"Schwab {name} failed after 3 attempts: {last_exc}")
+        raise BrokerError(f"Schwab {name} failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}")
 
     @staticmethod
     def _json(resp: httpx.Response) -> Any:
@@ -363,18 +378,59 @@ class SchwabBroker:
         except ValueError as exc:
             raise BrokerError(f"Schwab returned non-JSON body: {resp.text[:200]}") from exc
 
+    def _selection_stamp(self) -> int | None:
+        try:
+            return self.selection_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _assert_selection_unchanged(self) -> None:
+        """Opening orders only (live). The owner may choose another account, or remove the choice, after this bot resolved its account. The bot
+        keeps managing what it holds (reads, cancels and closes stay on the account it started with, so nothing is orphaned) but opens nothing
+        new until it is restarted: a bot must never open on one account while its positions sit on another."""
+        if self.dry_run or not self._guards_active or self._account_hash is None:
+            return
+        stamp = self._selection_stamp()
+        if stamp == self._selected_stamp:
+            return
+        selection = schwab_accounts.read_selection(self.selection_path)
+        in_use = f"...{(self._account_number or '')[-4:]}"
+        if selection is None:
+            raise BrokerError(f"The Schwab account selection was removed or is unreadable while the bot runs: NO new orders until it is restarted "
+                              f"(open positions are still managed on {in_use}). Run python schwab_select_account.py, then restart the bot.")
+        if selection["hash_value"] != self._account_hash:
+            raise BrokerError(f"The selected Schwab account is now {schwab_accounts.describe(selection)} but this bot trades {in_use}: NO new orders "
+                              f"until it is restarted (open positions are still managed on {in_use}).")
+        self._selected_stamp = stamp                 # the same account was saved again
+
     def _hash(self) -> str:
+        """Schwab's hash of the account the bot trades. LIVE orders need an account the owner SELECTED after the last login (selected_account.json:
+        schwab_login.py offers the choice, `python schwab_select_account.py` repeats it); it must still be linked to this login. Without
+        a saved selection a dry-run/sim bot falls back to SCHWAB_ACCOUNT_INDEX (as before), a live bot refuses."""
         if self._account_hash is not None:
-            return self._account_hash
+            return self._account_hash                # resolved once per process: reads, cancels and closes stay on this account (see _assert_selection_unchanged)
         client = self._get_client()
         numbers = self._json(self._request(client.get_account_numbers))
         if not numbers:
             raise BrokerError("Schwab returned no linked accounts for this token")
-        if self.account_index >= len(numbers):
-            raise BrokerError(f"SCHWAB_ACCOUNT_INDEX={self.account_index} but only {len(numbers)} account(s) linked")
-        entry = numbers[self.account_index]
+        self._selected_stamp = self._selection_stamp()
+        selection = schwab_accounts.read_selection(self.selection_path) if self._guards_active else None
+        if selection is not None:
+            entry = next((n for n in numbers if n.get("hashValue") == selection["hash_value"]), None)
+            if entry is None or str(entry.get("accountNumber", ""))[-4:] != str(selection["last4"]):
+                raise BrokerError(f"The selected Schwab account ({schwab_accounts.describe(selection)}) is not linked to this login any more: "
+                                  f"run python schwab_select_account.py to choose the account again")
+        elif not self.dry_run:
+            raise BrokerError("No Schwab account has been selected for LIVE orders: run python schwab_select_account.py "
+                              "(schwab_login.py also offers the choice right after a login). Nothing was sent.")
+        else:
+            if self.account_index >= len(numbers):
+                raise BrokerError(f"SCHWAB_ACCOUNT_INDEX={self.account_index} but only {len(numbers)} account(s) linked")
+            entry = numbers[self.account_index]
         self._account_hash = entry["hashValue"]
         self._account_number = str(entry.get("accountNumber", ""))
+        self._account_entry = {"last4": self._account_number[-4:], "type": str((selection or {}).get("type") or ""),
+                               "selected": selection is not None}
         return self._account_hash
 
     @staticmethod
@@ -405,13 +461,104 @@ class SchwabBroker:
             obp = _f(bal.get(key))
             if obp is not None:
                 break
-        return {
+        raw = {
             "equity": _f(bal.get("liquidationValue"), _f(bal.get("equity"), 0.0)),
             "cash": _f(bal.get("cashBalance"), 0.0),
             "buying_power": buying_power,
             "options_buying_power": obp if obp is not None else buying_power,
             "account_id": str(acct.get("accountNumber") or self._account_number or ""),
         }
+        self._last_account = self._with_guards(raw)
+        return self._last_account
+
+    # ------------------------------------------------------------------ go-live capital cap
+
+    def _capital_cap_active(self) -> bool:
+        return self._guards_active and bool(self._cfg("LIVE_CAPITAL_CAP_ENABLED", False))
+
+    def _capital_file(self) -> Path:
+        return self.log_dir / "live_capital.json"
+
+    def _capital_state(self, raw_equity: float) -> dict:
+        """Today's capital base, fixed at the first account read of the ET day and kept in logs/live_capital.json so a restart the same
+        day continues it: cap = the GREATER of LIVE_CAPITAL_FLOOR_USD and LIVE_CAPITAL_PCT of the account's total value, never more than the
+        account actually holds."""
+        today = datetime.now(ET).date().isoformat()
+        state = self._capital
+        if state is None:
+            try:
+                state = json.loads(self._capital_file().read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                state = None
+        floor = float(self._cfg("LIVE_CAPITAL_FLOOR_USD", 1000.0))
+        pct = float(self._cfg("LIVE_CAPITAL_PCT", 0.25))
+        account = hashlib.sha256((self._account_hash or "").encode()).hexdigest()[:12]       # a digest: the account hash itself is not written to logs
+        if not isinstance(state, dict) or state.get("date") != today or state.get("account") != account \
+                or state.get("floor") != floor or state.get("pct") != pct \
+                or not isinstance(state.get("raw_start"), (int, float)) or not isinstance(state.get("cap"), (int, float)):
+            state = {"date": today, "account": account, "raw_start": raw_equity,
+                     "cap": round(min(raw_equity, max(floor, pct * raw_equity)), 2), "floor": floor, "pct": pct}
+            try:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                self._capital_file().write_text(json.dumps(state), encoding="utf-8")
+            except OSError as exc:
+                self.log.warning("could not save %s (%s): the capital base is kept in memory only", self._capital_file(), exc)
+        self._capital = state
+        return state
+
+    def _with_guards(self, raw: dict) -> dict:
+        """The account as the strategies must see it. With the cap on, the bot works with a virtual account: today's capital cap less the
+        day's real loss (so a $1 loss in the account is a $1 loss to the bot's daily-loss limit), never MORE than the cap (a profit, a deposit
+        or a hand trade cannot raise it), and cash / buying power never exceed it. The real figures stay in raw_equity / raw_cash / raw_buying_power."""
+        if not self._capital_cap_active():
+            return raw
+        equity = raw.get("equity") or 0.0
+        if equity <= 0:                                  # total value unknown: the cap cannot be sized, so nothing is usable (fail closed)
+            return {**raw, "equity": 0.0, "cash": 0.0, "buying_power": 0.0, "options_buying_power": 0.0,
+                    "raw_equity": equity, "raw_cash": raw.get("cash"), "raw_buying_power": raw.get("buying_power"), "capital_cap": 0.0}
+        state = self._capital_state(float(equity))
+        virtual = max(min(state["cap"] + (float(equity) - state["raw_start"]), state["cap"]), 0.0)       # a ceiling: profits and deposits never raise it
+        capped = dict(raw)
+        capped["equity"] = round(virtual, 2)
+        for key in ("cash", "buying_power", "options_buying_power"):
+            value = raw.get(key)
+            capped[key] = round(min(value, virtual), 2) if isinstance(value, (int, float)) else value
+        capped.update(raw_equity=equity, raw_cash=raw.get("cash"), raw_buying_power=raw.get("buying_power"), capital_cap=state["cap"])
+        return capped
+
+    def _contract_cap(self) -> int | None:
+        value = self._cfg("LIVE_MAX_CONTRACTS_PER_TRADE", None)
+        if not self._guards_active or value is None:
+            return None
+        try:
+            cap = int(value)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap < 1:                                      # 0, negative or garbage must never mean "no cap"
+            raise BrokerError(f"LIVE_MAX_CONTRACTS_PER_TRADE={value!r} is invalid: it must be a whole number of at least 1")
+        return cap
+
+    def account_report_lines(self) -> list[str]:
+        """Lines for the start-of-day report: which account, how much capital, how many contracts, live or dry-run (nothing in the simulator)."""
+        if not self._guards_active:
+            return []
+        try:
+            self._hash()
+        except BrokerError as exc:
+            return [f"Account: NOT SELECTED -- {exc}"]
+        entry = self._account_entry or {}
+        kind = f" ({entry['type']})" if entry.get("type") else ""
+        how = "selected" if entry.get("selected") else f"by SCHWAB_ACCOUNT_INDEX={self.account_index}, NO account selected yet"
+        lines = [f"Account: ...{entry.get('last4', '?')}{kind} [{how}] -- "
+                 + ("DRY-RUN: orders are logged, not sent" if self.dry_run else "LIVE ORDERS: REAL MONEY")]
+        acct, state = self._last_account, self._capital
+        if self._capital_cap_active() and acct and state and acct.get("raw_equity") is not None:
+            lines.append(f"Capital: ${acct['equity']:,.2f} usable of ${acct['raw_equity']:,.2f} in the account (cap = the greater of "
+                         f"${state['floor']:,.0f} or {state['pct']:.0%} of the account, never more than it holds; this bot process only)")
+        cap = self._contract_cap()
+        if cap:
+            lines.append(f"Contracts: at most {cap} per opening order (LIVE_MAX_CONTRACTS_PER_TRADE)")
+        return lines
 
     def _equity_history_path(self) -> Path:
         return self.log_dir / "equity_history.csv"
@@ -433,7 +580,8 @@ class SchwabBroker:
         return rows
 
     def record_daily_equity(self) -> None:
-        equity = self.get_account()["equity"]
+        acct = self.get_account()
+        equity = acct.get("raw_equity", acct["equity"])          # the real account value, not the capped one: get_pnl_summary compares it with the real value
         today = datetime.now(ET).date()
         rows = [r for r in self._read_equity_history() if r[0] != today]
         rows.append((today, equity))
@@ -724,8 +872,23 @@ class SchwabBroker:
         if self.dry_run:
             return self._dry_order(order_json, underlying, time_in_force, label)
         client = self._get_client()
+        account_hash = self._hash()                      # refuses (BrokerError) unless a selected, still-linked account: nothing is sent then
         self.log.warning("[LIVE] %s sending: %s", label, json.dumps(order_json))
-        resp = self._request(client.place_order, self._hash(), order_json)
+        try:
+            # never blind-retry an order: a timeout or 5xx can follow an order Schwab DID accept, and a second POST would open a second position
+            resp = self._request(client.place_order, account_hash, order_json, attempts=1)
+        except SchwabAuthError:
+            raise
+        except BrokerError as exc:
+            try:
+                found = self._matching_working_order(order_json)
+            except BrokerError as exc2:
+                raise BrokerError(f"{label} may or may not have reached Schwab and was NOT re-sent ({exc}); looking for the resting order failed "
+                                  f"too ({exc2}): check the account before restarting") from exc
+            if found is None:
+                raise BrokerError(f"{label} was NOT re-sent (a second POST could open a duplicate): {exc}") from exc
+            self.log.warning("%s: no reply, but Schwab holds the order: using %s", label, found["id"])
+            return found
         order_id = self._order_id_from_response(resp)
         if order_id is None:
             raise BrokerError(f"Schwab accepted {label} (HTTP {resp.status_code}) but returned no order id")
@@ -738,6 +901,17 @@ class SchwabBroker:
             order = self._synthetic_order(order_json, underlying, time_in_force, order_id, "accepted")
         return order
 
+    def _matching_working_order(self, order_json: dict) -> dict | None:
+        """A resting order with exactly the legs, instructions, quantity and price of order_json (after place_order failed ambiguously), else None."""
+        wanted = sorted((leg["instruction"].lower(), to_occ(leg["instrument"]["symbol"])) for leg in order_json["orderLegCollection"])
+        qty = int(order_json["orderLegCollection"][0]["quantity"])
+        price = float(order_json["price"])
+        for order in self.get_open_orders():
+            got = sorted((str(leg.get("position_intent", "")).lower(), leg["symbol"]) for leg in order.get("legs") or [])
+            if got == wanted and int(order.get("qty") or 0) == qty and abs(float(order.get("limit_price") or 0.0) - price) < 0.005:
+                return order
+        return None
+
     def _spread_legs(self, underlying: str, expiration: date, right: str, short_strike: float,
                      long_strike: float, root: str | None) -> tuple[str, str, str]:
         r = (root or _strip_index(underlying) or underlying).upper()
@@ -749,6 +923,12 @@ class SchwabBroker:
                             long_strike: float, qty: int, limit_credit: float, time_in_force: str = "gtc",
                             root: str | None = None, client_tag: str | None = None) -> dict:
         und, short_sym, long_sym = self._spread_legs(underlying, expiration, right, short_strike, long_strike, root)
+        self._assert_selection_unchanged()
+        cap = self._contract_cap()
+        if cap is not None and qty > cap:                # the last line of defence behind the strategies' own sizing; closes are never clamped
+            self.log.warning("LIVE CAP: %s %s/%s asked for %d contracts: opening %d (LIVE_MAX_CONTRACTS_PER_TRADE)",
+                             client_tag or und, short_sym, long_sym, qty, cap)
+            qty = cap
         order_json = self._vertical_json("NET_CREDIT", limit_credit, time_in_force, qty,
                                          [("SELL_TO_OPEN", short_sym), ("BUY_TO_OPEN", long_sym)])
         label = f"place_credit_spread({client_tag or und} {short_sym}/{long_sym} x{qty} @ {limit_credit:.2f})"

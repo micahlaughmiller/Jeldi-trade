@@ -145,3 +145,11 @@ def make_candles(start: datetime, bars: list[tuple[float, float, float, float]],
 @pytest.fixture
 def now_1000() -> datetime:
     return et(10, 0)
+
+
+@pytest.fixture(autouse=True)
+def _pin_golive_caps_off(request, monkeypatch):
+    """The Schwab go-live contract cap (config.HARD_MAX_CONTRACTS, 1 in dry_run/live) is not part of the shared suite, whatever SCHWAB_MODE this
+    machine's .env holds; test_golive_caps sets it itself. Alpaca configs have no such setting (raising=False)."""
+    if request.module.__name__ != "test_golive_caps":
+        monkeypatch.setattr(config, "HARD_MAX_CONTRACTS", None, raising=False)

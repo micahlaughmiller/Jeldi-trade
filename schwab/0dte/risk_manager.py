@@ -39,6 +39,9 @@ def contracts_for(equity: float, width: float, credit: float, open_risk_dollars:
     n = min(n, max(portfolio_cap, 0), contract_cap)
     if news_day and config.NEWS_DAY_MODE == "half_size" and n >= 1:
         n = max(1, n // 2)
+    hard_cap = getattr(config, "HARD_MAX_CONTRACTS", None)      # 2026-10-15: the live go-live cap (Schwab configs only; None elsewhere)
+    if hard_cap is not None:                                    # 0 means "no contracts", never "no cap"
+        n = min(n, max(int(hard_cap), 0))
     return max(n, 0)
 
 

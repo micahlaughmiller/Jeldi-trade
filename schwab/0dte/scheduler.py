@@ -250,6 +250,9 @@ class Bot:
             self._restore_breakout_state(saved_today)
         else:
             self.risk = RiskManager(acct["equity"])
+        cap = acct.get("capital_cap")      # 2026-10-15 (Schwab go-live): the day's virtual start-of-day equity IS the capital cap, whatever a restored state saw
+        if cap:
+            self.risk.state.start_equity = cap
         positions = self.broker.get_positions()
         legs = self.bot_legs(positions)
         foreign = self.foreign_legs(positions)
@@ -1184,8 +1187,14 @@ class Bot:
             order = self.broker.replace_order_price(order["id"], next_limit)
             limit = next_limit
         log.info("Entry timeout: cancelling order %s", order["id"])
-        self.broker.cancel_order(order["id"])
-        return self.broker.get_order(order["id"]) or order
+        try:
+            self.broker.cancel_order(order["id"])
+        except BrokerError as e:      # 2026-10-15: a cancel can fail because the order FILLED a moment ago; that is never 'not filled'
+            log.warning("Entry cancel of %s failed (%s): re-reading the order in case it filled", order["id"], e)
+        final = self.broker.get_order(order["id"]) or order
+        if final.get("status") not in TERMINAL:                 # pending-cancel and the like: let it settle so a late fill is seen
+            final = self.broker.wait_for_fill(order["id"], 5.0, 1.0)
+        return final
 
     # ---------------------------------------------------------------- manage
 
@@ -1394,6 +1403,13 @@ class Bot:
             return [f"Schwab token: status unavailable ({e})"]
         return [f"Schwab token: {st['state']} -- {st['message']}"]
 
+    def _broker_report_lines(self) -> list[str]:
+        """Extra start-of-day lines the broker wants shown (the Schwab broker: account, capital cap, contract cap, live or dry-run)."""
+        try:
+            return list(getattr(self.broker, "account_report_lines", lambda: [])())
+        except Exception as e:      # noqa: BLE001 -- a report line must never stop the bot from starting
+            return [f"Broker notes unavailable ({type(e).__name__})"]
+
     @staticmethod
     def _live_es_report_line() -> str:
         try:
@@ -1419,6 +1435,7 @@ class Bot:
             f"({'PAPER' if self.broker.is_paper else 'LIVE'}){'  DRY-RUN' if self.broker.dry_run else ''}",
             f"Equity {fmt_money(acct['equity'])}  Cash {fmt_money(acct['cash'])}  "
             f"Options BP {fmt_money(acct['options_buying_power'])}",
+            *self._broker_report_lines(),
             *self._token_report_lines(now),
             f"P/L  YTD {fmt_money(pnl['ytd'])}  MTD {fmt_money(pnl['mtd'])}  Today {fmt_money(pnl['today'])}",
             f"Open positions: {len(positions)}" + "".join(

@@ -46,8 +46,38 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 
-SCHWAB_MODE = os.getenv("SCHWAB_MODE", "sim").strip().lower()   # sim | dry_run | live
+SCHWAB_MODE = os.getenv("SCHWAB_MODE", "sim").strip().lower() or "sim"   # sim | dry_run | live
+if SCHWAB_MODE not in ("sim", "dry_run", "live"):          # 2026-10-15: a typo must never fall through to live
+    raise ValueError(f"SCHWAB_MODE={SCHWAB_MODE!r} is not one of sim, dry_run, live (fix it in .env)")
 SIM_STARTING_EQUITY = float(os.getenv("SIM_STARTING_EQUITY", "2000"))
+# 2026-10-15 GO-LIVE SAFETY (live and dry_run modes; the simulator is never capped). The capital the bot sees is the GREATER of
+# LIVE_CAPITAL_FLOOR_USD and LIVE_CAPITAL_PCT of the account's total value (never more than the account holds), plus the day's real P/L; opening orders
+# are clamped to LIVE_MAX_CONTRACTS_PER_TRADE contracts, and the strategies' own sizing is capped by HARD_MAX_CONTRACTS. Live orders also need an account
+# chosen with schwab_select_account.py after each login. Raise the contract cap only once the live model has been shaken out.
+
+
+def _live_setting(name, default, cast, valid, rule):
+    """A go-live limit from the environment. Blank = the default. An invalid value stops the bot at start-up (a typo such as 0, 25 or 'abc' must never
+    switch a cap off or widen it); the simulator ignores these limits, so there an invalid value just falls back to the default."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+        if valid(value):
+            return value
+    except ValueError:
+        pass
+    if SCHWAB_MODE == "sim":
+        return default
+    raise ValueError(f"{name}={raw!r} is invalid ({rule}); fix it in .env")
+
+
+LIVE_CAPITAL_CAP_ENABLED = SCHWAB_MODE != "sim"
+LIVE_CAPITAL_FLOOR_USD = _live_setting("LIVE_CAPITAL_FLOOR_USD", 1000.0, float, lambda v: 0 <= v < 1e9, "dollars, 0 or more")
+LIVE_CAPITAL_PCT = _live_setting("LIVE_CAPITAL_PCT", 0.25, float, lambda v: 0 < v <= 1, "a fraction above 0 and at most 1, e.g. 0.25")
+LIVE_MAX_CONTRACTS_PER_TRADE = _live_setting("LIVE_MAX_CONTRACTS_PER_TRADE", 1, int, lambda v: v >= 1, "a whole number of at least 1")
+HARD_MAX_CONTRACTS = LIVE_MAX_CONTRACTS_PER_TRADE if SCHWAB_MODE != "sim" else None
 SIM_QUOTE_CACHE_SEC = 10
 SIM_FILL_START = "09:30"
 SIM_FILL_END = "16:00"

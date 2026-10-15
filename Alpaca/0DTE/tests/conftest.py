@@ -15,13 +15,15 @@ ET = config.ET
 
 
 @pytest.fixture(autouse=True)
-def _pin_default_strategies(monkeypatch):
+def _pin_default_strategies(request, monkeypatch):
     """The legacy suite asserts exact A/B key sets; ASTRA's persona override adds F, so every test
-    starts from the default two (tests that set STRATEGIES themselves run later and win)."""
-    monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
+    starts from the default two (tests that set STRATEGIES themselves run later and win). The per-folder guard
+    module checks what each folder really ships."""
+    if request.module.__name__ != "test_schwab_adoption_rules":
+        monkeypatch.setattr(config, "STRATEGIES", ("A", "B"))
 
 
-REAL_CONFIG_MODULES = ("test_session_limits",)   # these run against the shipped session/limit values
+REAL_CONFIG_MODULES = ("test_session_limits", "test_alpaca_adoption_rules", "test_schwab_adoption_rules")   # these run against the shipped session/limit values
 
 
 @pytest.fixture(autouse=True)
@@ -120,6 +122,7 @@ def _pin_adoption_default(request, monkeypatch):
     turns that off, so pin it -- except in the per-folder guard modules that check each folder's real value."""
     if request.module.__name__ not in GUARD_MODULES:
         monkeypatch.setattr(config, "ADOPT_UNTRACKED_SPXW", True)
+        monkeypatch.setattr(config, "ADOPT_UNTRACKED_STOCK", True, raising=False)
 
 
 @pytest.fixture(autouse=True)

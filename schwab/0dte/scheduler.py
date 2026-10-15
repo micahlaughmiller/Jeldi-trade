@@ -147,6 +147,7 @@ class Bot:
         self.last_de_candle: datetime | None = None             # Strategies D/E, MA/Bollinger reversion
         self.news_blackout_was_active: bool = False
         self._saved_spxw: set[tuple] = set()       # SPXW contracts today's saved state says THIS bot opened
+        self._saved_stock: set[tuple] = set()      # (root, right, expiration, strike) of stock contracts today's saved state says THIS bot opened (F)
         self._hold_alert_at: datetime | None = None
         self._eod_retry_at: datetime | None = None
         self._data_stale = False                      # an open position has no fresh price (see _check_marks)
@@ -201,7 +202,11 @@ class Bot:
                     (leg["right"], float(leg["strike"]), leg["expiration"]) in self._known_spxw()
             if (root, leg["right"], leg.get("expiration"), float(leg["strike"])) in tracked_legs:
                 return True
-            return f_on and self.f_owns_expiration(leg.get("expiration"))
+            # 2026-10-15: on a shared live account a stock leg inside F's window is only F's if F opened it (tracked now, or in today's saved
+            # state) -- unless adopting untracked legs is switched on (the dedicated Alpaca paper accounts)
+            if (root, leg["right"], leg.get("expiration"), float(leg["strike"])) in self._saved_stock:
+                return True
+            return f_on and getattr(config, "ADOPT_UNTRACKED_STOCK", True) and self.f_owns_expiration(leg.get("expiration"))
 
         return [leg for leg in option_legs(positions) if mine(leg)]
 
@@ -241,6 +246,10 @@ class Bot:
                             for d in ((saved_today or {}).get("positions") or {}).values()
                             if d and d.get("root", config.OPTION_ROOT) == config.OPTION_ROOT
                             for k in ("short_strike", "long_strike")}
+        self._saved_stock = {(d["root"], d["right"], date.fromisoformat(d["expiration"]), float(d[k]))
+                             for d in ((saved_today or {}).get("positions") or {}).values()
+                             if d and d.get("root", config.OPTION_ROOT) != config.OPTION_ROOT
+                             for k in ("short_strike", "long_strike")}
         if saved_today:
             self.risk = RiskManager(acct["equity"], DayState.from_dict(saved_today["day"]))
             self.acted = set(saved_today.get("acted", []))

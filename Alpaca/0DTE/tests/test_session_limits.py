@@ -3,6 +3,8 @@
 
 from datetime import time as dtime
 
+import pytest
+
 import config
 import strategy
 from conftest import et
@@ -92,8 +94,11 @@ def test_with_the_total_cap_off_only_the_per_strategy_caps_apply():
 
 # ------------------------------------------------- at most 2 trades open at one time (2026-10-08)
 
-def test_the_shipped_open_position_cap_is_two():
-    assert config.MAX_OPEN_POSITIONS_TOTAL == 2
+@pytest.fixture(autouse=True)
+def _alpaca_open_cap(monkeypatch):
+    """These tests describe the Alpaca default of two trades open at once; Schwab 0DTE ships one (2026-10-15). Each folder's real value is
+    guarded in its own test_*_adoption_rules.py."""
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 2)
 
 
 def test_a_third_trade_is_refused_while_two_are_open_whatever_the_strategy():

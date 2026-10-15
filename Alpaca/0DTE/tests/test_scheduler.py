@@ -1975,3 +1975,38 @@ def test_a_start_after_the_hard_stop_says_so_too(bot, caplog, monkeypatch):
     bot.run(et(14, 0))
     lines = [r for r in caplog.records if "Started after the hard stop" in r.getMessage()]
     assert len(lines) == 1 and lines[0].keep is True and "13:00" in lines[0].getMessage()
+
+
+# ------------------------------------------------- 2026-10-15: F on a shared (Schwab) account adopts only the stock spreads it opened
+
+def test_stock_legs_the_bot_did_not_open_are_adopted_only_when_untracked_adoption_is_on(bot, monkeypatch):
+    from datetime import timedelta
+    monkeypatch.setattr(config, "STRATEGIES", ("B", "F"))
+    soon = TODAY + timedelta(days=3)                                          # inside F's 0-7 day window
+    bot.broker.add_spread_position("P", 300.0, 295.0, 1, 4.0, 2.5, soon, root="TSLA")   # the owner's own, or a 45DTE spread near its expiration
+    positions = bot.broker.get_positions()
+    monkeypatch.setattr(config, "ADOPT_UNTRACKED_STOCK", False)
+    assert bot.bot_legs(positions) == []
+    assert {leg["strike"] for leg in bot.foreign_legs(positions)} == {300.0, 295.0}
+    bot._saved_stock = {("TSLA", "P", soon, 300.0), ("TSLA", "P", soon, 295.0)}   # today's saved state says F opened it (a restart)
+    assert {leg["strike"] for leg in bot.bot_legs(positions)} == {300.0, 295.0}
+    bot._saved_stock = set()
+    monkeypatch.setattr(config, "ADOPT_UNTRACKED_STOCK", True)                 # the dedicated Alpaca paper accounts
+    assert {leg["strike"] for leg in bot.bot_legs(positions)} == {300.0, 295.0}
+
+
+def test_a_restart_remembers_the_stock_spreads_todays_state_says_f_opened(bot, monkeypatch):
+    from test_position_manager import f_spread
+    monkeypatch.setattr(config, "STRATEGIES", ("B", "F"))
+    monkeypatch.setattr(config, "ADOPT_UNTRACKED_STOCK", False)
+    spread = f_spread("TSLA")
+    bot.pm.open(spread)
+    bot.save_state()
+    bot.broker.add_spread_position(spread.right, spread.short_strike, spread.long_strike, 1, 0.5, 0.32, spread.expiration, root="TSLA")
+    again = scheduler.Bot(dry_run=False, once=True)
+    again.today = TODAY
+    monkeypatch.setattr(again, "run", lambda now: None)                       # start() ends in the main loop
+    again.start()
+    assert again._saved_stock == {("TSLA", spread.right, spread.expiration, float(spread.short_strike)),
+                                  ("TSLA", spread.right, spread.expiration, float(spread.long_strike))}
+    assert {leg["strike"] for leg in again.bot_legs(again.broker.get_positions())} == {float(spread.short_strike), float(spread.long_strike)}

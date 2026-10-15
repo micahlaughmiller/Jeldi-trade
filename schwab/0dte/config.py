@@ -157,6 +157,10 @@ EXTERNAL_PREFLIGHT_RECHECK_SEC = 2
 # force-close them at the hard stop (FORCE_CLOSE_TIME). True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
 # shared with the 45DTE bot and whatever the owner trades by hand (allow-listed in tools/check_sync.py).
 ADOPT_UNTRACKED_SPXW = False
+# The same rule for single-stock option legs (Strategy F): with F on, every stock-option leg in the account that expires within F_MAX_DTE days used to be
+# adopted and force-closed at the hard stop, whoever opened it. On Schwab that would be the owner's hand trades or a 45DTE spread near its expiration, so
+# only legs today's saved state says F opened (or that F tracks now) are managed. True on Alpaca (allow-listed in tools/check_sync.py).
+ADOPT_UNTRACKED_STOCK = False
 # The staged exit's Bollinger-edge reversal check uses this %B level. It used to read D_BAND_TOUCH_PCT_B,
 # the D/E ENTRY threshold, so tuning that for a test persona silently moved every strategy's exits.
 EXIT_BB_TOUCH_PCT_B = 0.95
@@ -273,10 +277,11 @@ BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 # trading data analyzed (41/41 losses, -$8,660), with no day ever net positive, meeting the user's own
 # explicit bar. A's own code is deliberately left in place, unused, same as OVERNIGHT's retirement --
 # reversible if ever revisited, not deleted. Identical to Alpaca/0DTE/config.py.
-STRATEGIES = ("B",)
+# 2026-10-15: Schwab 0DTE trades B (SPX) and F (single-stock ORB) only -- C, D and E stay off. With MAX_OPEN_POSITIONS_TOTAL = 1 below, one
+# trade is open at a time across both. F had never run on Schwab before this date (allow-listed in tools/check_sync.py).
+STRATEGIES = ("B", "F")
 # Strategies that trade single-stock option roots with one position per ticker. They are excluded from
 # every SPX signal fan-out (strategy.spx_strategies) and from SPXW adoption; cards append the ticker.
-# F never runs on Schwab (no persona override here); the shared modules just need the keys.
 STOCK_STRATEGIES = ("F",)
 ALL_STRATEGIES = ("A", "B", "C", "D", "E", "F")
 STRATEGY_LABELS = {
@@ -316,7 +321,7 @@ MAX_TRADES_TOTAL_PER_DAY = None
 # before this each of B-E had its own single slot and F up to 3, so 7 could be open). None = off. A trade being
 # decided is refused while this many are open; positions adopted from the broker at a restart are not counted against a
 # new entry's decision beyond being open.
-MAX_OPEN_POSITIONS_TOTAL = 2
+MAX_OPEN_POSITIONS_TOTAL = 1           # 2026-10-15: Schwab 0DTE (live go-live): ONE trade open at a time across B and F (Alpaca: 2)
 MAX_CONSECUTIVE_LOSSES = 5
 # Per-strategy overrides of the two counters plus a cool-down (minutes after that strategy's last exit
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every

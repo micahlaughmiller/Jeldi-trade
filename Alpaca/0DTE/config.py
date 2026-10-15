@@ -122,6 +122,9 @@ EXTERNAL_PREFLIGHT_RECHECK_SEC = 2
 # force-close them at the hard stop (FORCE_CLOSE_TIME). True on the dedicated Alpaca paper accounts; False on Schwab, whose account is
 # shared with the 45DTE bot and whatever the owner trades by hand (allow-listed in tools/check_sync.py).
 ADOPT_UNTRACKED_SPXW = True
+# The same for single-stock option legs (Strategy F): adopt legs inside F's DTE window that the bot has no record of. True on the dedicated
+# Alpaca paper accounts; False on Schwab (allow-listed in tools/check_sync.py).
+ADOPT_UNTRACKED_STOCK = True
 # The staged exit's Bollinger-edge reversal check uses this %B level. It used to read D_BAND_TOUCH_PCT_B,
 # the D/E ENTRY threshold, so tuning that for a test persona silently moved every strategy's exits.
 EXIT_BB_TOUCH_PCT_B = 0.95

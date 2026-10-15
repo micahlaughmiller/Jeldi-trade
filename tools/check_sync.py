@@ -36,6 +36,10 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
     "0DTE": {
         "ADOPT_UNTRACKED_SPXW": ("True", "False", "2026-10-02: Schwab's account is shared with the 45DTE bot and the owner's "
                                  "hand trades, so it never adopts or force-closes SPXW legs it did not open"),
+        "ADOPT_UNTRACKED_STOCK": ("True", "False", "2026-10-15: the same for single-stock option legs now that Schwab runs Strategy F: "
+                                  "it never adopts or force-closes stock legs it did not open"),
+        "STRATEGIES": ("('B',)", "('B', 'F')", "2026-10-15: Schwab 0DTE trades B and F only (live go-live)"),
+        "MAX_OPEN_POSITIONS_TOTAL": ("2", "1", "2026-10-15: Schwab 0DTE (live go-live) holds ONE trade open at a time across B and F"),
     },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),

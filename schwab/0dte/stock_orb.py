@@ -721,7 +721,8 @@ class StockOrbTrader:
         equity = broker.get_account()["equity"]
         allowed, reason = bot.risk.trading_allowed(
             STRATEGY, equity, now, SETUP, open_count=bot.pm.open_count(STRATEGY),
-            exempt_open_pnl=bot.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT), open_spx=bot.pm.open_spx_count(),
+            exempt_open_pnl=bot.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT), own_open_pnl=bot.pm.open_pnl(bot.loss_limit_strategies()),
+            open_spx=bot.pm.open_spx_count(),
             open_total=bot.pm.open_total_count(), close_blocked=bot.pm.any_close_blocked(),
             halt=bot.entry_halt_reason())
         if not allowed:

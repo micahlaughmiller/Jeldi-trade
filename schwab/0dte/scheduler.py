@@ -631,6 +631,11 @@ class Bot:
             until = spx_candles.index[-1].to_pydatetime() + timedelta(minutes=ES_CHASE_MIN)
             self._es_chase_until = until if self._es_chase_until is None else max(self._es_chase_until, until)
 
+    @staticmethod
+    def loss_limit_strategies() -> tuple[str, ...]:
+        """The strategies whose P/L counts toward the daily loss limit (all but DAILY_LOSS_LIMIT_EXEMPT)."""
+        return tuple(s for s in config.ALL_STRATEGIES if s not in config.DAILY_LOSS_LIMIT_EXEMPT)
+
     def entry_possible(self, equity: float, setup: str | None = None,
                        strategies: tuple[str, ...] | None = None) -> bool:
         self.last_entry_blocks = {}
@@ -641,13 +646,14 @@ class Bot:
         reasons = []
         blocks: dict[str, str] = {}
         exempt_open = self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT)
+        own_open = self.pm.open_pnl(self.loss_limit_strategies())
         for strat in (strategies or strategy.spx_strategies()):
             if strat in self.pm.positions:
                 reasons.append(f"{strat}: position open")
                 blocks[strat] = "position open"
                 continue
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
-                                                        exempt_open_pnl=exempt_open, open_spx=self.pm.open_spx_count(),
+                                                        exempt_open_pnl=exempt_open, own_open_pnl=own_open, open_spx=self.pm.open_spx_count(),
                                                         open_total=self.pm.open_total_count(),
                                                         close_blocked=self.pm.any_close_blocked(),
                                                         halt=self.entry_halt_reason())
@@ -1096,6 +1102,7 @@ class Bot:
                 return f"skip: DAY_GATE ER={0.0 if day_er is None else day_er:.2f} < {min_er:.2f} (choppy)", 0.0
         allowed, reason = self.risk.trading_allowed(strat, equity, now, setup,
                                                     exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT),
+                                                    own_open_pnl=self.pm.open_pnl(self.loss_limit_strategies()),
                                                     open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count(),
                                                     close_blocked=self.pm.any_close_blocked(),
                                                     halt=self.entry_halt_reason())
@@ -1430,6 +1437,17 @@ class Bot:
         return (f"Live ES (Schwab /ES): OFF -- {reason}; breakouts are confirmed on SPX candles against ES levels shifted by "
                 f"the SPX-ES basis (Yahoo ES=F, ~10 min delayed)")
 
+    def _daily_limit_line(self) -> str:
+        """The day's loss limit and profit target in dollars, as the risk manager applies them (percent of the day's start equity)."""
+        start = self.risk.state.start_equity
+        basis = "this bot's own P/L" if getattr(config, "DAILY_LOSS_BASIS", "equity") == "bot" else "account equity"
+        loss = f"loss limit {fmt_money(self.risk.daily_loss_limit())} ({config.DAILY_LOSS_LIMIT_PCT:.1%} of {fmt_money(start)}, measured on {basis})"
+        target_pct = getattr(config, "DAILY_PROFIT_TARGET_PCT", None)
+        goal = (f"profit target {fmt_money(target_pct * start)} ({target_pct:.1%}): no new entries once it is banked"
+                if target_pct else "no profit target")
+        exempt = f"; exempt from the loss limit: {', '.join(config.DAILY_LOSS_LIMIT_EXEMPT)}" if config.DAILY_LOSS_LIMIT_EXEMPT else ""
+        return f"Daily limits: {loss}; {goal}{exempt}"
+
     def report_start(self, now: datetime, acct: dict, positions: list[dict]) -> None:
         pnl = self.broker.get_pnl_summary()
         t = tier(acct["equity"])
@@ -1456,6 +1474,7 @@ class Bot:
             f"Phase: {strategy.phase(now)}   News day: {strategy.is_news_day(now.date())} "
             f"(mode {config.NEWS_DAY_MODE})   Level source: {config.BREAKOUT_LEVEL_SOURCE}",
             self._live_es_report_line(),
+            self._daily_limit_line(),
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
                 f"| {k}: trades {s.trades_today} losses-in-a-row {s.consecutive_losses} P/L {fmt_money(s.realized_pnl)}"
                 for k, s in day.strategies.items()),

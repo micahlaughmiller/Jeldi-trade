@@ -249,3 +249,113 @@ def test_day_state_roundtrip_with_entries_today():
     assert restored == rm.state and restored.for_strategy("F").entries_today == 2
     legacy = DayState.from_dict({"start_equity": 10_000, "strategies": {"A": {"trades_today": 1, "realized_pnl": 5.0}}})
     assert legacy.for_strategy("A").entries_today == 0
+
+
+# ------------------------------------------------- 2026-10-15: daily profit target; F under the loss limit (Schwab 0DTE ships both)
+
+def test_the_daily_profit_target_stops_new_entries_for_every_strategy(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", 0.02, raising=False)
+    rm = RiskManager(1_000)
+    assert rm.trading_allowed("B") == (True, "OK")
+    rm.record_trade("B", 19.99)
+    assert rm.trading_allowed("B") == (True, "OK") and rm.trading_allowed("F", equity=1_000.0) == (True, "OK")
+    rm.record_trade("B", 0.01)                                                      # exactly 2% of 1,000
+    for strat in ("B", "F"):
+        ok, reason = rm.trading_allowed(strat, equity=1_000.0)
+        assert ok is False and reason == "DAILY_PROFIT_TARGET realized=20.00 >= 20.00", (strat, reason)
+
+
+def test_the_profit_target_counts_exempt_strategies_pnl_too(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", 0.02, raising=False)
+    rm = RiskManager(1_000)
+    rm.record_trade("F", 25.0)                                                      # F is exempt from the LOSS limit, not from the day's goal
+    assert rm.trading_allowed("B")[0] is False and rm.trading_allowed("F")[0] is False
+
+
+def test_no_profit_target_means_no_limit_on_gains(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", None, raising=False)
+    rm = RiskManager(1_000)
+    rm.record_trade("B", 10_000.0)
+    assert rm.trading_allowed("B") == (True, "OK")
+
+
+def test_the_target_is_a_fraction_of_the_days_start_equity(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", 0.02, raising=False)
+    big = RiskManager(10_000)
+    big.record_trade("B", 150.0)
+    assert big.trading_allowed("B") == (True, "OK")                                 # 200 would be the goal
+    big.record_trade("B", 50.0)
+    assert big.trading_allowed("B")[0] is False
+
+
+def test_f_follows_the_daily_loss_limit_when_it_is_not_exempt(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    rm = RiskManager(1_000)
+    rm.record_trade("F", -9.99)
+    assert rm.trading_allowed("B") == (True, "OK") and rm.trading_allowed("F") == (True, "OK")
+    rm.record_trade("F", -0.01)                                                     # exactly -1% of 1,000
+    for strat in ("B", "F"):
+        ok, reason = rm.trading_allowed(strat)
+        assert ok is False and reason == "DAILY_LOSS_LIMIT realized=-10.00", (strat, reason)
+    fresh = RiskManager(1_000)                                                      # the equity (unrealized) path stops F as well
+    assert fresh.trading_allowed("F", equity=990.01) == (True, "OK")
+    ok, reason = fresh.trading_allowed("F", equity=990.0)
+    assert ok is False and reason == "DAILY_LOSS_LIMIT equity=990.00 start=1000.00"
+    assert fresh.trading_allowed("B", equity=990.0)[0] is False
+
+
+def test_b_losses_stop_f_when_nothing_is_exempt(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    rm = RiskManager(1_000)
+    rm.record_trade("B", -12.0)
+    ok, reason = rm.trading_allowed("F", equity=1_000.0)
+    assert ok is False and reason.startswith("DAILY_LOSS_LIMIT")
+
+
+# ------------------------------------------------- 2026-10-15: the loss limit on the bot's own P/L (Schwab's shared account)
+
+def _bot_basis(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+
+
+def test_with_the_bot_basis_the_accounts_value_never_trips_the_loss_limit(monkeypatch):
+    _bot_basis(monkeypatch)
+    rm = RiskManager(1_000)
+    for equity in (1_000.0, 990.0, 900.0, 500.0, 0.0):                  # the owner's holdings or the 45DTE bot moved the account
+        assert rm.trading_allowed("B", equity=equity) == (True, "OK"), equity
+        assert rm.trading_allowed("F", equity=equity) == (True, "OK"), equity
+
+
+def test_with_the_bot_basis_realized_and_open_losses_trip_it(monkeypatch):
+    _bot_basis(monkeypatch)
+    rm = RiskManager(1_000)
+    assert rm.trading_allowed("B", own_open_pnl=-9.99) == (True, "OK")
+    ok, reason = rm.trading_allowed("B", own_open_pnl=-10.0)             # the open trade alone is down exactly 1%
+    assert ok is False and reason == "DAILY_LOSS_LIMIT bot P/L=-10.00 (realized 0.00, open -10.00)"
+    rm.record_trade("B", -6.0)
+    assert rm.trading_allowed("F", own_open_pnl=-3.99) == (True, "OK")   # -6.00 realized + -3.99 open = -9.99
+    ok, reason = rm.trading_allowed("F", own_open_pnl=-4.0)
+    assert ok is False and reason == "DAILY_LOSS_LIMIT bot P/L=-10.00 (realized -6.00, open -4.00)"
+    rm.record_trade("F", -4.0)                                           # banked: now the realized check alone stops everything
+    ok, reason = rm.trading_allowed("B")
+    assert ok is False and reason == "DAILY_LOSS_LIMIT realized=-10.00"
+
+
+def test_with_the_bot_basis_an_open_profit_offsets_a_realized_loss(monkeypatch):
+    _bot_basis(monkeypatch)
+    rm = RiskManager(1_000)
+    rm.record_trade("B", -8.0)
+    assert rm.trading_allowed("B", own_open_pnl=15.0) == (True, "OK")
+    assert rm.trading_allowed("B", own_open_pnl=-2.0)[0] is False
+
+
+def test_the_equity_basis_is_unchanged_and_ignores_own_open_pnl(monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "equity", raising=False)
+    rm = RiskManager(10_000)
+    assert rm.trading_allowed("B", equity=9_001.0, own_open_pnl=-5_000.0) == (True, "OK")
+    ok, reason = rm.trading_allowed("B", equity=9_000.0)
+    assert ok is False and reason == "DAILY_LOSS_LIMIT equity=9000.00 start=10000.00"

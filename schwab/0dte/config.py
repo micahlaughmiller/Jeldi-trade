@@ -339,14 +339,22 @@ LIMITS_BY_STRATEGY = {
     # up to 3 F positions open at once in different tickers. No COOLDOWN_MIN (strategy-wide).
     "F": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 7, "MAX_CONCURRENT_POSITIONS": 3},
 }
-DAILY_LOSS_LIMIT_PCT = 0.10
+# 2026-10-15 (Schwab live go-live): acceptable daily loss is 1% and the daily goal is 2% of the day's start equity -- the capital cap (see
+# LIVE_CAPITAL_*), so $10 and $20 at the $1,000 minimum. Alpaca keeps 10% and no target (allow-listed in tools/check_sync.py).
+DAILY_LOSS_LIMIT_PCT = 0.01
 # Per-strategy concurrency cap and the limit() fallback for strategies without their own entry (A-E are
 # single-slot by dict-key construction; only F's entry path consults this).
 MAX_CONCURRENT_POSITIONS = 1
 # Strategies whose P/L -- realized, and unrealized from the marks the tick already fetched -- is removed
 # from the combined 10% daily-loss basis. HALTS False: an A+B limit hit does not stop them either.
-DAILY_LOSS_LIMIT_EXEMPT = ("F",)
+# 2026-10-15: on Schwab nothing is exempt -- F's P/L counts toward the loss limit and F is stopped by it like B (Alpaca: F exempt).
+DAILY_LOSS_LIMIT_EXEMPT = ()
 DAILY_LOSS_LIMIT_HALTS_EXEMPT = False
+# Stop NEW entries (B and F) once the day's realized P/L reaches this fraction of the day's start equity. Open trades keep their normal exits.
+DAILY_PROFIT_TARGET_PCT = 0.02
+# The loss limit is measured on THIS bot's P/L (realized + its open trades' marks), not on the account's value: the Schwab account also holds the owner's
+# hand trades and the 45DTE bot, and at 1% of the capital cap ($10 at the $1,000 minimum) their moves would stop B and F for the day.
+DAILY_LOSS_BASIS = "bot"
 
 # Which setups and which ORB entry kinds each strategy trades. 2026-09-21: entries before 10:00 went
 # 1 for 12 and momentum-close entries bought the top of the 5-minute bar, so A takes only the ORB

@@ -770,3 +770,26 @@ def test_a_newer_break_on_the_same_ticker_replaces_the_waiting_signal(bot, data,
     assert old.key in bot.acted
     bot.f._confirm_and_queue(newer, et(10, 11))                             # the very same signal again: left alone
     assert bot.f.pending == [newer] and len(events(bot, "F_SKIPPED")) == 1
+
+
+def test_f_does_not_enter_after_the_daily_loss_limit_when_nothing_is_exempt(bot, data, monkeypatch):
+    """2026-10-15 (Schwab 0DTE): F follows the daily loss limit. The same scenario as the exempt case above, with the exemption off."""
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    rm = bot.risk
+    rm.record_trade("B", -1_000.0)
+    assert rm.trading_allowed("F", 9_000.0)[0] is False
+    rank(bot, data)
+    bot.f.step(et(9, 55, 10))
+    assert "F:TSLA" not in bot.pm.positions and not any(k.startswith("F:") for k in bot.pm.positions)
+
+
+def test_f_sees_the_bots_open_loss_on_the_bot_basis(bot, data, monkeypatch):
+    """2026-10-15 (Schwab): F's own entry check passes the bot's open marks, so an open trade down past the limit stops a new F entry."""
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    bot.pm.open(f_spread("AMZN", current=4.20))                                # -$340 open on a $10,000 day: the limit is -$100
+    assert bot.risk.state.realized_pnl == 0.0
+    rank(bot, data)
+    bot.f.step(et(9, 55, 10))
+    assert "F:TSLA" not in bot.pm.positions

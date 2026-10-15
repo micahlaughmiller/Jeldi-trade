@@ -2010,3 +2010,64 @@ def test_a_restart_remembers_the_stock_spreads_todays_state_says_f_opened(bot, m
     assert again._saved_stock == {("TSLA", spread.right, spread.expiration, float(spread.short_strike)),
                                   ("TSLA", spread.right, spread.expiration, float(spread.long_strike))}
     assert {leg["strike"] for leg in again.bot_legs(again.broker.get_positions())} == {float(spread.short_strike), float(spread.long_strike)}
+
+
+def test_the_bots_own_open_loss_counts_but_the_accounts_value_does_not_on_the_bot_basis(bot, monkeypatch):
+    """2026-10-15 (Schwab): DAILY_LOSS_BASIS "bot" -- the loss limit sees this bot's open spread marks, never the account's total."""
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    from test_position_manager import f_spread
+    assert bot.loss_limit_strategies() == tuple(config.ALL_STRATEGIES)           # nothing exempt: F counts too
+    bot.broker.equity = 100.0                                                   # the account value collapsed: nothing this bot did
+    assert bot.entry_possible(100.0) is True
+    spread = f_spread("TSLA", credit=0.80, width=5.0)
+    spread.current_price = 4.20                                                 # an open F spread marked about -$340
+    bot.pm.open(spread)
+    assert bot.pm.open_pnl(bot.loss_limit_strategies()) == pytest.approx(-340.0)
+    assert bot.entry_possible(100.0) is False                                   # 1% of 10,000 = -$100: this bot's own loss stops entries
+    assert all("DAILY_LOSS_LIMIT bot P/L=-340.00" in reason for reason in bot.last_entry_blocks.values())
+
+
+def test_the_start_report_shows_the_days_limits_in_dollars(bot, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", 0.02, raising=False)
+    bot.report_start(et(9, 25), bot.broker.get_account(), [])
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Daily limits:"))
+    assert "1.0% of $10,000.00, measured on this bot's own P/L" in line and "profit target $200.00 (2.0%)" in line
+    assert "exempt" not in line
+    monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", None, raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ("F",))
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "equity", raising=False)
+    caplog.clear()
+    bot.report_start(et(9, 25), bot.broker.get_account(), [])
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Daily limits:"))
+    assert "measured on account equity" in line and "no profit target" in line and "exempt from the loss limit: F" in line
+
+
+def test_the_per_strategy_entry_check_sees_the_bots_open_loss_on_the_bot_basis(bot, monkeypatch):
+    """enter_leg runs its own trading_allowed after entry_possible; it must pass the bot's open marks too, not only entry_possible."""
+    from test_position_manager import f_spread
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ())
+    spread = f_spread("TSLA", credit=0.80, width=5.0)
+    spread.current_price = 4.20                                                 # the open F spread is marked -$340 against a -$100 limit
+    bot.pm.open(spread)
+    summary, added = bot.enter_leg("B", et(10, 15), "ORB", BULLISH, 100.0, SPOT, 5, "P", [], 42.0, 0.0)
+    assert summary.startswith("skip: DAILY_LOSS_LIMIT bot P/L=-340.00") and added == 0.0 and "B" not in bot.pm.positions
+
+
+def test_on_the_bot_basis_an_exempt_strategys_open_loss_does_not_count(bot, monkeypatch):
+    from test_position_manager import f_spread
+    monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "bot", raising=False)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.01)
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ("F",))
+    assert "F" not in bot.loss_limit_strategies()
+    spread = f_spread("TSLA", credit=0.80, width=5.0)
+    spread.current_price = 4.20                                                 # F is down $340, but F is exempt here (the Alpaca rule)
+    bot.pm.open(spread)
+    assert bot.entry_possible(100.0) is True

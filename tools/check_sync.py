@@ -39,6 +39,11 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
         "ADOPT_UNTRACKED_STOCK": ("True", "False", "2026-10-15: the same for single-stock option legs now that Schwab runs Strategy F: "
                                   "it never adopts or force-closes stock legs it did not open"),
         "STRATEGIES": ("('B',)", "('B', 'F')", "2026-10-15: Schwab 0DTE trades B and F only (live go-live)"),
+        "DAILY_LOSS_LIMIT_PCT": ("0.1", "0.01", "2026-10-15: Schwab live go-live: acceptable daily loss is 1% (Alpaca 10%)"),
+        "DAILY_LOSS_LIMIT_EXEMPT": ("('F',)", "()", "2026-10-15: on Schwab F follows the daily loss limit (Alpaca: F is exempt)"),
+        "DAILY_PROFIT_TARGET_PCT": ("None", "0.02", "2026-10-15: Schwab live go-live: no new entries once 2% is banked (Alpaca: no target)"),
+        "DAILY_LOSS_BASIS": ("'equity'", "'bot'", "2026-10-15: Schwab's account is shared with hand trades and the 45DTE bot, so its loss limit "
+                             "counts only this bot's P/L (Alpaca: account equity)"),
         "MAX_OPEN_POSITIONS_TOTAL": ("2", "1", "2026-10-15: Schwab 0DTE (live go-live) holds ONE trade open at a time across B and F"),
     },
     "45DTE": {

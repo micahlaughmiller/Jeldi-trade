@@ -13,3 +13,11 @@ def test_the_shipped_strategies_and_open_cap():
     """2026-10-15: Schwab 0DTE trades B and F only, one trade open at a time (live go-live). Run with SCHWAB_MODE=sim, the shipped default."""
     assert config.STRATEGIES == ("B", "F") and "F" in config.STOCK_STRATEGIES
     assert config.MAX_OPEN_POSITIONS_TOTAL == 1
+
+
+def test_the_shipped_daily_limits():
+    """2026-10-15: acceptable daily loss 1%, daily goal 2%, and F follows the loss limit like B (nothing exempt)."""
+    assert config.DAILY_LOSS_LIMIT_PCT == 0.01
+    assert config.DAILY_LOSS_LIMIT_EXEMPT == ()
+    assert config.DAILY_PROFIT_TARGET_PCT == 0.02
+    assert config.DAILY_LOSS_BASIS == "bot"                       # not the account's value: it also holds hand trades and the 45DTE bot

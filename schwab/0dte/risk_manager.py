@@ -162,7 +162,7 @@ class RiskManager:
                         now: datetime | None = None, setup: str | None = None,
                         open_count: int = 0, exempt_open_pnl: float = 0.0,
                         open_spx: int = 0, open_total: int = 0, close_blocked: bool = False,
-                        halt: str | None = None) -> tuple[bool, str]:
+                        halt: str | None = None, own_open_pnl: float = 0.0) -> tuple[bool, str]:
         """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
         the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
         different ORB signal that represented the morning's move continuing into the day) -- if either the
@@ -170,7 +170,8 @@ class RiskManager:
         `open_count` is the strategy's currently open positions (its entries so far are at least the closed
         ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
         (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
-        from account equity before the drawdown check so nothing of theirs ever trips the SPX limit."""
+        from account equity before the drawdown check so nothing of theirs ever trips the SPX limit. `own_open_pnl` is the open
+        P/L of every strategy that counts toward the limit; it is used only when config.DAILY_LOSS_BASIS is "bot"."""
         block = self.transient_block(open_total, close_blocked, halt)
         if block:
             return False, block
@@ -196,12 +197,24 @@ class RiskManager:
             until = datetime.fromisoformat(s.last_exit) + timedelta(minutes=cooldown)
             if now < until:
                 return False, f"{strat}: COOLDOWN until {until.astimezone(config.ET).strftime('%H:%M')}"
+        target_pct = getattr(config, "DAILY_PROFIT_TARGET_PCT", None)
+        if target_pct:                      # 2026-10-15: the day's goal is banked: no new entries for any strategy (open trades keep their exits)
+            goal = target_pct * self.state.start_equity
+            banked = self.state.realized_pnl
+            if banked >= goal:
+                return False, f"DAILY_PROFIT_TARGET realized={banked:.2f} >= {goal:.2f}"
         if strat in config.DAILY_LOSS_LIMIT_EXEMPT and not config.DAILY_LOSS_LIMIT_HALTS_EXEMPT:
             return True, "OK"
         realized = self.state.loss_limit_pnl
         if realized <= self.daily_loss_limit():
             return False, f"DAILY_LOSS_LIMIT realized={realized:.2f}"
-        if equity is not None:
+        if getattr(config, "DAILY_LOSS_BASIS", "equity") == "bot":
+            # 2026-10-15 (Schwab, shared account): the bot's own day = what it banked plus what its open trades are marked at. The account's total
+            # value also moves with the owner's hand trades, the 45DTE bot and every holding, which is not this bot's loss.
+            drawdown = realized + own_open_pnl
+            if drawdown <= self.daily_loss_limit():
+                return False, f"DAILY_LOSS_LIMIT bot P/L={drawdown:.2f} (realized {realized:.2f}, open {own_open_pnl:.2f})"
+        elif equity is not None:
             equity = equity - self.state.exempt_realized_pnl - exempt_open_pnl
             if equity - self.state.start_equity <= self.daily_loss_limit():
                 return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={self.state.start_equity:.2f}"

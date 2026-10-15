@@ -126,6 +126,17 @@ def _pin_adoption_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_daily_limits(request, monkeypatch):
+    """The shared tests describe the Alpaca day limits (10% loss limit, F exempt from it, no profit target); Schwab 0DTE ships 1%, nothing
+    exempt and a 2% target (2026-10-15), so pin the Alpaca values -- except in the per-folder guard modules that check each folder's real ones."""
+    if request.module.__name__ not in GUARD_MODULES:
+        monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_PCT", 0.10)
+        monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_EXEMPT", ("F",))
+        monkeypatch.setattr(config, "DAILY_PROFIT_TARGET_PCT", None, raising=False)
+        monkeypatch.setattr(config, "DAILY_LOSS_BASIS", "equity", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_preflight_sleep(monkeypatch):
     """The preflight re-reads the broker EXTERNAL_PREFLIGHT_RECHECK_SEC seconds after something looks wrong; the
     tests' fake broker answers instantly, so there is nothing to wait for."""

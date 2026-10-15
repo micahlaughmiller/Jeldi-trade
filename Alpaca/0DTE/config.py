@@ -351,6 +351,12 @@ MAX_CONCURRENT_POSITIONS = 1
 # from the combined 10% daily-loss basis. HALTS False: an A+B limit hit does not stop them either.
 DAILY_LOSS_LIMIT_EXEMPT = ("F",)
 DAILY_LOSS_LIMIT_HALTS_EXEMPT = False
+# Stop NEW entries (every strategy) once the day's realized P/L reaches this fraction of the day's start equity. None = off. Open trades keep their
+# normal exits. Schwab 0DTE sets it (2026-10-15); allow-listed in tools/check_sync.py.
+DAILY_PROFIT_TARGET_PCT = None
+# What the daily loss limit is measured on: "equity" = the broker account's value (the dedicated Alpaca paper accounts); "bot" = this bot's own realized
+# P/L plus the marks of its open trades (Schwab, whose account is shared with the owner's hand trades and the 45DTE bot). Allow-listed in tools/check_sync.py.
+DAILY_LOSS_BASIS = "equity"
 
 # Which setups and which ORB entry kinds each strategy trades. 2026-09-21: entries before 10:00 went
 # 1 for 12 and momentum-close entries bought the top of the 5-minute bar, so A takes only the ORB

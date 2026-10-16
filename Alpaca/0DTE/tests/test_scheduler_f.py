@@ -793,3 +793,31 @@ def test_f_sees_the_bots_open_loss_on_the_bot_basis(bot, data, monkeypatch):
     rank(bot, data)
     bot.f.step(et(9, 55, 10))
     assert "F:TSLA" not in bot.pm.positions
+
+
+def test_f_fetches_a_chain_wide_enough_for_the_coarse_cap_and_tells_the_strike_walk_the_grid(bot, data, monkeypatch):
+    """2026-10-16: stock_orb must ask the broker for strikes out to the WIDER cap (a 2.5x EM strike is useless if it was never fetched)
+    and pass the strike increment it already measured, so the walk applies the coarse-grid cap from the real grid."""
+    import strategy
+    chain_calls, select_calls = [], []
+    real_chain, real_select = bot.broker.get_option_chain, strategy.select_strikes_f
+
+    def chain_spy(underlying, *a, **k):
+        if underlying == "TSLA":
+            chain_calls.append((a, k))
+        return real_chain(underlying, *a, **k)
+
+    def select_spy(*a, **k):
+        select_calls.append((a, k))
+        return real_select(*a, **k)
+
+    monkeypatch.setattr(bot.broker, "get_option_chain", chain_spy)
+    monkeypatch.setattr(strategy, "select_strikes_f", select_spy)
+    enter_f(bot, data)
+    assert len(select_calls) == 1
+    (spot, right, width, em, _chain), kw = select_calls[0]
+    assert kw.get("increment") and kw["increment"] > 0                                   # the measured grid is passed, not re-derived
+    span = strategy.f_chain_span(em, width)
+    assert span == pytest.approx(2.5 * em + 2 * width)
+    assert any(len(a) >= 4 and a[2] == pytest.approx(spot - span) and a[3] == pytest.approx(spot + span) for a, k in chain_calls), chain_calls
+

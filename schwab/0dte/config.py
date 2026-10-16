@@ -686,6 +686,12 @@ F_WIDTH_PCT = 0.01                # spread width ~1% of spot ...
 F_MIN_WIDTH = 1.0                 # ... snapped to the chain's strike increment, never below $1
 F_CREDIT_PCT_RANGE = (0.13, 0.22) # entry credit band as a fraction of width; lower bound = work_entry floor
 F_MAX_STRIKE_STEPS = 20           # strike-walk iterations before F_NO_STRIKE_IN_RANGE
+# 2026-10-16: how far from spot the short strike may sit, as a multiple of the expected move (it used to be a fixed 2x). Normal names 1.8x.
+# A COARSE grid -- the strike step is so large that the EM is under F_COARSE_GRID_EM_STEPS steps (e.g. a $2.50 grid on a $2.85 EM) -- cannot land
+# a strike near 1 EM, so it gets the wider cap instead of being rejected every time (10/16: a $171 name was refused at 2.18x EM).
+F_EM_CAP_MULT = 1.8
+F_EM_CAP_MULT_COARSE = 2.5
+F_COARSE_GRID_EM_STEPS = 2.0
 F_TARGET_PCT = 0.06               # profit target as a fraction of width (0.30 on $5)
 F_STOP_PCT = 0.10                 # stop as a fraction of width (0.50 on $5)
 F_LOCK_ARM_PCT = 0.03             # profit-lock arm as a fraction of width (0.15 on $5)

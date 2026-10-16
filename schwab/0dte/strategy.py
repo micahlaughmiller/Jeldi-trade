@@ -405,17 +405,35 @@ def width_for_stock(spot: float, increment: float, pct: float | None = None,
     return width
 
 
+def f_em_cap(em: float, increment: float | None) -> float:
+    """The farthest the short strike may sit from spot, in dollars: F_EM_CAP_MULT x EM, or F_EM_CAP_MULT_COARSE x EM when the strike grid is
+    coarse for this EM (the EM spans fewer than F_COARSE_GRID_EM_STEPS strike steps, so no strike can land near 1 EM)."""
+    coarse = increment is not None and increment > 0 and em < config.F_COARSE_GRID_EM_STEPS * increment
+    return (config.F_EM_CAP_MULT_COARSE if coarse else config.F_EM_CAP_MULT) * em
+
+
+def f_chain_span(em: float, width: float) -> float:
+    """Half-width of the chain window stock_orb asks the broker for: it must cover the widest cap plus the long leg."""
+    return max(config.F_EM_CAP_MULT, config.F_EM_CAP_MULT_COARSE) * em + 2 * width
+
+
 def select_strikes_f(spot: float, right: str, width: float, em: float, chain_rows: list[dict],
                      credit_pct: tuple[float, float] | None = None,
-                     max_steps: int | None = None) -> tuple[float | None, float | None, SpreadQuote | str]:
+                     max_steps: int | None = None, increment: float | None = None) -> tuple[float | None, float | None, SpreadQuote | str]:
     """OTM spread one expected move from spot, walked through the chain's QUOTED strikes until the
     credit is inside credit_pct x width. Unquoted strikes (gaps, coarser grids further out) are
     stepped over rather than failing the walk. Returns (short, long, quote) or (None, None, reason).
+    `increment` is the chain's strike step (derived from the quoted strikes when not given): it decides the EM cap, see f_em_cap.
     """
     lo_pct, hi_pct = credit_pct or config.F_CREDIT_PCT_RANGE
     max_steps = max_steps or config.F_MAX_STRIKE_STEPS
     lo, hi = round(lo_pct * width, 2), round(hi_pct * width, 2)
     quoted = sorted({round(float(q["strike"]), 2) for q in chain_rows if float(q.get("bid") or 0.0) > 0})
+    if increment is None:
+        steps = [round(b - a, 2) for a, b in zip(quoted, quoted[1:]) if b - a > 0]
+        increment = min(steps) if steps else None
+    cap = f_em_cap(em, increment)
+    cap_mult = cap / em if em else 0.0
     if right == "P":
         outward, sign = [k for k in reversed(quoted) if k < spot], -1.0
     elif right == "C":
@@ -434,8 +452,10 @@ def select_strikes_f(spot: float, right: str, width: float, em: float, chain_row
         distance = abs(spot - short)
         if distance < width:
             return None, None, f"F_TOO_CLOSE_TO_SPOT short={short:g} within {width:g} of spot {spot:.2f}"
-        if distance > 2 * em:
-            return None, None, f"F_BEYOND_2EM short={short:g} beyond 2x EM {em:.2f} from spot {spot:.2f}"
+        if distance > cap:
+            step_text = "unknown" if increment is None else f"{increment:g}"
+            return None, None, (f"F_BEYOND_EM_CAP short={short:g} beyond {cap_mult:g}x EM {em:.2f} from spot {spot:.2f} "
+                                f"(strike step {step_text})")
         long = round(short + sign * width, 2)
         quote = spread_quote(chain_rows, short, long)
         if quote is None:

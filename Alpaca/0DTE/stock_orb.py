@@ -752,9 +752,9 @@ class StockOrbTrader:
         if inc is None:
             return self._reject(now, sig, f"NO_STRIKE_INCREMENT fewer than two strikes around spot {spot:.2f}")
         width = strategy.width_for_stock(spot, inc)
-        span = 2 * em + 2 * width
+        span = strategy.f_chain_span(em, width)
         chain = broker.get_option_chain(sym, exp, right, spot - span, spot + span, spot=spot)
-        short, long, result = strategy.select_strikes_f(spot, right, width, em, chain)
+        short, long, result = strategy.select_strikes_f(spot, right, width, em, chain, increment=inc)
         if short is None:
             return self._reject(now, sig, result)
         quote = result

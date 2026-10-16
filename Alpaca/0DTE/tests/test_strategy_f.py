@@ -73,7 +73,7 @@ def test_select_strikes_f_gives_up_with_reasons():
     s, l, reason = select_strikes_f(436.0, "P", 5.0, 1.0, puts)
     assert s is None and reason.startswith("F_TOO_CLOSE_TO_SPOT short=435")
     far = rows({400.0: (0.2, 0.3), 395.0: (0.1, 0.2)})
-    assert select_strikes_f(436.0, "P", 5.0, 17.0, far)[2].startswith("F_BEYOND_2EM short=400")
+    assert select_strikes_f(436.0, "P", 5.0, 17.0, far)[2].startswith("F_BEYOND_EM_CAP short=400 beyond 1.8x EM")
     near_only = rows({435.0: (7.9, 8.1), 432.5: (6.4, 6.6)})
     assert "no quoted P strike at or beyond EM" in select_strikes_f(436.0, "P", 5.0, 17.0, near_only)[2]
     assert "F_NO_STRIKE_IN_RANGE no credit in 0.65-1.10 after 1 steps" in \
@@ -146,3 +146,51 @@ def test_every_persona_runs_f():
     assert config.DAILY_LOSS_LIMIT_HALTS_EXEMPT is False and config.F_MAX_ENTRIES_PER_TICKER is None
     assert config.LIMITS_BY_STRATEGY["F"] == {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 7,
                                               "MAX_CONCURRENT_POSITIONS": 3}
+
+
+# ------------------------------------------------- 2026-10-16: the EM cap is 1.8x, or 2.5x on a strike grid too coarse for the EM
+
+from strategy import f_chain_span, f_em_cap
+
+
+def test_f_em_cap_is_1_8x_on_a_normal_grid_and_2_5x_when_the_em_spans_under_two_strike_steps():
+    assert f_em_cap(17.0, 2.5) == pytest.approx(1.8 * 17.0)                         # EM 17 on a $2.50 grid: 6.8 steps, normal
+    assert f_em_cap(2.85, 2.5) == pytest.approx(2.5 * 2.85)                         # the 10/16 case: EM 2.85 = 1.14 steps, coarse
+    assert f_em_cap(5.0, 2.5) == pytest.approx(1.8 * 5.0)                           # exactly 2 steps is NOT coarse
+    assert f_em_cap(4.99, 2.5) == pytest.approx(2.5 * 4.99)
+    assert f_em_cap(2.85, None) == pytest.approx(1.8 * 2.85)                        # unknown grid: the normal cap
+    assert f_em_cap(2.85, 0.0) == pytest.approx(1.8 * 2.85)
+
+
+def test_the_171_dollar_name_from_10_16_now_passes_on_its_coarse_grid():
+    spot, em, width = 171.28, 2.85, 2.5                                               # width: 1% of spot snapped up to the $2.50 step
+    # the real chain that day: the first quoted CALL strike at or beyond 1 EM was 177.5, already 2.18 EM out (a $2.50 grid on a $2.85 EM)
+    chain = rows({172.5: (1.6, 1.8), 177.5: (0.75, 0.85), 180.0: (0.35, 0.45), 182.5: (0.15, 0.25)})
+    short, long, quote = select_strikes_f(spot, "C", width, em, chain, credit_pct=(0.13, 0.22), increment=2.5)
+    assert (short, long) == (177.5, 180.0), quote
+    assert 1.8 * em < abs(spot - short) <= 2.5 * em                                   # only the coarse cap lets this spread through
+    reason = select_strikes_f(spot, "C", width, em, chain, credit_pct=(0.13, 0.22), increment=0.5)[2]
+    assert isinstance(reason, str) and reason.startswith("F_BEYOND_EM_CAP short=177.5") and "1.8x EM" in reason   # a fine grid keeps 1.8x
+
+
+def test_the_normal_cap_tightened_from_2x_to_1_8x():
+    far_ok = rows({406.0: (1.4, 1.6), 401.0: (0.6, 0.8)})                             # 30.0 away: 1.76 EM, inside 1.8x; credit 0.80 in band
+    short, long, quote = select_strikes_f(436.0, "P", 5.0, 17.0, far_ok, increment=5.0)
+    assert (short, long) == (406.0, 401.0)
+    too_far = rows({404.0: (1.4, 1.6), 399.0: (0.6, 0.8)})                            # 32.0 away: 1.88 EM -- allowed at 2x, refused at 1.8x
+    reason = select_strikes_f(436.0, "P", 5.0, 17.0, too_far, increment=5.0)[2]
+    assert reason.startswith("F_BEYOND_EM_CAP short=404 beyond 1.8x EM 17.00") and "strike step 5" in reason
+
+
+def test_the_coarse_cap_comes_from_the_increment_stock_orb_passes_or_is_derived_from_the_chain():
+    spot, em = 171.28, 2.85
+    chain = rows({165.0: (0.75, 0.85), 162.5: (0.35, 0.45)})                          # only strikes 2.2 EM out: the coarse cap (7.13) lets 165 in
+    assert select_strikes_f(spot, "P", 2.5, em, chain, credit_pct=(0.13, 0.22), increment=2.5)[0] == 165.0
+    assert select_strikes_f(spot, "P", 2.5, em, chain, credit_pct=(0.13, 0.22))[0] == 165.0       # derived: the quoted strikes are 2.5 apart
+    reason = select_strikes_f(spot, "P", 2.5, em, chain, credit_pct=(0.13, 0.22), increment=1.0)[2]
+    assert reason.startswith("F_BEYOND_EM_CAP short=165 beyond 1.8x EM")                            # a $1 grid is not coarse for a 2.85 EM
+
+
+def test_the_chain_window_covers_the_widest_cap_plus_the_long_leg():
+    assert f_chain_span(2.85, 2.5) == pytest.approx(2.5 * 2.85 + 5.0)
+    assert f_chain_span(17.0, 5.0) == pytest.approx(2.5 * 17.0 + 10.0)                # always the wider cap: the grid is not known before the chain is fetched

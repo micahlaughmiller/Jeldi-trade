@@ -1,23 +1,39 @@
-"""Report drift between the Alpaca and Schwab copies of each strategy.
+"""Report drift between the Alpaca and Schwab copies of each strategy, and between the Schwab person folders.
 
 Strategy files must be byte-identical across broker folders; only broker.py,
 config, schwab_login.py and broker tests may differ. Config files are compared
 on their strategy parameters (everything after the broker section).
 
-    python tools/check_sync.py
+2026-10-26: the Schwab bots live in person folders -- schwab/Micah (0dte + 45DTE, login A), schwab/Dawson (0dte, login A),
+schwab/Ronnie (45DTE, login B). Micah's folders are the primaries the Alpaca copies are compared with; Dawson/0dte and
+Ronnie/45DTE must be byte-identical CLONES of Micah's (every tracked file; only .env.example may differ).
+
+    python tools/check_sync.py                  # report
+    python tools/check_sync.py --apply-clones   # after editing Micah's copy: push every tracked file to Dawson/0dte and Ronnie/45DTE
+    python tools/check_sync.py --apply-clones --sweep-extras   # ... and move code/data files only a clone has to an archive folder
 """
 
+import argparse
 import ast
 import filecmp
+import shutil
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
 PAIRS = {
-    "0DTE": (ROOT / "Alpaca" / "0DTE", ROOT / "schwab" / "0dte"),
-    "45DTE": (ROOT / "Alpaca" / "45DTE", ROOT / "schwab" / "45DTE"),
+    "0DTE": (ROOT / "Alpaca" / "0DTE", ROOT / "schwab" / "Micah" / "0dte"),
+    "45DTE": (ROOT / "Alpaca" / "45DTE", ROOT / "schwab" / "Micah" / "45DTE"),
 }
+# clone label -> (primary, clone): the clone must hold exactly the primary's tracked files, byte for byte (.env.example excepted)
+CLONES = {
+    "Dawson/0dte": (ROOT / "schwab" / "Micah" / "0dte", ROOT / "schwab" / "Dawson" / "0dte"),
+    "Ronnie/45DTE": (ROOT / "schwab" / "Micah" / "45DTE", ROOT / "schwab" / "Ronnie" / "45DTE"),
+}
+CLONE_MAY_DIFFER = {".env.example"}
 
 BROKER_SPECIFIC = {
     "broker.py", "config.py", "config_45dte.py", "schwab_login.py", "alpaca-reset.py",
@@ -59,7 +75,7 @@ BROKER_CONFIG_KEYS = {
     "ACTIVE_TRADER", "TRADER_NAME", "TRADER_NAMES", "PAPER_TRADING", "DRY_RUN", "PERSONA_OVERRIDES",
     "CDE_STRATEGIES",   # helper tuple for PERSONA_OVERRIDES entries, Alpaca-persona-only like it
     "SCHWAB_APP_KEY", "SCHWAB_APP_SECRET", "SCHWAB_CALLBACK_URL", "SCHWAB_TOKEN_PATH",
-    "SCHWAB_ACCOUNT_INDEX", "SCHWAB_MODE", "SIM_STARTING_EQUITY", "SIM_QUOTE_CACHE_SEC",
+    "SCHWAB_ACCOUNT_INDEX", "SCHWAB_ACCOUNT_LAST4", "SCHWAB_MODE", "SIM_STARTING_EQUITY", "SIM_QUOTE_CACHE_SEC",
     "SIM_FILL_START", "SIM_FILL_END", "SIM_INDEX_FILL_END",
     "LIVE_CAPITAL_CAP_ENABLED", "LIVE_CAPITAL_FLOOR_USD", "LIVE_CAPITAL_PCT", "LIVE_MAX_CONTRACTS_PER_TRADE", "HARD_MAX_CONTRACTS",
 }
@@ -115,8 +131,115 @@ def compare_folder(a: Path, b: Path, intentional: dict[str, tuple[str, str, str]
     return problems
 
 
-def main() -> int:
+RUNTIME_DIRS = {"logs", "logs_45dte", "shared_data", "__pycache__", ".pytest_cache"}
+CLONE_DRIFT_SUFFIXES = {".py", ".json", ".txt", ".md", ".csv"}      # files a clone may drift on; launchers (.cmd/.bat) and backups are left alone
+
+
+def git_listing(folder: Path) -> list[Path] | None:
+    """Files git tracks or would add under `folder` (relative to it), or None when git is unavailable or fails. Ignored runtime files
+    (.env, token.json, logs/, shared_data/ ...) are never listed."""
+    try:
+        out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", str(folder)],
+                             cwd=str(ROOT), capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    try:
+        return [Path(line.strip()).relative_to(folder.relative_to(ROOT)) for line in out.stdout.splitlines() if line.strip()]
+    except ValueError:
+        return None
+
+
+def guessed_listing(folder: Path) -> list[Path]:
+    """Report-mode fallback when git is unavailable: code and data files only, never runtime folders or secrets."""
+    return [p.relative_to(folder) for p in folder.rglob("*")
+            if p.is_file() and not (set(p.relative_to(folder).parts[:-1]) & RUNTIME_DIRS)
+            and p.suffix in (".py", ".json", ".txt", ".md") and not p.name.startswith((".env", "token.json", "selected_account.json"))]
+
+
+def tracked_files(folder: Path) -> list[Path]:
+    listed = git_listing(folder)
+    return listed if listed is not None else guessed_listing(folder)
+
+
+def compare_clone(primary: Path, clone: Path, lister=tracked_files) -> list[str]:
+    problems: list[str] = []
+    expected = set()
+    for rel in lister(primary):
+        if rel.name in CLONE_MAY_DIFFER:
+            continue
+        expected.add(rel)
+        src, dst = primary / rel, clone / rel
+        if not src.is_file():
+            problems.append(f"tracked in git but missing on disk in {primary.relative_to(ROOT)}: {rel} (git rm it, or restore it)")
+            continue
+        if not dst.exists():
+            problems.append(f"missing in {clone.relative_to(ROOT)}: {rel}")
+        elif not filecmp.cmp(src, dst, shallow=False):
+            problems.append(f"differs: {rel}")
+    for rel in lister(clone):                           # code/data the clone has that the primary does not
+        if rel.name in CLONE_MAY_DIFFER or rel in expected or rel.suffix not in CLONE_DRIFT_SUFFIXES:
+            continue
+        problems.append(f"extra in {clone.relative_to(ROOT)}: {rel} (not in {primary.relative_to(ROOT)})")
+    return problems
+
+
+def apply_clone(primary: Path, clone: Path, archive_root: Path, sweep: bool = False, lister=git_listing) -> list[str]:
+    """Make the clone match the primary: copy missing / differing files. With sweep=True, code/data files the primary does not have are
+    MOVED to archive_root (never deleted) with a note. Refuses to touch anything unless git can list both folders."""
+    primary_files, clone_files = lister(primary), lister(clone)
+    if primary_files is None or clone_files is None:
+        return [f"git listing unavailable for {primary.relative_to(ROOT)} / {clone.relative_to(ROOT)}: NOTHING changed (git must be on PATH)"]
+    done: list[str] = []
+    expected = set()
+    for rel in primary_files:
+        if rel.name in CLONE_MAY_DIFFER or not (primary / rel).is_file():
+            continue
+        expected.add(rel)
+        dst = clone / rel
+        if not dst.exists() or not filecmp.cmp(primary / rel, dst, shallow=False):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(primary / rel, dst)
+            done.append(f"copied {rel}")
+    extras = [rel for rel in clone_files if rel.name not in CLONE_MAY_DIFFER and rel not in expected and rel.suffix in CLONE_DRIFT_SUFFIXES]
+    if extras and not sweep:
+        done.append("left alone (use --sweep-extras to move them to the archive): " + ", ".join(str(r) for r in extras))
+    elif extras:
+        archive = archive_root / clone.relative_to(ROOT)
+        note = archive / "README.txt"
+        archive.mkdir(parents=True, exist_ok=True)
+        lines = [f"Moved out of {clone} by tools/check_sync.py --apply-clones --sweep-extras on {datetime.now():%Y-%m-%d %H:%M}:",
+                 f"these files were not in {primary} (the primary the clone must match). To restore one, copy it back to the same path.", ""]
+        for rel in extras:
+            (archive / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(clone / rel), str(archive / rel))
+            lines.append(f"  {rel}   <- {clone / rel}")
+            done.append(f"moved extra {rel} to {archive / rel}")
+        note.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return done
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply-clones", action="store_true",
+                        help="make Dawson/0dte and Ronnie/45DTE match Micah's folders (copies files; needs git on PATH)")
+    parser.add_argument("--sweep-extras", action="store_true",
+                        help="with --apply-clones: also move code/data files only a clone has to <repo parent>/_archive-for-review (never deleted)")
+    args = parser.parse_args(argv)
     exit_code = 0
+    if args.apply_clones:
+        archive_root = ROOT.parent / "_archive-for-review" / f"check_sync-{datetime.now():%Y%m%d-%H%M%S}"
+        for label, (primary, clone) in CLONES.items():
+            for line in apply_clone(primary, clone, archive_root, sweep=args.sweep_extras):
+                print(f"{label}: {line}")
+    if git_listing(ROOT / "tools") is None:
+        print("note: git is not available here; the clone check is working from a guess of the file lists")
+    for label, (primary, clone) in CLONES.items():
+        problems = compare_clone(primary, clone)
+        print(f"{label}: {'identical to ' + str(primary.relative_to(ROOT)) if not problems else str(len(problems)) + ' difference(s)'}")
+        for p in problems:
+            print(f"  - {p}")
+        if problems:
+            exit_code = 1
     for label, (a, b) in PAIRS.items():
         notes: list[str] = []
         problems = compare_folder(a, b, INTENTIONAL_CONFIG_DIVERGENCE.get(label), notes)

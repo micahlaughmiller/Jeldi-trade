@@ -191,18 +191,21 @@ ES_SCHWAB_SYMBOL = "/ES"
 # Cross-broker, READ-ONLY market data credentials -- this folder never places a Schwab order.
 # SCHWAB_APP_KEY/SECRET must come from .env (never hardcode a real secret in this file, which is a
 # public repo). SCHWAB_TOKEN_PATH's hardcoded default points at the Schwab bot's OWN token file
-# (same account, same OAuth session) so every persona process and the Schwab bot share ONE file --
-# Schwab's refresh token rotates on each use, so separate copies would invalidate each other.
+# (login A: schwab/Micah/0dte/token.json) so every persona process and the Schwab bots share ONE file --
+# when login A is renewed the bots reload from that file, and a separate copy would be left holding the
+# old, cancelled login.
 SCHWAB_APP_KEY = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
 def _token_file(raw: str, default: str) -> str:
     """The token file to use. A blank setting means the default; a setting that names an existing FOLDER (the Schwab bot's own folder)
     means the token.json inside it -- opening a folder as a file raises PermissionError on Windows, which once looked like a locked file."""
-    chosen = (raw or "").strip() or default
-    return str(Path(chosen) / "token.json") if Path(chosen).is_dir() else chosen
+    chosen = Path((raw or "").strip() or default)
+    if not chosen.is_absolute():                      # 2026-10-26: relative = relative to THIS folder, whatever the working directory is
+        chosen = (Path(__file__).resolve().parent / chosen).resolve()
+    return str(chosen / "token.json") if chosen.is_dir() else str(chosen)
 
 
-SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), r"C:\Users\Micah\Trading-Automation\schwab\0dte\token.json")
+SCHWAB_TOKEN_PATH = _token_file(os.getenv("SCHWAB_TOKEN_PATH", ""), r"C:\Users\Micah\Trading-Automation\schwab\Micah\0dte\token.json")
 
 MARKET_OPEN = time(9, 30)
 # 2026-10-01: real regular-trading-hours close, used to filter Alpaca's SPY bars down to the same

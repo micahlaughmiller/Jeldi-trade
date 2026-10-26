@@ -1,12 +1,15 @@
 """Log in to Schwab ONCE and give both Schwab bots that same login.
 
-    python tools/schwab_login_both.py            # log in (schwab/0dte), copy the new token.json into schwab/45DTE, show both
+    python tools/schwab_login_both.py            # log in (schwab/Micah/0dte), copy the new token.json into schwab/Micah/45DTE, show both
 
 Why: both Schwab bots use the same Schwab app, and a NEW login appears to cancel the older one -- so two separate logins (one per folder)
 kill each other ("token rejected" right after you re-logged in). When nine personas were running, the 45DTE bot worked because its
 token.json was a COPY of the 0dte login (identical creation time and refresh token). This does exactly that, weekly (a login lives 7 days):
-it runs schwab_login.py in schwab/0dte (you paste the redirect URL as usual), checks that a fresh token.json was written, and copies it
-over schwab/45DTE/token.json. The file it replaces is kept beside it as token.json.replaced-<time>.token (matched by .gitignore's *.token).
+it runs schwab_login.py in schwab/Micah/0dte (you paste the redirect URL as usual), checks that a fresh token.json was written, and copies it
+over schwab/Micah/45DTE/token.json. The file it replaces is kept beside it as token.json.replaced-<time>.token (matched by .gitignore's *.token).
+
+2026-10-26 person folders: Dawson/0dte uses the SAME login and reads schwab/Micah/0dte/token.json directly (SCHWAB_TOKEN_PATH in its .env), so
+nothing is copied there. Ronnie/45DTE is a DIFFERENT Schwab login with its own token.json: log in from that folder; it is never copied.
 
 Only creation timestamps are printed -- nothing secret.
 """
@@ -22,8 +25,10 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "schwab" / "0dte"
-TARGETS = (ROOT / "schwab" / "45DTE",)
+SOURCE = ROOT / "schwab" / "Micah" / "0dte"
+# 2026-10-26: no targets any more. Micah/45DTE and Dawson/0dte read schwab/Micah/0dte/token.json directly (SCHWAB_TOKEN_PATH in their .env), so a
+# copy in Micah/45DTE would only be a stray file the daily check flags. Running this now just logs in from Micah/0dte.
+TARGETS: tuple[Path, ...] = ()
 
 
 def created(path: Path) -> float | None:
@@ -58,7 +63,7 @@ def copy_login(source: Path, target: Path, now: datetime | None = None) -> Path 
 
 def main(argv: list[str] | None = None, source: Path = SOURCE, targets: tuple[Path, ...] = TARGETS, login=run_login) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--no-login", action="store_true", help="skip the login: only copy the schwab/0dte token.json that is there now")
+    parser.add_argument("--no-login", action="store_true", help="skip the login: only copy the schwab/Micah/0dte token.json that is there now")
     args = parser.parse_args(argv)
     before = created(source / "token.json")
     if not args.no_login:
@@ -77,7 +82,8 @@ def main(argv: list[str] | None = None, source: Path = SOURCE, targets: tuple[Pa
     for target in targets:
         kept = copy_login(source, target)
         print(f"Copied the {when(after)} login to {target / 'token.json'}" + (f" (the old file is kept as {kept.name})" if kept else ""))
-    print("\nBoth Schwab bots now share one login. Restart the bots that were running; redo this in 7 days (before the login expires).")
+    print("\nLogin A renewed. Restart the bots that were running; redo this in 7 days (before the login expires)."
+          + (" The other folders on login A read this file directly." if not targets else ""))
     for folder in (source, *targets):
         print(f"  {folder / 'token.json'}: login {when(created(folder / 'token.json'))}")
     return 0

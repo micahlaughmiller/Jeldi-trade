@@ -1,0 +1,6 @@
+schwab-py>=1.5
+pandas
+numpy
+yfinance
+python-dotenv
+pytest

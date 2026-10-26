@@ -155,7 +155,9 @@ class Scheduler:
         print(f"START OF DAY  {self.now_fn().strftime('%Y-%m-%d %H:%M:%S %Z')}  broker={self.broker.name} "
               f"{'PAPER' if self.broker.is_paper else 'LIVE'}{'  DRY-RUN' if getattr(self.broker, 'dry_run', False) else ''}")
         print("#" * 96)
-        print(f"equity ${self.equity:,.2f} | cash ${account['cash']:,.2f} | options BP ${account['options_buying_power']:,.2f}")
+        token = getattr(self.broker, "token_path", None)
+        print(f"account ...{str(account.get('account_id') or '')[-4:] or '?'}" + (f" | token {token}" if token else "")
+              + f" | equity ${self.equity:,.2f} | cash ${account['cash']:,.2f} | options BP ${account['options_buying_power']:,.2f}")
         print(f"P&L  YTD {money(pnl.get('ytd'))} | MTD {money(pnl.get('mtd'))} | today {money(pnl.get('today'))}")
         print(f"\nOPEN ORDERS ({len(open_orders)})")
         for o in open_orders:

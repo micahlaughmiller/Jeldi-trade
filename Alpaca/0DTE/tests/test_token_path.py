@@ -36,3 +36,15 @@ def test_a_blank_setting_means_the_default():
     default = config_path(None)
     assert default.endswith("token.json")
     assert config_path("") == default and config_path("   ") == default
+
+
+def test_a_relative_path_is_relative_to_the_bot_folder_not_to_the_working_directory(tmp_path):
+    """2026-10-26: Dawson/0dte points at ..\\..\\Micah\\0dte\\token.json; every reader (the live-/ES reader included) must get the
+    folder-relative file even when the bot is started from somewhere else."""
+    env = {k: v for k, v in os.environ.items() if k != "SCHWAB_TOKEN_PATH"}
+    env["SCHWAB_TOKEN_PATH"] = r"..\other\token.json"
+    out = subprocess.run([sys.executable, "-c", "import dotenv; dotenv.load_dotenv = lambda *a, **k: False; import sys; "
+                          f"sys.path.insert(0, {str(FOLDER)!r}); import config; print(config.SCHWAB_TOKEN_PATH)"],
+                         cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=60)        # a DIFFERENT working directory
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == str((FOLDER / ".." / "other" / "token.json").resolve())

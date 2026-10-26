@@ -1,0 +1,218 @@
+"""Persona-scoped JSONL event log, trades.csv, and state persistence."""
+
+import csv
+import json
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+import config
+
+TRADE_FIELDS = [
+    "date", "strategy", "entry_time", "exit_time", "direction", "setup", "right",
+    "short_strike", "long_strike", "width", "qty", "entry_credit", "exit_price",
+    "pnl", "exit_reason", "runner",
+    "trigger_price", "exit_slippage", "realistic_exit_price", "pnl_actual_fill",
+    "entry_mid", "entry_slippage",
+    "prev_tick_price", "prev_tick_pnl", "prev_tick_jump",
+    "ticker", "expiration", "mfe", "mae", "scanner_score",
+]
+
+RULE = "=" * 70
+THIN = "-" * 70
+TABLE_WIDTH = 119
+
+
+def _money(v: float) -> str:
+    return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
+
+
+def _clock(dt: datetime | str | None) -> str:
+    if dt is None:
+        return "?"
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    return dt.strftime("%H:%M:%S ET")
+
+
+def _row(label: str, value: Any, indent: int = 1) -> str:
+    return f"{' ' * indent}{label:<16}{value}"
+
+
+def strategy_label(strat: str, ticker: str | None = None) -> str:
+    label = config.STRATEGY_LABELS.get(strat, strat)
+    return f"{label} {ticker}" if ticker and strat in config.STOCK_STRATEGIES else label
+
+
+def _header(trade_no: int, strat: str, setup: str, direction: str, right: str, root: str,
+            expiration: date | str, qty: int, ticker: str | None = None) -> list[str]:
+    kind = "PUT CREDIT SPREAD" if right == "P" else "CALL CREDIT SPREAD"
+    return [
+        RULE, f" TRADE #{trade_no}   STRATEGY {strategy_label(strat, ticker)}", THIN,
+        _row("Strategy", strategy_label(strat, ticker)), _row("Setup", setup),
+        _row("Direction", direction), _row("Spread", kind),
+        _row("Underlying", f"{root}  expires {expiration}"), _row("Contracts", qty),
+    ]
+
+
+def _entry_rows(entry_time: Any, right: str, short_strike: float, long_strike: float, credit: float, qty: int) -> list[str]:
+    return [
+        THIN, " ENTRY", _row("Time", _clock(entry_time), 3),
+        _row("Sold", f"{short_strike:g} {right}", 3),
+        _row("Bought", f"{long_strike:g} {right}", 3),
+        _row("Credit", f"${credit:.2f} per spread   ({_money(credit * 100 * qty)} total)", 3),
+    ]
+
+
+def _num(v: Any, fmt: str = ".2f") -> str:
+    return "n/a" if v is None else format(v, fmt)
+
+
+def _scan_rows(spread: Any) -> list[str]:
+    """Strategy F: the scanner and break-confirmation snapshot that led to the entry."""
+    scan, confirm = spread.scan, spread.scan.get("confirm") or {}
+    match = "match" if scan.get("direction_match") else "MISMATCH"
+    return [
+        _row("Score", f"{_num(scan.get('score'), 'g')} raw / {_num(scan.get('score_with_tier'), 'g')} tier {scan.get('tier')}"
+                      f"   rank {scan.get('rank')}   scanner {scan.get('scanner_direction')} ({match})", 3),
+        _row("Trigger", scan.get("trigger"), 3),
+        _row("Exp move", f"straddle ${_num(scan.get('em_straddle'))}   ATR ${_num(scan.get('expected_move'))}"
+                         f"   remaining ${_num(confirm.get('remaining_em'))}", 3),
+        _row("RVOL", f"{_num(scan.get('rvol'), '.2f')}x   break vol {_num(confirm.get('candle_volume'), ',.0f')}"
+                     f" vs normal {_num(confirm.get('normal_volume'), ',.0f')}", 3),
+        _row("Width", f"${spread.width:g}   (strike step {_num(scan.get('increment'), 'g')})", 3),
+        _row("Quote", f"bid {_num(spread.entry_bid)} / ask {_num(spread.entry_ask)} / mid {_num(spread.entry_mid)}", 3),
+    ]
+
+
+def format_entry_card(spread: Any, trade_no: int) -> str:
+    lines = _header(trade_no, spread.strategy, spread.setup, spread.direction, spread.right, spread.root,
+                    spread.expiration, spread.qty, ticker=getattr(spread, "ticker", None))
+    lines += _entry_rows(spread.entry_time, spread.right, spread.short_strike, spread.long_strike, spread.entry_credit, spread.qty)
+    lines += [_row("Stop", f"${spread.stop_price:.2f}  (spread price rises to)", 3), _row("Target", f"${spread.target_price:.2f}  (spread price falls to)", 3)]
+    if getattr(spread, "scan", None):
+        lines += _scan_rows(spread)
+    lines.append(RULE)
+    return "\n".join(lines)
+
+
+def format_close_card(row: dict, trade_no: int, day_pnl: dict[str, float], closed_today: int, remaining: int) -> str:
+    """`day_pnl` is realized P/L today per strategy (including this fill)."""
+    total_qty = int(row.get("total_qty") or row["qty"] + remaining)
+    lines = _header(trade_no, row["strategy"], row["setup"], row["direction"], row["right"], row.get("root", "SPXW"),
+                    row.get("expiration") or row["date"], total_qty, ticker=row.get("ticker"))
+    lines += _entry_rows(row["entry_time"], row["right"], row["short_strike"], row["long_strike"], row["entry_credit"], total_qty)
+    lines += [THIN, " CLOSE", _row("Time", _clock(row["exit_time"]), 3),
+              _row("Bought back", f"{row['qty']} of {total_qty}" + (f"   ({remaining} still open)" if remaining else ""), 3),
+              _row("Debit", f"${row['exit_price']:.2f} per spread   ({_money(-row['exit_price'] * 100 * row['qty'])} total)", 3),
+              _row("Reason", row["exit_reason"], 3)]
+    if row["strategy"] in config.STOCK_STRATEGIES:
+        lines += [_row("MFE / MAE", f"+{_num(row.get('mfe'))} / -{_num(row.get('mae'))}", 3),
+                  _row("Slippage", f"entry {_num(row.get('entry_slippage'), '+.2f')}   exit {_num(row.get('exit_slippage'), '+.2f')}", 3)]
+    lines += [THIN, _row("P/L this fill" if remaining else "P/L this trade", _money(row["pnl"]))]
+    if remaining:
+        lines.append(_row("P/L position", f"{_money(row['position_pnl'])} so far"))
+    for strat in config.STRATEGIES:
+        lines.append(_row(f"P/L today {strat}", _money(day_pnl.get(strat, 0.0))))
+    lines += [_row("P/L today total", f"{_money(sum(day_pnl.values()))}   ({closed_today} trade{'s' if closed_today != 1 else ''} closed)"), RULE]
+    return "\n".join(lines)
+
+
+def _trade_pnl(r: dict) -> float:
+    return float(r.get("position_pnl", r["pnl"]))
+
+
+def _subtotal(strat: str, rows: list[dict]) -> str:
+    pnl = sum(_trade_pnl(r) for r in rows)
+    wins = sum(1 for r in rows if _trade_pnl(r) > 0)
+    losses = sum(1 for r in rows if _trade_pnl(r) < 0)
+    rate = f"{100 * wins / len(rows):.0f}%" if rows else "n/a"
+    text = (f" {strategy_label(strat):<26}trades {len(rows):<4}wins {wins:<4}losses {losses:<4}"
+            f"win rate {rate:<6}")
+    return f"{text:<{TABLE_WIDTH - 10}}{_money(pnl):>10}"
+
+
+def format_day_table(closed_trades: list[dict], day_pnl: float) -> str:
+    """End-of-day grid, one row per closed trade, then a subtotal per strategy."""
+    head = (f" {'#':<3}{'STRAT':<6}{'TICKER':<7}{'ENTRY':<10}{'SETUP':<10}{'DIR':<9}{'SOLD':<8}{'BOUGHT':<8}{'QTY':<5}"
+            f"{'CREDIT':<8}{'CLOSE':<10}{'DEBIT':<8}{'REASON':<16}{'P/L':>10}")
+    lines = [RULE, " TRADES TODAY", THIN, head, THIN]
+    for i, r in enumerate(closed_trades, 1):
+        qty = int(r.get("total_qty") or r["qty"])
+        lines.append(f" {i:<3}{r['strategy']:<6}{str(r.get('ticker') or ''):<7}{_clock(r['entry_time'])[:8]:<10}{r['setup']:<10}{r['direction']:<9}"
+                     f"{f'{r['short_strike']:g}{r['right']}':<8}{f'{r['long_strike']:g}{r['right']}':<8}{qty:<5}"
+                     f"{r['entry_credit']:<8.2f}{_clock(r['exit_time'])[:8]:<10}{r['exit_price']:<8.2f}"
+                     f"{str(r['exit_reason'])[:15]:<16}{_money(_trade_pnl(r)):>10}")
+    if not closed_trades:
+        lines.append(" (no trades closed today)")
+    lines.append(THIN)
+    for strat in config.STRATEGIES:
+        lines.append(_subtotal(strat, [r for r in closed_trades if r["strategy"] == strat]))
+    label = f" P/L TODAY ({'+'.join(config.STRATEGIES)})"
+    lines += [THIN, f"{label:<{TABLE_WIDTH - 10}}{_money(day_pnl):>10}", RULE]
+    return "\n".join(lines)
+
+
+def jsonable(obj: Any) -> Any:
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return jsonable(asdict(obj))
+    if isinstance(obj, dict):
+        return {k: jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [jsonable(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if hasattr(obj, "item"):
+        return obj.item()
+    return obj
+
+
+class Journal:
+    def __init__(self, log_dir: str | Path, trader_name: str):
+        self.dir = Path(log_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.trader = trader_name.upper()
+        self.slug = self.trader.lower()
+        self.state_path = self.dir / f"state_{self.slug}.json"
+        self.trades_path = self.dir / f"trades_{self.slug}.csv"
+
+    def event(self, kind: str, now: datetime, **data: Any) -> None:
+        path = self.dir / f"events_{self.slug}_{now.date().isoformat()}.jsonl"
+        record = {"ts": now.isoformat(), "trader": self.trader, "event": kind, **jsonable(data)}
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    def trade(self, row: dict) -> None:
+        exists = self.trades_path.exists()
+        if exists:
+            with self.trades_path.open(newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), [])
+            if header != TRADE_FIELDS:
+                # Columns changed: park the old file rather than appending misaligned rows to it.
+                parked = self.trades_path.with_name(f"{self.trades_path.stem}_until_{row.get('date', 'x')}.csv")
+                self.trades_path.replace(parked)
+                exists = False
+        with self.trades_path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+            if not exists:
+                w.writeheader()
+            w.writerow(jsonable(row))
+
+    def card(self, text: str, now: datetime) -> None:
+        path = self.dir / f"trades_{self.slug}_{now.date().isoformat()}.txt"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(text + "\n\n")
+
+    def save_state(self, state: dict) -> None:
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(jsonable(state), indent=2, default=str), encoding="utf-8")
+        tmp.replace(self.state_path)
+
+    def load_state(self) -> dict | None:
+        if not self.state_path.exists():
+            return None
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None

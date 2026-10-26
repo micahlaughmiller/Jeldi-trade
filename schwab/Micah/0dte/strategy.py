@@ -1,0 +1,765 @@
+"""Pure 0DTE strategy logic: phases, breakout detection, ORB setup, strikes, credit, momentum.
+
+No I/O here. Candles are pandas DataFrames indexed by tz-aware ET bar START
+time with columns open/high/low/close/volume, containing completed bars only.
+
+Breakout level source (config.BREAKOUT_LEVEL_SOURCE):
+  ES_TO_SPX (default): the overnight high/low come from ES futures (the only
+    instrument trading 18:00-09:30), are translated into SPX terms with the
+    09:30 basis (SPX - ES), and compared against live SPX candles. Yahoo's ES
+    quotes are ~10 minutes delayed while ^GSPC is real-time, so confirming on
+    SPX candles keeps the 2-candle confirmation on current prices.
+  ES: compare ES candles directly against the raw ES levels. Simpler, but the
+    signal arrives ~10 minutes late.
+"""
+
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from enum import StrEnum
+from math import ceil, floor
+
+import pandas as pd
+
+import config
+
+BULLISH = "BULLISH"
+BEARISH = "BEARISH"
+MOMENTUM = "MOMENTUM"     # ORB entry kinds
+PULLBACK = "PULLBACK"
+
+
+class Phase(StrEnum):
+    PRE_OPEN = "PRE_OPEN"
+    OVERNIGHT_ONLY = "OVERNIGHT_ONLY"
+    ORB_ONLY = "ORB_ONLY"
+    NO_NEW_ENTRIES = "NO_NEW_ENTRIES"
+    CLOSED = "CLOSED"
+
+
+ENTRY_PHASES = {Phase.OVERNIGHT_ONLY, Phase.ORB_ONLY}
+OVERNIGHT_PHASES = {Phase.OVERNIGHT_ONLY}
+ORB_PHASES = {Phase.ORB_ONLY}
+ORB_SETUPS = ("ORB", "STOCK_ORB")   # opening-range setups admitted by NEWS_DAY_MODE "orb_only"
+
+
+def spx_strategies() -> tuple[str, ...]:
+    """Active strategies that trade the SPX signal funnel (stock strategies such as F are excluded)."""
+    return tuple(s for s in config.STRATEGIES if s not in config.STOCK_STRATEGIES)
+
+
+@dataclass(frozen=True)
+class Levels:
+    high: float
+    low: float
+    established_at: datetime
+
+    def shifted(self, basis: float) -> "Levels":
+        return Levels(self.high + basis, self.low + basis, self.established_at)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Levels":
+        return cls(high=d["high"], low=d["low"], established_at=datetime.fromisoformat(d["established_at"]))
+
+
+@dataclass(frozen=True)
+class Breakout:
+    direction: str
+    candle_times: tuple[datetime, datetime]
+
+
+@dataclass(frozen=True)
+class SpreadQuote:
+    mid: float
+    bid_side: float
+    ask_side: float
+
+
+def at_time(now: datetime, t: time) -> datetime:
+    return now.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=0)
+
+
+def minutes_since_open(now: datetime) -> float:
+    return (now - at_time(now, config.MARKET_OPEN)).total_seconds() / 60.0
+
+
+def phase(now: datetime) -> Phase:
+    if now >= at_time(now, config.FORCE_CLOSE_TIME):
+        return Phase.CLOSED
+    if now >= at_time(now, config.LAST_ENTRY_TIME):
+        return Phase.NO_NEW_ENTRIES
+    m = minutes_since_open(now)
+    if m < 0:
+        return Phase.PRE_OPEN
+    if m < config.OVERNIGHT_ENTRY_END_MIN:
+        return Phase.OVERNIGHT_ONLY
+    return Phase.ORB_ONLY
+
+
+def detect_breakout(candles: pd.DataFrame, level_high: float, level_low: float,
+                    level_time: datetime) -> Breakout | None:
+    if candles is None or len(candles) < 2:
+        return None
+    prev, last = candles.iloc[-2], candles.iloc[-1]
+    t_prev, t_last = candles.index[-2].to_pydatetime(), candles.index[-1].to_pydatetime()
+    if t_prev < level_time:
+        return None
+    if prev.close > level_high and last.close > level_high and last.high > prev.high:
+        return Breakout(BULLISH, (t_prev, t_last))
+    if prev.close < level_low and last.close < level_low and last.low < prev.low:
+        return Breakout(BEARISH, (t_prev, t_last))
+    return None
+
+
+class OrbSetup:
+    """Opening-range break state machine fed one completed ORB candle at a time.
+
+    WAITING -> BROKEN (close beyond a level) -> PULLED_BACK (wick touches the level)
+    -> ENTRY, or straight from BROKEN to ENTRY when a candle closes beyond the break
+    close. Any close back through the level resets; after an entry the setup stays
+    DONE until a candle closes back inside the range.
+    """
+
+    WAITING = "WAITING"
+    BROKEN = "BROKEN"
+    PULLED_BACK = "PULLED_BACK"
+    DONE = "DONE"
+
+    def __init__(self, or_high: float, or_low: float):
+        self.or_high = or_high
+        self.or_low = or_low
+        self.state = self.WAITING
+        self.direction: str | None = None
+        self.break_close: float | None = None
+        self.candles_since_break = 0
+        self.entry_kind: str | None = None   # MOMENTUM or PULLBACK for the entry just fired
+
+    def to_dict(self) -> dict:
+        return {"or_high": self.or_high, "or_low": self.or_low, "state": self.state,
+                "direction": self.direction, "break_close": self.break_close,
+                "candles_since_break": self.candles_since_break, "entry_kind": self.entry_kind}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OrbSetup":
+        obj = cls(d["or_high"], d["or_low"])
+        obj.state = d["state"]
+        obj.direction = d["direction"]
+        obj.break_close = d["break_close"]
+        obj.candles_since_break = d["candles_since_break"]
+        obj.entry_kind = d["entry_kind"]
+        return obj
+
+    def _reset(self) -> None:
+        self.state = self.WAITING
+        self.direction = None
+        self.break_close = None
+        self.candles_since_break = 0
+        self.entry_kind = None
+
+    def _arm(self, direction: str, close: float) -> None:
+        self.state = self.BROKEN
+        self.direction = direction
+        self.break_close = close
+        self.candles_since_break = 0
+
+    def _enter(self, kind: str) -> str:
+        self.state = self.DONE
+        self.entry_kind = kind
+        return self.direction
+
+    def update(self, candle: pd.Series) -> str | None:
+        """Feed one completed candle; returns BULLISH/BEARISH exactly once per entry."""
+        close, open_ = float(candle.close), float(candle.open)
+        if self.state == self.DONE:
+            if self.or_low <= close <= self.or_high:
+                self._reset()
+            return None
+        if self.state == self.WAITING:
+            if close > self.or_high:
+                self._arm(BULLISH, close)
+            elif close < self.or_low:
+                self._arm(BEARISH, close)
+            return None
+        self.candles_since_break += 1
+        if self.candles_since_break > config.ORB_SETUP_TIMEOUT_CANDLES:
+            self._reset()
+            return self.update(candle)
+        # Mirror the bearish case onto the bullish one: positive = beyond the broken level.
+        sign = 1.0 if self.direction == BULLISH else -1.0
+        level = self.or_high if self.direction == BULLISH else self.or_low
+        touch = float(candle.low) if self.direction == BULLISH else float(candle.high)
+        if sign * (close - level) <= 0:
+            self._reset()
+            return self.update(candle)
+        if self.state == self.BROKEN:
+            if sign * (touch - level) <= 0:
+                self.state = self.PULLED_BACK
+            elif sign * (close - self.break_close) > 0:
+                return self._enter(MOMENTUM)
+            return None
+        if sign * (close - open_) > 0:
+            return self._enter(PULLBACK)
+        return None
+
+
+def direction_to_spread(direction: str) -> str:
+    if direction == BULLISH:
+        return "P"
+    if direction == BEARISH:
+        return "C"
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+def select_strikes(spot: float, right: str, width: int) -> tuple[float, float]:
+    """Return (short_strike, long_strike). ITM credit spreads by design."""
+    if right == "P":
+        long = float(floor(spot / 5) * 5 + 5)
+        return long + width, long
+    if right == "C":
+        long = float(ceil(spot / 5) * 5 - 5)
+        return long - width, long
+    raise ValueError(f"unknown right {right!r}")
+
+
+def width_for_tier(tier: int) -> int:
+    return config.WIDTH_BY_TIER[tier]
+
+
+def credit_range(width: int) -> tuple[float, float]:
+    return config.CREDIT_RANGE_BY_WIDTH[width]
+
+
+def credit_range_b(width: int) -> tuple[float, float]:
+    return config.B_CREDIT_RANGE_BY_WIDTH[width]
+
+
+def exit_setting(strat: str, name: str, default=None):
+    """Per-strategy exit knob from EXIT_TUNING_BY_STRATEGY, else the module-level config value."""
+    v = config.EXIT_TUNING_BY_STRATEGY.get(strat, {}).get(name)
+    return v if v is not None else getattr(config, name, default)
+
+
+EXIT_LEVELS_BY_STRATEGY = {
+    "A": ("PROFIT_TARGET", "STOP_LOSS"),
+    "B": ("B_PROFIT_TARGET", "B_STOP_LOSS"),
+    # C, D, E all use Strategy B's width/strike selection (user's own instruction) and, absent any
+    # strategy-specific target/stop of their own, B's target/stop too -- each has its own config name
+    # so it can be tuned independently later without touching B.
+    "C": ("C_PROFIT_TARGET", "C_STOP_LOSS"),
+    "D": ("D_PROFIT_TARGET", "D_STOP_LOSS"),
+    "E": ("E_PROFIT_TARGET", "E_STOP_LOSS"),
+    # F's live target/stop are width-scaled per position (f_exit_params); these are registry placeholders.
+    "F": ("F_PROFIT_TARGET", "F_STOP_LOSS"),
+}
+
+
+def exit_levels(strat: str) -> tuple[float, float]:
+    """(profit_target, stop_loss) in spread-price points for the given strategy."""
+    names = EXIT_LEVELS_BY_STRATEGY.get(strat)
+    if names is None:
+        raise ValueError(f"unknown strategy {strat!r}")
+    target_name, stop_name = names
+    return getattr(config, target_name), getattr(config, stop_name)
+
+
+def spread_quote(chain_quotes: list[dict], short_strike: float, long_strike: float) -> SpreadQuote | None:
+    by_strike = {round(q["strike"], 2): q for q in chain_quotes}
+    short, long = by_strike.get(round(short_strike, 2)), by_strike.get(round(long_strike, 2))
+    if short is None or long is None:
+        return None
+    return SpreadQuote(
+        mid=round(short["mid"] - long["mid"], 2),
+        bid_side=round(short["bid"] - long["ask"], 2),
+        ask_side=round(short["ask"] - long["bid"], 2),
+    )
+
+
+def entry_credit(chain_quotes: list[dict], short_strike: float, long_strike: float,
+                 width: int) -> tuple[SpreadQuote | None, str | None]:
+    """(quote, None) when the mid is inside the credit range, else (quote, reason)."""
+    quote = spread_quote(chain_quotes, short_strike, long_strike)
+    if quote is None:
+        return None, f"STRIKES_NOT_IN_CHAIN short={short_strike} long={long_strike}"
+    lo, hi = credit_range(width)
+    if quote.mid < lo:
+        return quote, f"CREDIT_BELOW_MIN mid={quote.mid:.2f} < {lo:.2f}"
+    if quote.mid > hi:
+        return quote, f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f}"
+    return quote, None
+
+
+def credit_bias(width: int) -> float:
+    return config.A_CREDIT_BIAS_BY_WIDTH[width]
+
+
+def select_strikes_a(spot: float, right: str, width: int,
+                     chain_rows: list[dict]) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """Strategy A strikes: the ITM spread from select_strikes, walked toward spot while too deep.
+
+    A mid above credit_bias(width) -- or above the band's max -- means the short strike is deeper
+    ITM than wanted. Step both strikes one strike toward spot, up to A_MAX_STRIKE_WALK times, as
+    long as the short strike stays ITM. The first quote at or under the bias wins; if the walk runs
+    out (or would drop the credit below the band's minimum) the last in-band quote is used.
+    Returns (short, long, quote) or (None, None, reason).
+    """
+    short, long = select_strikes(spot, right, width)
+    lo, hi = credit_range(width)
+    bias = credit_bias(width)
+    step = -5.0 if right == "P" else 5.0
+    best: tuple[float, float, SpreadQuote] | None = None
+    reason = ""
+    for _ in range(config.A_MAX_STRIKE_WALK + 1):
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            reason = f"STRIKES_NOT_IN_CHAIN short={short:g} long={long:g}"
+            break
+        if quote.mid < lo:
+            reason = f"CREDIT_BELOW_MIN mid={quote.mid:.2f} < {lo:.2f} at {short:g}/{long:g}"
+            break
+        if quote.mid <= bias:
+            return short, long, quote
+        if quote.mid <= hi:
+            best = (short, long, quote)
+        reason = f"CREDIT_ABOVE_MAX mid={quote.mid:.2f} > {hi:.2f} at {short:g}/{long:g}"
+        next_short = short + step
+        if not (next_short > spot if right == "P" else next_short < spot):
+            reason += " (next strike would not be ITM)"
+            break
+        short, long = next_short, long + step
+    else:
+        reason += f" after {config.A_MAX_STRIKE_WALK} strike walk(s)"
+    if best is not None:
+        return best
+    return None, None, reason
+
+
+def expected_move(chain_calls: list[dict], chain_puts: list[dict], spot: float) -> float | None:
+    """ATM straddle mid (call + put at the strike nearest spot); None if a side is missing."""
+    strikes = {round(q["strike"], 2) for q in chain_calls} | {round(q["strike"], 2) for q in chain_puts}
+    if not strikes:
+        return None
+    atm = min(strikes, key=lambda k: (abs(k - spot), k))
+    call = next((q for q in chain_calls if round(q["strike"], 2) == atm), None)
+    put = next((q for q in chain_puts if round(q["strike"], 2) == atm), None)
+    if call is None or put is None:
+        return None
+    return round(call["mid"] + put["mid"], 2)
+
+
+def select_strikes_b(spot: float, right: str, width: int, em: float,
+                     chain_rows: list[dict]) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """OTM spread one expected move from spot, walked strike by strike into B's credit range.
+
+    Returns (short, long, quote) or (None, None, reason).
+    """
+    if right == "P":
+        short, toward_spot = float(ceil((spot - em) / 5) * 5), 5.0
+    elif right == "C":
+        short, toward_spot = float(floor((spot + em) / 5) * 5), -5.0
+    else:
+        raise ValueError(f"unknown right {right!r}")
+    lo, hi = credit_range_b(width)
+    for _ in range(20):
+        distance = abs(spot - short)
+        if distance < config.B_MIN_DISTANCE_FROM_SPOT:
+            return None, None, f"B_NO_STRIKE_IN_RANGE short={short:g} within {config.B_MIN_DISTANCE_FROM_SPOT} of spot {spot:.2f}"
+        if distance > 2 * em:
+            return None, None, f"B_NO_STRIKE_IN_RANGE short={short:g} beyond 2x EM {em:.2f} from spot {spot:.2f}"
+        long = short - width if right == "P" else short + width
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            return None, None, f"STRIKES_NOT_IN_CHAIN short={short:g} long={long:g}"
+        if quote.mid < lo:
+            short += toward_spot
+        elif quote.mid > hi:
+            short -= toward_spot
+        else:
+            return short, long, quote
+    return None, None, f"B_NO_STRIKE_IN_RANGE no credit in {lo:.2f}-{hi:.2f} after 20 steps"
+
+
+# ---------------------------------------------------------------- Strategy F: stock ORB credit spreads
+
+def strike_increment(chain_rows: list[dict], spot: float, band_pct: float | None = None) -> float | None:
+    """Smallest gap between distinct quoted strikes within +/-band_pct of spot (every strike when fewer
+    than two sit in the band); None with fewer than two strikes at all."""
+    band = config.F_EM_WINDOW_PCT if band_pct is None else band_pct
+    strikes = sorted({round(float(q["strike"]), 2) for q in chain_rows})
+    near = [k for k in strikes if abs(k - spot) <= band * spot]
+    if len(near) < 2:
+        near = strikes
+    if len(near) < 2:
+        return None
+    return round(min(b - a for a, b in zip(near, near[1:])), 2)
+
+
+def width_for_stock(spot: float, increment: float, pct: float | None = None,
+                    min_width: float | None = None) -> float:
+    """Spread width: the multiple of the chain's strike increment nearest pct x spot, never below
+    max(min_width, increment)."""
+    pct = config.F_WIDTH_PCT if pct is None else pct
+    min_width = config.F_MIN_WIDTH if min_width is None else min_width
+    width = round(max(1, round(pct * spot / increment)) * increment, 2)
+    floor_width = max(min_width, increment)
+    if width < floor_width:
+        width = round(ceil(round(floor_width / increment, 9)) * increment, 2)
+    return width
+
+
+def f_em_cap(em: float, increment: float | None) -> float:
+    """The farthest the short strike may sit from spot, in dollars: F_EM_CAP_MULT x EM, or F_EM_CAP_MULT_COARSE x EM when the strike grid is
+    coarse for this EM (the EM spans fewer than F_COARSE_GRID_EM_STEPS strike steps, so no strike can land near 1 EM)."""
+    coarse = increment is not None and increment > 0 and em < config.F_COARSE_GRID_EM_STEPS * increment
+    return (config.F_EM_CAP_MULT_COARSE if coarse else config.F_EM_CAP_MULT) * em
+
+
+def f_chain_span(em: float, width: float) -> float:
+    """Half-width of the chain window stock_orb asks the broker for: it must cover the widest cap plus the long leg."""
+    return max(config.F_EM_CAP_MULT, config.F_EM_CAP_MULT_COARSE) * em + 2 * width
+
+
+def select_strikes_f(spot: float, right: str, width: float, em: float, chain_rows: list[dict],
+                     credit_pct: tuple[float, float] | None = None,
+                     max_steps: int | None = None, increment: float | None = None) -> tuple[float | None, float | None, SpreadQuote | str]:
+    """OTM spread one expected move from spot, walked through the chain's QUOTED strikes until the
+    credit is inside credit_pct x width. Unquoted strikes (gaps, coarser grids further out) are
+    stepped over rather than failing the walk. Returns (short, long, quote) or (None, None, reason).
+    `increment` is the chain's strike step (derived from the quoted strikes when not given): it decides the EM cap, see f_em_cap.
+    """
+    lo_pct, hi_pct = credit_pct or config.F_CREDIT_PCT_RANGE
+    max_steps = max_steps or config.F_MAX_STRIKE_STEPS
+    lo, hi = round(lo_pct * width, 2), round(hi_pct * width, 2)
+    quoted = sorted({round(float(q["strike"]), 2) for q in chain_rows if float(q.get("bid") or 0.0) > 0})
+    if increment is None:
+        steps = [round(b - a, 2) for a, b in zip(quoted, quoted[1:]) if b - a > 0]
+        increment = min(steps) if steps else None
+    cap = f_em_cap(em, increment)
+    cap_mult = cap / em if em else 0.0
+    if right == "P":
+        outward, sign = [k for k in reversed(quoted) if k < spot], -1.0
+    elif right == "C":
+        outward, sign = [k for k in quoted if k > spot], 1.0
+    else:
+        raise ValueError(f"unknown right {right!r}")
+    i = next((n for n, k in enumerate(outward) if abs(k - spot) >= em), None)
+    if i is None:
+        return None, None, f"F_NO_STRIKE_IN_RANGE no quoted {right} strike at or beyond EM {em:.2f} from spot {spot:.2f}"
+    step = -1   # toward spot (more credit); +1 steps away
+    gap = ""
+    for _ in range(max_steps):
+        if i < 0 or i >= len(outward):
+            break
+        short = outward[i]
+        distance = abs(spot - short)
+        if distance < width:
+            return None, None, f"F_TOO_CLOSE_TO_SPOT short={short:g} within {width:g} of spot {spot:.2f}"
+        if distance > cap:
+            step_text = "unknown" if increment is None else f"{increment:g}"
+            return None, None, (f"F_BEYOND_EM_CAP short={short:g} beyond {cap_mult:g}x EM {em:.2f} from spot {spot:.2f} "
+                                f"(strike step {step_text})")
+        long = round(short + sign * width, 2)
+        quote = spread_quote(chain_rows, short, long)
+        if quote is None:
+            gap = f" (skipped unquoted {short:g}/{long:g})"
+        elif quote.mid < lo:
+            step = -1
+        elif quote.mid > hi:
+            step = 1
+        else:
+            return short, long, quote
+        i += step
+    return None, None, f"F_NO_STRIKE_IN_RANGE no credit in {lo:.2f}-{hi:.2f} after {max_steps} steps{gap}"
+
+
+def f_exit_params(width: float) -> dict:
+    """Width-scaled exits for one F spread, each floored at F_EXIT_FLOOR: target, stop, and the
+    per-position overrides for the profit lock and runner trail. Width 5.0 reproduces B's numbers."""
+    def scaled(pct: float) -> float:
+        return max(config.F_EXIT_FLOOR, round(pct * width, 2))
+    return {
+        "profit_target": scaled(config.F_TARGET_PCT), "stop_loss": scaled(config.F_STOP_PCT),
+        "overrides": {"PROFIT_LOCK_ARM": scaled(config.F_LOCK_ARM_PCT),
+                      "PROFIT_LOCK_GIVEBACK": scaled(config.F_LOCK_GIVEBACK_PCT),
+                      "TRAIL_AMOUNT": scaled(config.F_TRAIL_PCT_OF_WIDTH)},
+    }
+
+
+def f_stop_distance(width: float) -> float:
+    """How far above its entry credit an F spread's staged stop sits (PositionManager._staged_tick's level())."""
+    return max(config.STAGE_EXIT_FLOOR, exit_setting("F", "STAGE0_STOP_PCT", config.STAGE0_STOP_PCT) * width)
+
+
+def quote_blown_out(quote: SpreadQuote, width: float, max_frac: float | None = None,
+                    stop_distance: float | None = None) -> bool:
+    """No bid-side credit, a bid/ask spread on the vertical wider than max_frac of its width, or (when the
+    stop distance is given) wider than F_MAX_QUOTE_SPREAD_STOP_RATIO of it -- a stop inside the quote noise
+    is a coin flip, not a stop."""
+    max_frac = config.F_MAX_QUOTE_SPREAD_FRAC if max_frac is None else max_frac
+    spread = quote.ask_side - quote.bid_side
+    if quote.bid_side <= 0 or spread > max_frac * width:
+        return True
+    return stop_distance is not None and spread > config.F_MAX_QUOTE_SPREAD_STOP_RATIO * stop_distance + 1e-9
+
+
+def _signed_bodies(candles: pd.DataFrame, direction: str) -> pd.Series:
+    sign = 1.0 if direction == BULLISH else -1.0
+    return (candles["close"] - candles["open"]) * sign
+
+
+def momentum(candles: pd.DataFrame, direction: str, n: int | None = None) -> float:
+    """Average body (close-open) of the last n completed candles, positive = with the trade."""
+    n = n or config.MOMENTUM_CANDLES
+    if candles is None or candles.empty:
+        return 0.0
+    return float(_signed_bodies(candles.tail(n), direction).mean())
+
+
+def efficiency_ratio(candles: pd.DataFrame) -> tuple[float | None, int]:
+    """Kaufman efficiency ratio over completed candles: |net move| / total path length, in [0, 1] --
+    near 1 means price traveled in a straight line (trending/efficient), near 0 means it churned back
+    and forth to cover the same net distance (choppy). Returns (ratio, candle_count); ratio is None
+    with fewer than 2 candles or a completely flat path (no movement to measure efficiency over)."""
+    n = 0 if candles is None else len(candles)
+    if candles is None or n < 2:
+        return None, n
+    closes = candles["close"]
+    net = abs(float(closes.iloc[-1]) - float(closes.iloc[0]))
+    path = float(closes.diff().abs().sum())
+    if path <= 0:
+        return None, n
+    return net / path, n
+
+
+def momentum_continuing(candles: pd.DataFrame, direction: str, ratio: float | None = None) -> bool:
+    """Last candle body is in the trade direction and at least `ratio` of the previous body."""
+    ratio = ratio if ratio is not None else config.MOMENTUM_CONTINUE_RATIO
+    if candles is None or len(candles) < 2:
+        return False
+    bodies = _signed_bodies(candles.tail(2), direction)
+    prev, last = float(bodies.iloc[0]), float(bodies.iloc[1])
+    return last > 0 and last >= ratio * prev
+
+
+def candle_against(candles: pd.DataFrame, direction: str) -> bool:
+    """Last completed candle closed against the trade (red for BULLISH, green for BEARISH)."""
+    if candles is None or candles.empty:
+        return False
+    return float(_signed_bodies(candles.tail(1), direction).iloc[0]) < 0
+
+
+def rsi(closes: pd.Series, period: int = 14) -> pd.Series:
+    """Standard Wilder-style RSI (simple rolling mean of gains/losses, not the smoothed EMA variant --
+    close enough for a same-day reversal read and simpler to reason about). NaN for the first `period`
+    bars, same as a Bollinger Band's rolling std."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def momentum_reversing(candles: pd.DataFrame, direction: str, rsi_period: int = 14,
+                       rsi_reversal_pts: float = 5.0) -> bool:
+    """2026-09-29: a position management "is the move showing signs of turning" read -- candles AND
+    RSI, per the user's own words. True if EITHER the last completed candle closed against the trade,
+    OR RSI has moved at least rsi_reversal_pts against the trade direction over its last 3 readings
+    (a meaningful swing, not just noise). False (never flags a reversal) with too little data for RSI.
+    """
+    if candle_against(candles, direction):
+        return True
+    if candles is None or len(candles) < rsi_period + 3:
+        return False
+    r = rsi(candles["close"], rsi_period)
+    if r.isna().iloc[-1] or r.isna().iloc[-3]:
+        return False
+    change = float(r.iloc[-1] - r.iloc[-3])
+    return change < -rsi_reversal_pts if direction == BULLISH else change > rsi_reversal_pts
+
+
+def bb_edge_reversal_risk(candles: pd.DataFrame, direction: str, period: int, num_std: float,
+                          band_touch: float) -> bool:
+    """2026-09-30: exit-timing read from the user's own manual process ("wasn't close to the
+    bollinger band edge, once it got close..."). As a trade runs in its favor, price approaching the
+    Bollinger extreme IN THE DIRECTION IT HAS BEEN MOVING (upper band for a BULLISH position riding a
+    rally, lower band for a BEARISH position riding a decline) warns the move is stretched and due
+    for a mean-reversion snap-back against the position. Uses its OWN, shorter period (config.
+    EXIT_BB_PERIOD) rather than D/E's 30-period ENTRY-signal read -- a deliberately faster window for
+    exit timing. False (never flags risk) with too little data yet.
+    """
+    if candles is None or len(candles) < period:
+        return False
+    _, upper, lower = bollinger(candles["close"], period, num_std)
+    if upper.isna().iloc[-1] or lower.isna().iloc[-1]:
+        return False
+    pct_b = percent_b(float(candles["close"].iloc[-1]), float(upper.iloc[-1]), float(lower.iloc[-1]))
+    if pct_b is None:
+        return False
+    return pct_b >= band_touch if direction == BULLISH else pct_b <= (1.0 - band_touch)
+
+
+def momentum_slowed(current: float, reference: float, pct: float | None = None) -> bool:
+    pct = pct if pct is not None else config.MOMENTUM_SLOWDOWN_PCT
+    return current < reference * (1.0 - pct)
+
+
+def is_news_day(d: date) -> bool:
+    return d.isoformat() in config.NEWS_DAYS
+
+
+def news_mode(d: date) -> str | None:
+    return config.NEWS_DAY_MODE if is_news_day(d) else None
+
+
+def setup_allowed(setup: str, d: date) -> bool:
+    mode = news_mode(d)
+    if mode == "skip":
+        return False
+    if mode == "orb_only":
+        return setup in ORB_SETUPS
+    return True
+
+
+def in_news_blackout(now: datetime, events: list[time], before_min: int, after_min: int) -> bool:
+    """True when `now` falls within `before_min` minutes before or `after_min` minutes after any
+    scheduled news time on today's calendar (config.NEWS_TIMES). Applies bot-wide (all strategies)."""
+    for t in events:
+        event_dt = at_time(now, t)
+        if event_dt - timedelta(minutes=before_min) <= now <= event_dt + timedelta(minutes=after_min):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- Strategy C: ES-sourced break
+
+class TwoCandleBreak:
+    """Close-only break/confirm state machine for Strategy C's ES-overnight-session signal.
+
+    Deliberately simpler than OrbSetup (no wick/pullback path -- the user's own spec: "no wicks
+    count"). Candle N closes beyond the level = armed; the very next candle must ALSO close beyond
+    the SAME level to confirm and fire. A close back inside the level at any point resets to WAITING
+    -- there is no partial-credit pullback/reconfirm state like the ORB/ON_BREAK machine has.
+    """
+
+    WAITING = "WAITING"
+    ARMED = "ARMED"
+    DONE = "DONE"
+
+    def __init__(self, level_high: float, level_low: float):
+        self.level_high = level_high
+        self.level_low = level_low
+        self.state = self.WAITING
+        self.direction: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"level_high": self.level_high, "level_low": self.level_low,
+                "state": self.state, "direction": self.direction}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TwoCandleBreak":
+        obj = cls(d["level_high"], d["level_low"])
+        obj.state = d["state"]
+        obj.direction = d["direction"]
+        return obj
+
+    def _reset(self) -> None:
+        self.state = self.WAITING
+        self.direction = None
+
+    def update(self, candle: pd.Series) -> str | None:
+        """Feed one completed candle; returns BULLISH/BEARISH exactly once per confirmed entry."""
+        close = float(candle.close)
+        if self.state == self.DONE:
+            if self.level_low <= close <= self.level_high:
+                self._reset()
+            return None
+        if self.state == self.WAITING:
+            if close > self.level_high:
+                self.state, self.direction = self.ARMED, BULLISH
+            elif close < self.level_low:
+                self.state, self.direction = self.ARMED, BEARISH
+            return None
+        # ARMED: this candle is the confirmation candle.
+        sign = 1.0 if self.direction == BULLISH else -1.0
+        level = self.level_high if self.direction == BULLISH else self.level_low
+        if sign * (close - level) <= 0:
+            self._reset()
+            return self.update(candle)
+        direction = self.direction
+        self.state = self.DONE
+        return direction
+
+
+# ------------------------------------------------------------- Strategies D/E: MA/Bollinger reversion
+
+def ema(values: pd.Series, span: int) -> pd.Series:
+    return values.ewm(span=span, adjust=False).mean()
+
+
+def bollinger(values: pd.Series, period: int, num_std: float,
+             basis: pd.Series | None = None) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """(basis, upper, lower). `basis` defaults to a rolling SMA; pass the strategy's own EMA
+    (e.g. the 30 EMA that config.D_EMA_SLOW_SPAN also matches to) to use that as the band's
+    center line instead, matching the user's "match the BB and moving average" instruction."""
+    center = basis if basis is not None else values.rolling(period).mean()
+    std = values.rolling(period).std(ddof=0)
+    return center, center + num_std * std, center - num_std * std
+
+
+def percent_b(price: float, upper: float, lower: float) -> float | None:
+    """0.0 = at/below the lower band, 1.0 = at/above the upper band, 0.5 = at the basis line."""
+    width = upper - lower
+    if width <= 0:
+        return None
+    return (price - lower) / width
+
+
+def ema_trend(ema_fast: float, ema_slow: float, chop_threshold: float) -> str:
+    """RISING/FALLING/CHOP from the fast-vs-slow EMA relationship. CHOP when the two are within
+    chop_threshold of each other (a proxy for "crossing" -- exact equality is a zero-measure event
+    on real price data, so this is read as a tight-spread/converging band around the cross)."""
+    if abs(ema_fast - ema_slow) < chop_threshold:
+        return "CHOP"
+    return "RISING" if ema_fast > ema_slow else "FALLING"
+
+
+def mean_reversion_signal(spot: float, ma: float, pct_b: float | None, trend: str,
+                          band_touch: float, use_trend_gate: bool = True) -> str | None:
+    """Strategy D/E entry direction, or None if no valid setup right now.
+
+    Trend gates direction (rising -> only the bull-side reversion, falling -> only bear-side, chop
+    -> sit out entirely). Within whichever side the trend allows, price must also be on the correct
+    side of the MA AND within band_touch of the matching Bollinger extreme (>= band_touch reading as
+    %B for the upper touch, <= 1 - band_touch for the lower touch) -- both conditions from the
+    dictated rule ("above MA and near/touching BB is a bear credit spread, below MA near/touching BB
+    is bull credit spread"), i.e. a bull-side reversion needs price below the MA and pct_b <= 1-band_touch.
+
+    use_trend_gate=False (Strategy E's test variant, config.E_USE_TREND_GATE) drops the trend gate and the
+    CHOP early-out: only the side of the MA and the band touch decide the direction.
+    """
+    if pct_b is None:
+        return None
+    if not use_trend_gate:
+        if spot > ma and pct_b >= band_touch:
+            return BEARISH
+        if spot < ma and pct_b <= (1.0 - band_touch):
+            return BULLISH
+        return None
+    if trend == "CHOP":
+        return None
+    if trend == "RISING":
+        if spot < ma and pct_b <= (1.0 - band_touch):
+            return BULLISH
+        return None
+    if trend == "FALLING":
+        if spot > ma and pct_b >= band_touch:
+            return BEARISH
+        return None
+    raise ValueError(f"unknown trend {trend!r}")
+
+
+def two_candle_confirm(candles: pd.DataFrame, direction: str, n: int = 2) -> bool:
+    """Strategy E's chop-day rule: the last n completed candles all closed in `direction`
+    (green/green for bullish, red/red for bearish)."""
+    if candles is None or len(candles) < n:
+        return False
+    bodies = _signed_bodies(candles.tail(n), direction)
+    return bool((bodies > 0).all())

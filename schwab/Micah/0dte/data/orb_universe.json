@@ -1,0 +1,8 @@
+{
+  "index": "SPX",
+  "tiers": {
+    "A": ["TSLA", "AMZN", "META", "AMD", "AVGO", "ORCL", "BE", "HOOD", "BA", "INTC"],
+    "B": ["CAT", "DE", "GE", "JPM", "GS", "UBER", "NFLX", "LLY", "LRCX", "MRVL"],
+    "C": ["TSM", "DELL", "GOOGL", "MSFT", "XOM", "CVX", "COP", "BAC", "NKE", "PFE"]
+  }
+}

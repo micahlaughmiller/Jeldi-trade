@@ -1,0 +1,221 @@
+"""Tiering, contract sizing, and daily circuit breakers (per strategy plus combined)."""
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from math import floor
+
+import config
+
+
+def limit(strat: str, name: str, default=None):
+    """Per-strategy limit from LIMITS_BY_STRATEGY, else the module-level config value."""
+    v = config.LIMITS_BY_STRATEGY.get(strat, {}).get(name)
+    return v if v is not None else getattr(config, name, default)
+
+
+def tier(equity: float) -> int:
+    for ceiling, t in config.TIER_BANDS:
+        if equity < ceiling:
+            return t
+    return config.TIER_BANDS[-1][1]
+
+
+def contracts_for(equity: float, width: float, credit: float, open_risk_dollars: float,
+                  news_day: bool = False, half_size: bool = False) -> int:
+    """`half_size` is Strategy D (always) and Strategy E (its choppy-day variant) trading at half
+    the testing-phase contract cap, per the user's own instruction -- see config.TESTING_MODE."""
+    max_loss = (width - credit) * 100.0
+    if max_loss <= 0 or equity <= 0:
+        return 0
+    n = floor(equity * config.RISK_PER_TRADE_PCT / max_loss)
+    if n == 0 and config.ALLOW_MIN_CONTRACT_OVERRIDE \
+            and (open_risk_dollars + max_loss) / equity <= config.MAX_PORTFOLIO_RISK_PCT:
+        n = 1
+    portfolio_cap = floor((config.MAX_PORTFOLIO_RISK_PCT * equity - open_risk_dollars) / max_loss)
+    if config.TESTING_MODE:
+        contract_cap = config.TESTING_HALF_SIZE_MAX_CONTRACTS if half_size else config.TESTING_MAX_CONTRACTS
+    else:
+        contract_cap = config.MAX_CONTRACTS_PER_TRADE
+    n = min(n, max(portfolio_cap, 0), contract_cap)
+    if news_day and config.NEWS_DAY_MODE == "half_size" and n >= 1:
+        n = max(1, n // 2)
+    hard_cap = getattr(config, "HARD_MAX_CONTRACTS", None)      # 2026-10-15: the live go-live cap (Schwab configs only; None elsewhere)
+    if hard_cap is not None:                                    # 0 means "no contracts", never "no cap"
+        n = min(n, max(int(hard_cap), 0))
+    return max(n, 0)
+
+
+def _exit_key(row: dict) -> str:
+    v = row.get("exit_time")
+    return v if isinstance(v, str) else (v.isoformat() if v is not None else "")
+
+
+@dataclass
+class StrategyState:
+    trades_today: int = 0
+    consecutive_losses: int = 0
+    realized_pnl: float = 0.0
+    closed_trades: list[dict] = field(default_factory=list)
+    last_exit: str | None = None
+    last_exit_setup: str | None = None
+    entries_today: int = 0   # counted at ENTRY by multi-position strategies (F); A-E count closes only
+    manual_cooldown_until: str | None = None   # no new entry before this (iso): set when a position is closed by hand
+
+    def record_entry(self) -> int:
+        self.entries_today += 1
+        return self.entries_today
+
+    def record(self, pnl: float, row: dict | None, manual_cooldown: bool = True) -> None:
+        self.trades_today += 1
+        self.realized_pnl = round(self.realized_pnl + pnl, 2)
+        self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
+        if row is not None:
+            self.closed_trades.append(row)
+            if row.get("exit_time") is not None:
+                self.last_exit = _exit_key(row)
+                self.last_exit_setup = row.get("setup")
+                if row.get("external") and manual_cooldown:
+                    # closed by hand in the broker UI: stand down for MANUAL_CLOSE_COOLDOWN_SEC, then be ready again
+                    self.manual_cooldown_until = (datetime.fromisoformat(self.last_exit)
+                                                  + timedelta(seconds=config.MANUAL_CLOSE_COOLDOWN_SEC)).isoformat()
+
+
+def _fresh_strategies() -> dict[str, StrategyState]:
+    return {s: StrategyState() for s in config.STRATEGIES}
+
+
+@dataclass
+class DayState:
+    start_equity: float
+    strategies: dict[str, StrategyState] = field(default_factory=_fresh_strategies)
+
+    def for_strategy(self, strat: str) -> StrategyState:
+        return self.strategies.setdefault(strat, StrategyState())
+
+    @property
+    def trades_today(self) -> int:
+        return sum(s.trades_today for s in self.strategies.values())
+
+    @property
+    def realized_pnl(self) -> float:
+        return round(sum(s.realized_pnl for s in self.strategies.values()), 2)
+
+    @property
+    def loss_limit_pnl(self) -> float:
+        """Realized P/L that counts toward the combined daily-loss limit (DAILY_LOSS_LIMIT_EXEMPT removed)."""
+        return round(sum(s.realized_pnl for k, s in self.strategies.items()
+                         if k not in config.DAILY_LOSS_LIMIT_EXEMPT), 2)
+
+    @property
+    def exempt_realized_pnl(self) -> float:
+        return round(sum(s.realized_pnl for k, s in self.strategies.items()
+                         if k in config.DAILY_LOSS_LIMIT_EXEMPT), 2)
+
+    @property
+    def closed_trades(self) -> list[dict]:
+        return sorted((r for s in self.strategies.values() for r in s.closed_trades), key=_exit_key)
+
+    def pnl_by_strategy(self) -> dict[str, float]:
+        return {k: s.realized_pnl for k, s in self.strategies.items()}
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DayState":
+        strategies = {
+            k: StrategyState(**{f: v[f] for f in StrategyState.__dataclass_fields__ if f in v})
+            for k, v in d.get("strategies", {}).items()
+        }
+        return cls(start_equity=d["start_equity"], strategies=strategies or _fresh_strategies())
+
+
+class RiskManager:
+    def __init__(self, start_equity: float, state: DayState | None = None):
+        self.state = state or DayState(start_equity=start_equity)
+
+    def record_trade(self, strat: str, pnl: float, row: dict | None = None) -> None:
+        # a strategy-wide pause would stall every F ticker (F has per-ticker re-entry logic of its own), so the
+        # manual-close cool-down only applies to the SPX strategies
+        self.state.for_strategy(strat).record(pnl, row, manual_cooldown=strat not in config.STOCK_STRATEGIES)
+
+    def record_entry(self, strat: str) -> int:
+        return self.state.for_strategy(strat).record_entry()
+
+    def daily_loss_limit(self) -> float:
+        return -config.DAILY_LOSS_LIMIT_PCT * self.state.start_equity
+
+    def transient_block(self, open_total: int = 0, close_blocked: bool = False, halt: str | None = None) -> str | None:
+        """Why NO strategy may enter right now for a reason that clears by itself -- stale prices or an expiring broker token (halt),
+        a close failing at the broker, the open-position cap -- as opposed to a day limit, which does not. F keeps a confirmed
+        signal waiting through these instead of dropping it."""
+        if halt:
+            return halt                  # stale prices / expiring broker token: entries are halted whatever the strategy
+        if close_blocked:
+            return "CLOSE_BLOCKED (a close is failing at the broker: new entries are halted)"
+        open_cap = getattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
+        if open_cap and open_total >= open_cap:
+            return f"MAX_OPEN_POSITIONS ({open_total}/{open_cap})"
+        return None
+
+    def trading_allowed(self, strat: str, equity: float | None = None,
+                        now: datetime | None = None, setup: str | None = None,
+                        open_count: int = 0, exempt_open_pnl: float = 0.0,
+                        open_spx: int = 0, open_total: int = 0, close_blocked: bool = False,
+                        halt: str | None = None, own_open_pnl: float = 0.0) -> tuple[bool, str]:
+        """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
+        the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
+        different ORB signal that represented the morning's move continuing into the day) -- if either the
+        candidate setup or the last exit's setup is unknown, the cool-down still applies (conservative).
+        `open_count` is the strategy's currently open positions (its entries so far are at least the closed
+        ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
+        (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
+        from account equity before the drawdown check so nothing of theirs ever trips the SPX limit. `own_open_pnl` is the open
+        P/L of every strategy that counts toward the limit; it is used only when config.DAILY_LOSS_BASIS is "bot"."""
+        block = self.transient_block(open_total, close_blocked, halt)
+        if block:
+            return False, block
+        s = self.state.for_strategy(strat)
+        entries = max(s.entries_today, s.trades_today + open_count)
+        if entries >= limit(strat, "MAX_TRADES_PER_DAY"):
+            return False, f"{strat}: MAX_TRADES_PER_DAY ({entries})"
+        total_cap = getattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
+        if total_cap:
+            # A-E count a trade when it CLOSES (an open one is `open_spx`), F counts at ENTRY (entries_today >= its closes)
+            taken = sum(max(st.entries_today, st.trades_today) for st in self.state.strategies.values()) + open_spx
+            if taken >= total_cap:
+                return False, f"TOTAL_MAX_TRADES_PER_DAY ({taken}/{total_cap})"
+        if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
+            return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
+        if s.manual_cooldown_until and now is not None:
+            resume = datetime.fromisoformat(s.manual_cooldown_until)
+            if now < resume:
+                return False, f"{strat}: MANUAL_CLOSE cooldown until {resume.astimezone(config.ET).strftime('%H:%M:%S')}"
+        cooldown = limit(strat, "COOLDOWN_MIN", 0)
+        same_setup = setup is None or s.last_exit_setup is None or setup == s.last_exit_setup
+        if cooldown and now is not None and s.last_exit and same_setup:
+            until = datetime.fromisoformat(s.last_exit) + timedelta(minutes=cooldown)
+            if now < until:
+                return False, f"{strat}: COOLDOWN until {until.astimezone(config.ET).strftime('%H:%M')}"
+        target_pct = getattr(config, "DAILY_PROFIT_TARGET_PCT", None)
+        if target_pct:                      # 2026-10-15: the day's goal is banked: no new entries for any strategy (open trades keep their exits)
+            goal = target_pct * self.state.start_equity
+            banked = self.state.realized_pnl
+            if banked >= goal:
+                return False, f"DAILY_PROFIT_TARGET realized={banked:.2f} >= {goal:.2f}"
+        if strat in config.DAILY_LOSS_LIMIT_EXEMPT and not config.DAILY_LOSS_LIMIT_HALTS_EXEMPT:
+            return True, "OK"
+        realized = self.state.loss_limit_pnl
+        if realized <= self.daily_loss_limit():
+            return False, f"DAILY_LOSS_LIMIT realized={realized:.2f}"
+        if getattr(config, "DAILY_LOSS_BASIS", "equity") == "bot":
+            # 2026-10-15 (Schwab, shared account): the bot's own day = what it banked plus what its open trades are marked at. The account's total
+            # value also moves with the owner's hand trades, the 45DTE bot and every holding, which is not this bot's loss.
+            drawdown = realized + own_open_pnl
+            if drawdown <= self.daily_loss_limit():
+                return False, f"DAILY_LOSS_LIMIT bot P/L={drawdown:.2f} (realized {realized:.2f}, open {own_open_pnl:.2f})"
+        elif equity is not None:
+            equity = equity - self.state.exempt_realized_pnl - exempt_open_pnl
+            if equity - self.state.start_equity <= self.daily_loss_limit():
+                return False, f"DAILY_LOSS_LIMIT equity={equity:.2f} start={self.state.start_equity:.2f}"
+        return True, "OK"

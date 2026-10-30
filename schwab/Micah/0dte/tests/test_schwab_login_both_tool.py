@@ -122,7 +122,7 @@ def token_check():
     return module
 
 
-def person_root(tmp_path, envs: dict, tokens=()):
+def person_root(tmp_path, envs: dict, tokens=(), keys=None):
     """tmp/schwab/<Person>/<bot> folders with the given .env SCHWAB_TOKEN_PATH values (None = no .env) and stray token files."""
     for rel in ("Micah/0dte", "Micah/45DTE", "Dawson/0dte", "Ronnie/45DTE", "45DTE"):
         (tmp_path / "schwab" / rel).mkdir(parents=True)
@@ -130,6 +130,9 @@ def person_root(tmp_path, envs: dict, tokens=()):
     for rel, value in envs.items():
         if value is not None:
             (tmp_path / "schwab" / rel / ".env").write_text("" if value == "" else f"SCHWAB_TOKEN_PATH={value}\n")
+    for rel, key in (keys or {}).items():
+        env = tmp_path / "schwab" / rel / ".env"
+        env.write_text((env.read_text() if env.is_file() else "") + f"SCHWAB_APP_KEY={key}\n")
     for rel in tokens:
         (tmp_path / "schwab" / rel / "token.json").write_text("{}")
     return tmp_path
@@ -147,7 +150,7 @@ def test_the_routing_check_flags_a_second_login_a_and_a_cross_login_path(token_c
     root = person_root(tmp_path, {"Micah/0dte": "", "Micah/45DTE": None, "Dawson/0dte": "", "Ronnie/45DTE": r"..\..\Micah\0dte\token.json"},
                        tokens=("Micah/0dte", "Dawson/0dte"))
     report = dict(token_check.routing_report(root))
-    assert any("Dawson" in line and "WRONG" in line and "second login" in line for line in report)       # blank path, no siblings
+    assert any("Dawson" in line and "WRONG" in line and "separate login" in line for line in report)      # blank path, no key, no siblings
     assert any("Ronnie" in line and "WRONG" in line and "should lead to" in line for line in report)    # login B pointed at login A
     assert any("Micah\\45DTE" in line and "no .env yet" in line for line in report)
     assert any(wrong for line, wrong in report.items() if "Dawson" in line)
@@ -162,7 +165,7 @@ def test_a_45dte_without_the_explicit_line_is_a_note_not_an_error(token_check, t
                        tokens=("Micah/0dte",))
     report = token_check.routing_report(root)
     note = [line for line, _ in report if "Micah\\45DTE" in line]
-    assert note and "[ note ]" in note[0] and not [w for l, w in report if "Micah\\45DTE" in l][0]
+    assert note and "[  ok  ]" in note[0] and "same app key" in note[0] and not [w for l, w in report if "Micah\\45DTE" in l][0]
 
 
 def test_a_login_another_folder_routes_to_is_never_skipped(token_check, tmp_path):
@@ -192,12 +195,21 @@ def test_a_quoted_value_with_a_hidden_tab_is_made_visible(token_check, tmp_path)
     assert bad and "hidden character" in bad[0] and "WITHOUT quotes" in bad[0]
 
 
-def test_the_paper_45dte_folder_must_point_at_login_a(token_check, tmp_path):
-    """2026-10-30: schwab/45DTE (the paper bot) has no sibling 0dte folder any more, so a blank SCHWAB_TOKEN_PATH would make it a
-    separate login A; the documented line sends it to Micah/0dte."""
-    root = person_root(tmp_path, {"Micah/0dte": "", "45DTE": ""}, tokens=("Micah/0dte",))
+def test_the_paper_45dte_folder_shares_login_a_by_app_key(token_check, tmp_path):
+    """2026-10-30: schwab/45DTE (the paper bot) has no sibling 0dte folder any more. With login A's app key in its .env it shares the
+    newest login-A token by itself; with another key and no path it would be a separate login; an explicit path still works."""
+    root = person_root(tmp_path, {"Micah/0dte": "", "45DTE": ""}, tokens=("Micah/0dte",))            # no keys known: separate login
     report = token_check.routing_report(root)
-    assert any(line.startswith("  [WRONG ] schwab\\45DTE") and "second login" in line and wrong for line, wrong in report)
+    assert any(line.startswith("  [WRONG ] schwab\\45DTE") and "separate login" in line and wrong for line, wrong in report)
     root = person_root(tmp_path / "ok", {"Micah/0dte": "", "45DTE": r"..\\Micah\\0dte\\token.json"}, tokens=("Micah/0dte",))
     report = token_check.routing_report(root)
     assert any(line.startswith("  [  ok  ] schwab\\45DTE") and not wrong for line, wrong in report)
+    root = person_root(tmp_path / "key", {"Micah/0dte": "", "45DTE": "", "Dawson/0dte": ""}, tokens=("Micah/0dte",),
+                       keys={"Micah/0dte": "KEY-A", "45DTE": "KEY-A", "Dawson/0dte": "KEY-A"})
+    report = token_check.routing_report(root)
+    assert all(not wrong for _, wrong in report), report
+    assert any(line.startswith("  [  ok  ] schwab\\45DTE") and "same app key" in line for line, _ in report)
+    assert any(line.startswith("  [  ok  ] schwab\\Dawson") and "same app key" in line for line, _ in report)
+    root = person_root(tmp_path / "otherkey", {"Micah/0dte": "", "45DTE": ""}, tokens=("Micah/0dte",),
+                       keys={"Micah/0dte": "KEY-A", "45DTE": "KEY-X"})
+    assert any(line.startswith("  [WRONG ] schwab\\45DTE") and wrong for line, wrong in token_check.routing_report(root))

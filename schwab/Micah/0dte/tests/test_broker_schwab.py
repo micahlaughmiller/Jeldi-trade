@@ -819,3 +819,72 @@ def test_an_own_token_file_that_is_being_rewritten_is_kept_over_a_siblings_older
     sb.token_path = me / "token.json"
     sb._explicit_token_path = False
     assert sb._select_token_path() == me / "token.json"
+
+
+# ------------------------------------------------- 2026-10-30: bots on the SAME Schwab app key share the newest login across the person folders
+
+def _person_layout(tmp_path, own_key="KEY-A"):
+    """tmp/schwab/45DTE (this bot: the paper folder, no sibling next to it) + schwab/Micah/0dte (login A, same app key, newer token)
+    + schwab/Ronnie/45DTE (login B, another app key, the newest token of all)."""
+    import json
+    import time
+    root = tmp_path / "schwab"
+    me = root / "45DTE"
+    micah = root / "Micah" / "0dte"
+    ronnie = root / "Ronnie" / "45DTE"
+    now = time.time()
+    for folder, key, age in ((me, own_key, 6 * 86400), (micah, "KEY-A", 2 * 86400), (ronnie, "KEY-B", 60)):
+        folder.mkdir(parents=True)
+        (folder / "schwab_login.py").write_text("")
+        (folder / "token.json").write_text(json.dumps({"creation_timestamp": now - age, "token": {}}))
+        if key:
+            (folder / ".env").write_text(f"SCHWAB_APP_KEY={key}\n")
+    return me, micah, ronnie
+
+
+def test_the_paper_45dte_finds_micahs_login_by_the_shared_app_key_and_never_ronnies(tmp_path, monkeypatch):
+    me, micah, ronnie = _person_layout(tmp_path)
+    monkeypatch.setattr(broker_mod, "HERE", me)
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    b = Broker(make_config(tmp_path, SCHWAB_APP_KEY="KEY-A"), dry_run=True)
+    sb = getattr(b, "data", b)
+    sb.token_path = me / "token.json"
+    sb._explicit_token_path = False
+    assert sb._sibling_token_paths() == [micah / "token.json"]                        # Ronnie's (another app) is not a sibling
+    assert sb._select_token_path() == micah / "token.json"                            # the newer login A, not my stale copy, not login B
+
+
+def test_without_a_known_app_key_only_the_folders_next_to_me_count(tmp_path, monkeypatch):
+    me, micah, ronnie = _person_layout(tmp_path, own_key="")
+    monkeypatch.setattr(broker_mod, "HERE", me)
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    b = Broker(make_config(tmp_path), dry_run=True)
+    sb = getattr(b, "data", b)
+    sb.token_path = me / "token.json"
+    sb._explicit_token_path = False
+    assert sb._sibling_token_paths() == [] and sb._select_token_path() == me / "token.json"
+
+
+def test_a_person_folder_bot_also_sees_the_paper_folders_login_when_it_is_the_newest(tmp_path, monkeypatch):
+    import json
+    import time
+    me, micah, ronnie = _person_layout(tmp_path)
+    (me / "token.json").write_text(json.dumps({"creation_timestamp": time.time(), "token": {}}))    # the owner just logged in from the paper folder
+    monkeypatch.setattr(broker_mod, "HERE", micah)
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    b = Broker(make_config(tmp_path, SCHWAB_APP_KEY="KEY-A"), dry_run=True)
+    sb = getattr(b, "data", b)
+    sb.token_path = micah / "token.json"
+    sb._explicit_token_path = False
+    assert sb._select_token_path() == me / "token.json"                                # same app, newest login: the valid one
+
+
+def test_an_explicit_token_path_still_wins_over_the_shared_app_rule(tmp_path, monkeypatch):
+    me, micah, ronnie = _person_layout(tmp_path)
+    monkeypatch.setattr(broker_mod, "HERE", me)
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    elsewhere = tmp_path / "elsewhere" / "token.json"                                 # a path of its own (pointing at ones own file = the default)
+    b = Broker(make_config(tmp_path, SCHWAB_APP_KEY="KEY-A", SCHWAB_TOKEN_PATH=str(elsewhere)), dry_run=True)
+    sb = getattr(b, "data", b)
+    assert sb._explicit_token_path and sb._select_token_path() == elsewhere

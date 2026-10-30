@@ -154,13 +154,17 @@ def routing_report(root: Path) -> list[tuple[str, bool]]:
             lines.append((f"  [  ok  ] {label}: reads {resolved}", False))
         elif expected_rel is not None and not (raw or "").strip():
             sibling_ok = any(p != folder and p.is_dir() and (p / "schwab_login.py").is_file()      # Micah/45DTE finds Micah/0dte by the
-                             for p in folder.parent.iterdir())                                      # sibling rule; Dawson/0dte has no sibling
-            if sibling_ok:
-                lines.append((f"  [ note ] {label}: SCHWAB_TOKEN_PATH not set: it uses the newest sibling login (a login made HERE would "
-                              f"not be seen by Dawson/0dte or ASTRA) -- set SCHWAB_TOKEN_PATH=..\\0dte\\token.json", False))
+                             for p in folder.parent.iterdir())                                      # sibling rule
+            own_key = str(dotenv_values(env_file).get("SCHWAB_APP_KEY") or "").strip()
+            login_env = root / expected_rel.parent / ".env"
+            login_key = str(dotenv_values(login_env).get("SCHWAB_APP_KEY") or "").strip() if login_env.is_file() else ""
+            if sibling_ok or (own_key and own_key == login_key):
+                lines.append((f"  [  ok  ] {label}: SCHWAB_TOKEN_PATH not set: shares the newest login of the bots on the same app key "
+                              f"({expected_rel.parent} among them)", False))
             else:
-                lines.append((f"  [WRONG ] {label}: SCHWAB_TOKEN_PATH not set, so it expects its OWN token.json: a login made here is a "
-                              f"second login that cancels {expected_rel.parent}'s. Set SCHWAB_TOKEN_PATH to {expected_rel}", True))
+                lines.append((f"  [WRONG ] {label}: SCHWAB_TOKEN_PATH not set and its SCHWAB_APP_KEY does not match {expected_rel.parent}'s, so it "
+                              f"expects its OWN token.json: a login made here is a separate login. Use the same app key as {expected_rel.parent} "
+                              f"(or set SCHWAB_TOKEN_PATH to {expected_rel})", True))
         else:
             lines.append((f"  [WRONG ] {label}: SCHWAB_TOKEN_PATH={shown(raw)} leads to {str(resolved)!r} but should lead to {expected}", True))
         if expected_rel is not None and own.is_file() and resolved != own:

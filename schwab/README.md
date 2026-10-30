@@ -3,21 +3,22 @@
 | Folder | Bot | Schwab login | Token file it uses | Account |
 |---|---|---|---|---|
 | `Micah\0dte` | 0DTE (B + F) | A | its own `token.json` (this IS login A) | chosen with `schwab_select_account.py` |
-| `Micah\45DTE` | 45DTE | A | `..\0dte\token.json` (set in its `.env`) | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
-| `Dawson\0dte` | 0DTE (B + F) | A | `..\..\Micah\0dte\token.json` (set in its `.env`) | chosen with `schwab_select_account.py` |
-| `Ronnie\45DTE` | 45DTE | B | its own `token.json` | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
-| `45DTE` | 45DTE **paper** (sim) | A | `..\Micah\0dte\token.json` (set in its `.env`) | reads only; `SCHWAB_ACCOUNT_INDEX` in `.env` |
+| `Micah\45DTE` | 45DTE | A | the newest login-A token (same app key as `Micah\0dte`) | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
+| `Dawson\0dte` | 0DTE (B + F) | A | the newest login-A token (same app key) | chosen with `schwab_select_account.py` |
+| `Ronnie\45DTE` | 45DTE | B | its own `token.json` (its own app key) | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
+| `45DTE` | 45DTE **paper** (sim) | A | the newest login-A token (same app key) | reads only; `SCHWAB_ACCOUNT_INDEX` in `.env` |
 
 `schwab\45DTE` is the original paper-trading 45DTE bot, kept where it always was (`SCHWAB_MODE=sim`); `Micah\45DTE` is the one that
 can go live. They are the same code.
 
 ## The rules
 
-- **One token file per login, one developer app per login.** Login A lives in `Micah\0dte\token.json` and nowhere else: never put a
-  `token.json` in `Micah\45DTE` or `Dawson\0dte` (the daily check flags it as a stray login). `Micah\45DTE` and `Dawson\0dte` read that
-  file and rewrite it when the token refreshes; ASTRA (`Alpaca\0DTE`) only reads it. All three of those `.env` files must hold the SAME
-  `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET`. Renew login A from `Micah\0dte`: `python schwab_login.py --force`, then pick Micah's account.
-  `tools\schwab_login_both.py` is retired for this layout (it now only logs in from `Micah\0dte`).
+- **One developer app per login; bots on the same app key share the newest login.** Every bot folder whose `.env` holds login A's
+  `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET` (`Micah\0dte`, `Micah\45DTE`, `Dawson\0dte`, the paper `45DTE`) uses whichever of their
+  `token.json` files is the newest login -- exactly what `schwab\0dte` and `schwab\45DTE` did before, now across the person folders. No
+  `SCHWAB_TOKEN_PATH` line is needed (an explicit one still works and wins). Renew login A from any of those folders
+  (`python schwab_login.py --force`; from a 0DTE folder it also asks for the account). ASTRA (`Alpaca\0DTE`) reads `Micah\0dte\token.json`
+  read-only, so renew from `Micah\0dte` when you can. `tools\schwab_login_both.py` is retired (it now only logs in from `Micah\0dte`).
 - **Login B is separate.** `Ronnie\45DTE` keeps its own `token.json` and has no sibling folder, so it never borrows login A. Log in for B
   only from that folder. Use a SEPARATE developer app (key + secret) for login B: a new login cancels an older login made with the same app
   for the same user, and whether one app can hold two users' logins at once has NOT been tested. If it cannot, every Ronnie login would stop
@@ -46,15 +47,14 @@ bot stopped (Ctrl+C), in order:
    `move schwab\0dte\.env schwab\Micah\0dte\`, then the same for `token.json`, `selected_account.json` and `logs`.
    If the `logs` move says `Access is denied.`, the new `logs` folder already exists: rename it away first (`ren schwab\Micah\0dte\logs logs-empty`)
    and move again. Check afterwards that `schwab\0dte` holds nothing but caches.
-   The paper bot's folder `schwab\45DTE` STAYS: keep its `.env` and `logs` there. Move its old `token.json` out (to the archive folder): it reads
-   login A from `..\Micah\0dte\token.json` now and the daily check flags a `token.json` beside it as a stray login.
-2. Open `schwab\Micah\0dte\.env`: remove any `SCHWAB_TOKEN_PATH` line (the file next to it is the login).
-   Open `schwab\45DTE\.env` (the paper bot): add `SCHWAB_TOKEN_PATH=..\Micah\0dte\token.json` (replace an old absolute path that names
-   `schwab\0dte`).
-   Create `schwab\Micah\45DTE\.env` from `schwab\Micah\45DTE\.env.example` (login A's app key and secret; `SCHWAB_TOKEN_PATH=..\0dte\token.json`
-   is already in it), and set `SCHWAB_ACCOUNT_LAST4` (and `SCHWAB_ACCOUNT_INDEX`) for MICAH'S account (see "The 45DTE bots have no selector").
-   It starts in `SCHWAB_MODE=sim`; switch it to live only when you mean it.
-3. Create `schwab\Dawson\0dte\.env` by copying `schwab\Dawson\0dte\.env.example` (never Micah's `.env`); paste login A's app key and secret.
+   The paper bot's folder `schwab\45DTE` STAYS exactly as it is (`.env`, `token.json`, `logs`): it shares login A by app key, as before.
+2. Open `schwab\Micah\0dte\.env` and `schwab\45DTE\.env`: remove any `SCHWAB_TOKEN_PATH` line that names the old `schwab\0dte` folder
+   (a blank or missing line is right: the bots share login A by app key).
+   Create `schwab\Micah\45DTE\.env` from `schwab\Micah\45DTE\.env.example` (login A's app key and secret), and set `SCHWAB_ACCOUNT_LAST4`
+   (and `SCHWAB_ACCOUNT_INDEX`) for MICAH'S account (see "The 45DTE bots have no selector"). It starts in `SCHWAB_MODE=sim`; switch it to live
+   only when you mean it.
+3. Create `schwab\Dawson\0dte\.env` by copying `schwab\Dawson\0dte\.env.example` (never Micah's `.env`); paste login A's app key and secret
+   (that key is what makes it share login A).
    Create `schwab\Ronnie\45DTE\.env` from `schwab\Ronnie\45DTE\.env.example` with login B's own app key and secret; leave
    `SCHWAB_ACCOUNT_INDEX=0` and `SCHWAB_ACCOUNT_LAST4` blank for now (login B does not exist yet; step 7 fills them in).
 4. Open `Alpaca\0DTE\.env` (ASTRA) and set `SCHWAB_TOKEN_PATH=C:\Users\Micah\Trading-Automation\schwab\Micah\0dte\token.json`

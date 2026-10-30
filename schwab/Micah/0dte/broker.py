@@ -56,6 +56,24 @@ if TYPE_CHECKING:
 ET = ZoneInfo("US/Eastern")
 HERE = Path(__file__).resolve().parent
 FOLDER_HINT = str(Path(*HERE.parts[-2:]))     # e.g. Micah\0dte: the folder to cd into for a re-login (two folders are named 0dte now)
+
+
+def _schwab_root(here: Path) -> Path | None:
+    """The schwab folder this bot lives under: schwab/<bot> or schwab/<Person>/<bot>; None for any other layout (tests, copies elsewhere)."""
+    if here.parent.name.lower() == "schwab":
+        return here.parent
+    if len(here.parents) > 1 and here.parents[1].name.lower() == "schwab":
+        return here.parents[1]
+    return None
+
+
+def _env_app_key(folder: Path) -> str:
+    """The SCHWAB_APP_KEY in a bot folder's .env ("" when there is none): bots with the same key share one Schwab login."""
+    try:
+        from dotenv import dotenv_values
+        return str(dotenv_values(folder / ".env").get("SCHWAB_APP_KEY") or "").strip()
+    except Exception:       # noqa: BLE001 -- an unreadable .env just means "unknown app": not a sibling
+        return ""
 load_dotenv(HERE / ".env")
 
 TERMINAL_STATUSES = {"filled", "canceled", "rejected", "expired", "replaced", "dry_run"}
@@ -275,7 +293,10 @@ class SchwabBroker:
     AUTH_PROBE_SEC = 60.0
 
     def _sibling_token_paths(self) -> list[Path]:
-        """token.json of the other Schwab bot folders next to this one (a folder with its own schwab_login.py)."""
+        """token.json of the other Schwab bot folders this bot may share a login with: the folders next to it (a folder with its own
+        schwab_login.py -- the original rule), and, since the bots moved into person folders (schwab/<Person>/<bot>), every other bot
+        folder under the schwab root whose .env uses the SAME Schwab app key (2026-10-30). One app key has one valid login, the newest, so
+        the paper schwab/45DTE finds schwab/Micah/0dte's token by itself and a bot on another app (another login) is never mixed in."""
         found: list[Path] = []
         try:
             for folder in sorted(HERE.parent.iterdir()):
@@ -283,6 +304,21 @@ class SchwabBroker:
                     found.append(folder / "token.json")
         except OSError:
             pass
+        root = _schwab_root(HERE)
+        own_key = str(self._cfg("SCHWAB_APP_KEY", None) or os.getenv("SCHWAB_APP_KEY") or "").strip()
+        if root is None or not own_key:
+            return found
+        try:
+            scripts = sorted(set(root.glob("*/schwab_login.py")) | set(root.glob("*/*/schwab_login.py")))
+        except OSError:
+            scripts = []
+        for script in scripts:
+            folder = script.parent
+            token = folder / "token.json"
+            if folder == HERE or token in found or not token.is_file():
+                continue
+            if _env_app_key(folder) == own_key:
+                found.append(token)
         return found
 
     def _select_token_path(self) -> Path:

@@ -6,6 +6,10 @@
 | `Micah\45DTE` | 45DTE | A | `..\0dte\token.json` (set in its `.env`) | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
 | `Dawson\0dte` | 0DTE (B + F) | A | `..\..\Micah\0dte\token.json` (set in its `.env`) | chosen with `schwab_select_account.py` |
 | `Ronnie\45DTE` | 45DTE | B | its own `token.json` | `SCHWAB_ACCOUNT_LAST4` (+ `SCHWAB_ACCOUNT_INDEX`) in `.env` |
+| `45DTE` | 45DTE **paper** (sim) | A | `..\Micah\0dte\token.json` (set in its `.env`) | reads only; `SCHWAB_ACCOUNT_INDEX` in `.env` |
+
+`schwab\45DTE` is the original paper-trading 45DTE bot, kept where it always was (`SCHWAB_MODE=sim`); `Micah\45DTE` is the one that
+can go live. They are the same code.
 
 ## The rules
 
@@ -26,7 +30,7 @@
   new login: in `Micah\0dte` run `python schwab_select_account.py`, read the table, press Enter (nothing changes); its `#` column counts
   from 1, so the index is that number MINUS 1.
 - **No quotes around paths in `.env`.** `"..\0dte\token.json"` turns `\t` into a hidden TAB and the path silently breaks.
-- **Code is identical.** `Dawson\0dte` is a byte-for-byte clone of `Micah\0dte`, `Ronnie\45DTE` of `Micah\45DTE`. Edit Micah's copy (or the
+- **Code is identical.** `Dawson\0dte` is a byte-for-byte clone of `Micah\0dte`; `Ronnie\45DTE` and the paper `45DTE` of `Micah\45DTE`. Edit Micah's copy (or the
   Alpaca copy for shared strategy files, then copy it to Micah's), then run `python tools\check_sync.py --apply-clones` to push the change to
   the clones (git must be on PATH; it refuses to touch anything otherwise). `python tools\check_sync.py` alone only reports drift.
 - **Daily check.** `python tools\schwab_token_check.py` reports both logins' ages and whether each folder's `.env` (ASTRA's included) leads
@@ -38,22 +42,25 @@
 (a start creates a `logs` folder there, and then the `move` of the old `logs` folder fails with only `Access is denied.`). With every Schwab
 bot stopped (Ctrl+C), in order:
 
-1. Move the runtime files into Micah's folders (move, do not copy):
-   `move schwab\0dte\.env schwab\Micah\0dte\`, then the same for `token.json`, `selected_account.json` and `logs`;
-   `move schwab\45DTE\.env schwab\Micah\45DTE\` and the same for its `logs` folder.
-   Leave the old `schwab\45DTE\token.json` where it is (it goes to the archive in step 5): `Micah\45DTE` must have no `token.json`.
-   If a `logs` move says `Access is denied.`, the new `logs` folder already exists: rename it away first (`ren schwab\Micah\0dte\logs logs-empty`)
-   and move again. Check afterwards that `schwab\0dte` and `schwab\45DTE` hold nothing but the old `token.json` and caches.
+1. Move the 0DTE runtime files into Micah's folder (move, do not copy):
+   `move schwab\0dte\.env schwab\Micah\0dte\`, then the same for `token.json`, `selected_account.json` and `logs`.
+   If the `logs` move says `Access is denied.`, the new `logs` folder already exists: rename it away first (`ren schwab\Micah\0dte\logs logs-empty`)
+   and move again. Check afterwards that `schwab\0dte` holds nothing but caches.
+   The paper bot's folder `schwab\45DTE` STAYS: keep its `.env` and `logs` there. Move its old `token.json` out (to the archive folder): it reads
+   login A from `..\Micah\0dte\token.json` now and the daily check flags a `token.json` beside it as a stray login.
 2. Open `schwab\Micah\0dte\.env`: remove any `SCHWAB_TOKEN_PATH` line (the file next to it is the login).
-   Open `schwab\Micah\45DTE\.env`: set `SCHWAB_TOKEN_PATH=..\0dte\token.json` (add the line, or replace an old absolute path that names the
-   old folder), and set `SCHWAB_ACCOUNT_LAST4` (and `SCHWAB_ACCOUNT_INDEX`) for MICAH'S account (see "The 45DTE bots have no selector").
+   Open `schwab\45DTE\.env` (the paper bot): add `SCHWAB_TOKEN_PATH=..\Micah\0dte\token.json` (replace an old absolute path that names
+   `schwab\0dte`).
+   Create `schwab\Micah\45DTE\.env` from `schwab\Micah\45DTE\.env.example` (login A's app key and secret; `SCHWAB_TOKEN_PATH=..\0dte\token.json`
+   is already in it), and set `SCHWAB_ACCOUNT_LAST4` (and `SCHWAB_ACCOUNT_INDEX`) for MICAH'S account (see "The 45DTE bots have no selector").
+   It starts in `SCHWAB_MODE=sim`; switch it to live only when you mean it.
 3. Create `schwab\Dawson\0dte\.env` by copying `schwab\Dawson\0dte\.env.example` (never Micah's `.env`); paste login A's app key and secret.
    Create `schwab\Ronnie\45DTE\.env` from `schwab\Ronnie\45DTE\.env.example` with login B's own app key and secret; leave
    `SCHWAB_ACCOUNT_INDEX=0` and `SCHWAB_ACCOUNT_LAST4` blank for now (login B does not exist yet; step 7 fills them in).
 4. Open `Alpaca\0DTE\.env` (ASTRA) and set `SCHWAB_TOKEN_PATH=C:\Users\Micah\Trading-Automation\schwab\Micah\0dte\token.json`
    (or remove the line: that path is now the default). Without this ASTRA's live /ES feed silently drops to delayed data.
-5. Move the old folders `schwab\0dte` and `schwab\45DTE` out of the way (for example into `C:\Users\Micah\_archive-for-review`) so
-   nothing can be started from them by habit. Repoint any Task Scheduler entry or shortcut that launched them.
+5. Move the old folder `schwab\0dte` out of the way (for example into `C:\Users\Micah\_archive-for-review`) so nothing can be started
+   from it by habit; `schwab\45DTE` stays. Repoint any Task Scheduler entry or shortcut that launched `schwab\0dte\scheduler.py`.
 6. Run `python tools\schwab_token_check.py`. Every routing line (the `schwab\...` and `Alpaca\0DTE` lines) must read `[  ok  ]`. The
    `login B` token line reads `[MISSING]` and the command exits 1 until step 7 is done -- expected at this point.
 7. Log in once from `schwab\Micah\0dte` (`python schwab_login.py --force`) and pick Micah's account; then in `schwab\Dawson\0dte` run

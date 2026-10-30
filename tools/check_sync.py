@@ -5,8 +5,9 @@ config, schwab_login.py and broker tests may differ. Config files are compared
 on their strategy parameters (everything after the broker section).
 
 2026-10-26: the Schwab bots live in person folders -- schwab/Micah (0dte + 45DTE, login A), schwab/Dawson (0dte, login A),
-schwab/Ronnie (45DTE, login B). Micah's folders are the primaries the Alpaca copies are compared with; Dawson/0dte and
-Ronnie/45DTE must be byte-identical CLONES of Micah's (every tracked file; only .env.example may differ).
+schwab/Ronnie (45DTE, login B); 2026-10-30: schwab/45DTE is back as the PAPER 45DTE bot (sim, login A). Micah's folders are the
+primaries the Alpaca copies are compared with; Dawson/0dte, Ronnie/45DTE and schwab/45DTE must be byte-identical CLONES of
+Micah's (every tracked file; only .env.example may differ).
 
     python tools/check_sync.py                  # report
     python tools/check_sync.py --apply-clones   # after editing Micah's copy: push every tracked file to Dawson/0dte and Ronnie/45DTE
@@ -32,6 +33,7 @@ PAIRS = {
 CLONES = {
     "Dawson/0dte": (ROOT / "schwab" / "Micah" / "0dte", ROOT / "schwab" / "Dawson" / "0dte"),
     "Ronnie/45DTE": (ROOT / "schwab" / "Micah" / "45DTE", ROOT / "schwab" / "Ronnie" / "45DTE"),
+    "45DTE (paper)": (ROOT / "schwab" / "Micah" / "45DTE", ROOT / "schwab" / "45DTE"),     # 2026-10-30: the original paper bot folder, kept
 }
 CLONE_MAY_DIFFER = {".env.example"}
 

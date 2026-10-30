@@ -71,6 +71,7 @@ LAYOUT = {
     Path("schwab") / "Micah" / "45DTE": Path("schwab") / "Micah" / "0dte" / "token.json",
     Path("schwab") / "Dawson" / "0dte": Path("schwab") / "Micah" / "0dte" / "token.json",
     Path("schwab") / "Ronnie" / "45DTE": None,
+    Path("schwab") / "45DTE": Path("schwab") / "Micah" / "0dte" / "token.json",          # 2026-10-30: the paper 45DTE bot, login A
 }
 
 

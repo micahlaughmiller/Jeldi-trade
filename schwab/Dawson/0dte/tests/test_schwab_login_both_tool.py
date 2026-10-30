@@ -124,7 +124,7 @@ def token_check():
 
 def person_root(tmp_path, envs: dict, tokens=()):
     """tmp/schwab/<Person>/<bot> folders with the given .env SCHWAB_TOKEN_PATH values (None = no .env) and stray token files."""
-    for rel in ("Micah/0dte", "Micah/45DTE", "Dawson/0dte", "Ronnie/45DTE"):
+    for rel in ("Micah/0dte", "Micah/45DTE", "Dawson/0dte", "Ronnie/45DTE", "45DTE"):
         (tmp_path / "schwab" / rel).mkdir(parents=True)
         (tmp_path / "schwab" / rel / "schwab_login.py").write_text("")
     for rel, value in envs.items():
@@ -137,9 +137,9 @@ def person_root(tmp_path, envs: dict, tokens=()):
 
 def test_the_routing_check_accepts_the_documented_layout(token_check, tmp_path):
     root = person_root(tmp_path, {"Micah/0dte": "", "Micah/45DTE": r"..\0dte\token.json", "Dawson/0dte": r"..\..\Micah\0dte\token.json",
-                                  "Ronnie/45DTE": ""}, tokens=("Micah/0dte", "Ronnie/45DTE"))
+                                  "Ronnie/45DTE": "", "45DTE": r"..\Micah\0dte\token.json"}, tokens=("Micah/0dte", "Ronnie/45DTE"))
     report = token_check.routing_report(root)
-    assert [wrong for _, wrong in report] == [False, False, False, False], report
+    assert [wrong for _, wrong in report] == [False] * 5, report
     assert all("[  ok  ]" in line for line, _ in report)
 
 
@@ -190,3 +190,14 @@ def test_a_quoted_value_with_a_hidden_tab_is_made_visible(token_check, tmp_path)
     report = token_check.routing_report(root)
     bad = [line for line, wrong in report if "Dawson" in line and wrong]
     assert bad and "hidden character" in bad[0] and "WITHOUT quotes" in bad[0]
+
+
+def test_the_paper_45dte_folder_must_point_at_login_a(token_check, tmp_path):
+    """2026-10-30: schwab/45DTE (the paper bot) has no sibling 0dte folder any more, so a blank SCHWAB_TOKEN_PATH would make it a
+    separate login A; the documented line sends it to Micah/0dte."""
+    root = person_root(tmp_path, {"Micah/0dte": "", "45DTE": ""}, tokens=("Micah/0dte",))
+    report = token_check.routing_report(root)
+    assert any(line.startswith("  [WRONG ] schwab\\45DTE") and "second login" in line and wrong for line, wrong in report)
+    root = person_root(tmp_path / "ok", {"Micah/0dte": "", "45DTE": r"..\\Micah\\0dte\\token.json"}, tokens=("Micah/0dte",))
+    report = token_check.routing_report(root)
+    assert any(line.startswith("  [  ok  ] schwab\\45DTE") and not wrong for line, wrong in report)

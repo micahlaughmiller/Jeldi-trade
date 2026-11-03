@@ -92,6 +92,8 @@ DRY_RUN = SCHWAB_MODE != "sim" and \
 RISK_FREE_RATE = 0.04
 # 2026-09-23: SPX 0DTE quotes are tight enough to work a closer limit; escalation step now $0.03/retry
 # instead of $0.05 (close_spread_at_market: limit = ask-side + CLOSE_SLIPPAGE * attempt_number).
+# 2026-11-03: SPX/SPXW orders are snapped DOWN to the $0.05 grid before they are sent (broker.snap_spx_price), so for SPX
+# the first close limit is the ask-side itself and every retry climbs one $0.05 tick; stock options (F) keep this exact step.
 CLOSE_SLIPPAGE = 0.03
 # 2026-09-29: 15s -> 2s. A's profit-lock/stop exits were chasing a moving target during fast moves
 # (one traced case: decision at 2.67, actual fill at 2.95 -- slippage well past the nominal

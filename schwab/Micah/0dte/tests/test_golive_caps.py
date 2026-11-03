@@ -706,3 +706,104 @@ def test_a_negative_account_index_is_refused_at_start_up(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHWAB_LIVE_ORDERS", "false")
     with pytest.raises(BrokerError, match="counts from 0"):
         Broker(make_config(tmp_path, SCHWAB_MODE="dry_run", SCHWAB_ACCOUNT_INDEX=-1), dry_run=True)
+
+
+# ---------------------------------------------------------------- the SPX $0.05 price grid, live (2026-11-03)
+
+def _raw_close(order_id, status, price, desc=None, filled=0.0, order_type="NET_DEBIT"):
+    raw = {"orderId": order_id, "status": status, "orderType": order_type, "price": price, "quantity": 1.0, "filledQuantity": filled,
+           "duration": "DAY", "session": "NORMAL", "orderStrategyType": "SINGLE", "complexOrderStrategyType": "VERTICAL",
+           "enteredTime": "2026-11-03T16:07:16+0000",
+           "orderLegCollection": [
+               {"legId": 1, "instruction": "BUY_TO_CLOSE", "quantity": 1.0,
+                "instrument": {"assetType": "OPTION", "symbol": "SPXW  260917P07610000"}},
+               {"legId": 2, "instruction": "SELL_TO_CLOSE", "quantity": 1.0,
+                "instrument": {"assetType": "OPTION", "symbol": "SPXW  260917P07605000"}}]}
+    if desc:
+        raw["statusDescription"] = desc
+    return raw
+
+
+class CloseFake(LiveFake):
+    """Numbers the orders it is sent 777, 778, ...; a test scripts what get_order says about each (default: filled)."""
+
+    def __init__(self):
+        super().__init__()
+        self.next_id = 777
+        self.canceled: list[str] = []
+
+    def place_order(self, account_hash, order_json):
+        self.placed.append((account_hash, order_json))
+        oid, self.next_id = self.next_id, self.next_id + 1
+        self.order_by_id.setdefault(str(oid), _raw_close(oid, "FILLED", float(order_json["price"]), filled=1.0))
+        return _resp(201, None, {"Location": f"https://api.schwabapi.com/trader/v1/accounts/x/orders/{oid}"})
+
+    def cancel_order(self, order_id, account_hash):
+        self.canceled.append(str(order_id))
+        self.order_by_id[str(order_id)]["status"] = "CANCELED"
+        return _resp(200, None)
+
+
+def test_a_rejected_close_carries_schwabs_reason_and_was_sent_on_the_grid(tmp_path, monkeypatch, caplog):
+    fake = CloseFake()
+    fake.order_by_id["777"] = _raw_close(777, "REJECTED", 1.80, "Option order price rounded to nearest 0.05 (not a penny pilot)")
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(BrokerError, match="Schwab says: Option order price rounded to nearest 0.05"):
+            b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert [o["price"] for _, o in fake.placed] == ["1.80"]             # ask-side 1.80 + 0.03 -> 1.80, never 1.83
+    sent = [r for r in caplog.records if "[LIVE]" in r.getMessage() and "sending" in r.getMessage()]
+    assert sent and all(getattr(r, "keep", False) for r in sent)        # the order that was sent reaches the log file
+
+
+def test_a_close_that_does_not_fill_is_re_sent_one_tick_higher(tmp_path, monkeypatch):
+    fake = CloseFake()
+    fake.order_by_id["777"] = _raw_close(777, "WORKING", 1.80)           # rests, is cancelled; the retry fills
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert order["status"] == "filled" and order["id"] == "778"
+    assert [o["price"] for _, o in fake.placed] == ["1.80", "1.85"]     # not 1.83, and not 1.80 again
+    assert fake.canceled == ["777"]
+
+
+def test_a_live_re_price_of_an_spx_order_lands_on_the_grid_and_a_no_op_is_not_sent(tmp_path, monkeypatch):
+    class Replaces(LiveFake):
+        def __init__(self):
+            super().__init__()
+            self.replaced: list[tuple[str, dict]] = []
+
+        def replace_order(self, account_hash, order_id, order_json):
+            self.replaced.append((str(order_id), order_json))
+            return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/556"})
+
+    fake = Replaces()
+    fake.order_by_id["555"] = _raw_close(555, "WORKING", 0.85, order_type="NET_CREDIT")
+    fake.order_by_id["556"] = _raw_close(556, "WORKING", 0.80, order_type="NET_CREDIT")
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    assert b.replace_order_price("555", 0.86)["id"] == "555"            # 0.86 snaps to 0.85, the order's own price: nothing sent
+    assert fake.replaced == []
+    order = b.replace_order_price("555", 0.83)                           # 0.83 -> 0.80
+    assert order["id"] == "556" and fake.replaced == [("555", fake.replaced[0][1])]
+    assert fake.replaced[0][1]["price"] == "0.80"
+
+
+def test_the_live_bots_log_callable_accepts_the_keep_tag_and_a_plain_callable_drops_it(tmp_path, monkeypatch, caplog):
+    """scheduler.py builds the broker with log=log.info (a bound Logger method, wrapped in _CallableLog), not a Logger:
+    the keep tag on the 'sending' lines must reach the log and never raise. Caught by review on 2026-11-03."""
+    fake = CloseFake()
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    b.log = broker_mod._CallableLog(logging.getLogger("test.golive.callable").info)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        order = b.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.88, root="SPXW")
+    assert order["status"] == "filled" and fake.placed[0][1]["price"] == "0.85"
+    sent = [r for r in caplog.records if "sending" in r.getMessage()]
+    assert sent and all(getattr(r, "keep", False) for r in sent)
+    b.log.debug("the adapter answers debug too")
+    lines: list[str] = []
+    b.log = broker_mod._CallableLog(lines.append)                       # a plain callable: the tag is dropped, nothing raises
+    b.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.88, root="SPXW")
+    assert any("sending" in line for line in lines)

@@ -888,3 +888,66 @@ def test_an_explicit_token_path_still_wins_over_the_shared_app_rule(tmp_path, mo
     b = Broker(make_config(tmp_path, SCHWAB_APP_KEY="KEY-A", SCHWAB_TOKEN_PATH=str(elsewhere)), dry_run=True)
     sb = getattr(b, "data", b)
     assert sb._explicit_token_path and sb._select_token_path() == elsewhere
+
+
+# ---------------------------------------------------------------- the SPX $0.05 price grid (2026-11-03)
+# Schwab rejected every closing order of the first live day: the limit was ask-side + $0.03, and SPX/SPXW spreads must be
+# priced in $0.05 steps. Every SPX/SPXW price is now snapped DOWN to the grid before it is sent; stock options are untouched.
+
+@pytest.mark.parametrize("price, snapped", [
+    (0.83, 0.80), (0.85, 0.85), (0.88, 0.85), (0.84, 0.80), (0.849, 0.85), (1.00, 1.00), (1.83, 1.80), (3.07, 3.05), (0.04, 0.05), (0.0, 0.05),
+])
+def test_spx_prices_snap_down_to_the_five_cent_grid(price, snapped):
+    assert broker_mod.snap_spx_price(price, "SPXW") == snapped
+    assert broker_mod.snap_spx_price(price, "SPX") == snapped
+    assert broker_mod.snap_spx_price(price, "spxw") == snapped
+
+
+@pytest.mark.parametrize("price", [0.83, 0.88, 0.07, 1.23])
+def test_stock_prices_are_not_snapped(price):
+    assert broker_mod.snap_spx_price(price, "AAPL") == price
+    assert broker_mod.snap_spx_price(price, None) == price
+
+
+def test_the_next_close_price_always_climbs_a_full_tick_for_spx():
+    assert broker_mod.next_close_price(0.80, 0.03, "SPXW") == 0.85      # 0.83 alone would snap back to 0.80 and never escalate
+    assert broker_mod.next_close_price(0.80, 0.05, "SPXW") == 0.85
+    assert broker_mod.next_close_price(0.80, 0.12, "SPXW") == 0.90
+    assert broker_mod.next_close_price(0.73, 0.03, "AAPL") == 0.76
+
+
+def test_an_spx_entry_is_sent_on_the_grid(brk):
+    order = brk.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.88, root="SPXW")
+    assert order["raw"]["price"] == "0.85" and order["limit_price"] == 0.85
+
+
+def test_an_spx_close_is_sent_on_the_grid(brk):
+    order = brk.place_close_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_debit=0.83, root="SPXW", time_in_force="day")
+    assert order["raw"]["price"] == "0.80"
+
+
+def test_a_stock_close_keeps_its_penny_price(brk):
+    order = brk.place_close_spread("AAPL", date(2026, 11, 20), "P", 150, 145, qty=1, limit_debit=0.73, time_in_force="day")
+    assert order["raw"]["price"] == "0.73"
+
+
+def test_a_close_at_market_with_the_three_cent_slippage_lands_on_the_grid(tmp_path, fake, monkeypatch):
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    b = Broker(make_config(tmp_path, CLOSE_SLIPPAGE=0.03), dry_run=True, log=logging.getLogger("test.broker"))
+    b._client = fake
+    b._sleep = lambda s: None
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW")
+    assert order["raw"]["price"] == "1.80"           # ask-side 1.80 + 0.03 = 1.83: the 3 Nov orders went out like that and were rejected
+
+
+def test_a_dry_run_re_price_of_an_spx_order_is_snapped(brk):
+    order = brk.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.90, root="SPXW")
+    assert brk.replace_order_price(order["id"], 0.83)["raw"]["price"] == "0.80"
+
+
+def test_the_normalized_order_carries_schwabs_reason_text(brk):
+    raw = dict(RAW_FILLED, status="REJECTED", statusDescription="Option order price rounded to nearest 0.05 (not a penny pilot)")
+    order = brk._normalize_order(raw)
+    assert order["status"] == "rejected"
+    assert order["status_description"] == "Option order price rounded to nearest 0.05 (not a penny pilot)"
+    assert brk._normalize_order(RAW_FILLED)["status_description"] is None

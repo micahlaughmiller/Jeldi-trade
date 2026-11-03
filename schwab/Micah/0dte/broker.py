@@ -77,6 +77,38 @@ def _env_app_key(folder: Path) -> str:
 load_dotenv(HERE / ".env")
 
 TERMINAL_STATUSES = {"filled", "canceled", "rejected", "expired", "replaced", "dry_run"}
+
+# 2026-11-03: Schwab rejected all 42 closing orders of the first live day. SPX/SPXW spreads must be priced in $0.05
+# steps (Cboe Rule 5.4(b): complex orders in SPX trade in $0.05 net increments; orders off the grid are rejected, not
+# rounded), and the close limit was ask-side + $0.03 -- never on the grid. Every SPX/SPXW price this broker sends is now
+# snapped DOWN to the grid (0.83 -> 0.80), never below one tick. Stock options keep their penny prices.
+SPX_PRICE_TICK = 0.05
+SPX_ROOTS = {"SPX", "SPXW"}
+
+
+def is_spx_root(root: str | None) -> bool:
+    return str(root or "").upper() in SPX_ROOTS
+
+
+def snap_spx_price(price: float, root: str | None) -> float:
+    """The price Schwab is sent for an SPX/SPXW order: rounded DOWN to the $0.05 grid, at least one tick. Any other
+    root is returned unchanged (rounded to cents)."""
+    price = round(float(price), 2)
+    if not is_spx_root(root):
+        return price
+    steps = int(price / SPX_PRICE_TICK + 1e-9)                       # 0.85 / 0.05 = 16.999999999999996 -> 17
+    return round(max(1, steps) * SPX_PRICE_TICK, 2)
+
+
+def next_close_price(price: float, step: float, root: str | None) -> float:
+    """The next, higher limit for a close that did not fill: price + step, snapped for SPX/SPXW -- and always at
+    least one tick above the last price, so a step smaller than the grid still escalates (0.80 + 0.03 -> 0.85)."""
+    nxt = snap_spx_price(price + step, root)
+    if is_spx_root(root) and nxt <= price + 1e-9:
+        nxt = round(price + SPX_PRICE_TICK, 2)
+    return nxt
+
+
 _STATUS_MAP = {
     "NEW": "new",
     "WORKING": "new",
@@ -195,15 +227,23 @@ def _strip_index(symbol: str | None) -> str | None:
 
 
 class _CallableLog:
-    """Adapts the plain `log(message)` callable the strategies pass to the Logger calls used here."""
+    """Adapts the plain `log(message)` callable the strategies pass to the Logger calls used here. A bound Logger
+    method (scheduler.py passes log.info) also receives the keyword arguments -- extra={"keep": True} must reach the
+    file filter -- while any other callable gets the text only (2026-11-03: the keyword used to raise TypeError here,
+    which would have stopped every live order before it was sent)."""
 
-    def __init__(self, fn: Callable[[str], Any]):
+    def __init__(self, fn: Callable[..., Any]):
         self._fn = fn
+        self._logger_method = isinstance(getattr(fn, "__self__", None), logging.Logger)
 
-    def _emit(self, msg: str, *args: Any) -> None:
-        self._fn(msg % args if args else msg)
+    def _emit(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        text = msg % args if args else msg
+        if kwargs and self._logger_method:
+            self._fn(text, **kwargs)
+        else:
+            self._fn(text)
 
-    info = warning = error = critical = _emit
+    debug = info = warning = error = critical = _emit
 
 
 class SchwabBroker:
@@ -821,6 +861,7 @@ class SchwabBroker:
         return {
             "id": str(raw.get("orderId", "")),
             "status": status,
+            "status_description": raw.get("statusDescription") or None,     # Schwab's reason text, e.g. why it was REJECTED
             "symbol": symbol,
             "order_class": "mleg" if len(legs) > 1 else "simple",
             "side": side,
@@ -883,6 +924,9 @@ class SchwabBroker:
             raise BrokerError("qty must be positive")
         if price <= 0:
             raise BrokerError("limit price must be positive")
+        roots = {parse_occ(symbol)["root"] for _, symbol in legs}
+        if any(is_spx_root(r) for r in roots):
+            price = snap_spx_price(price, "SPX")
         return {
             "orderType": order_type,
             "session": "NORMAL",
@@ -913,6 +957,7 @@ class SchwabBroker:
         return {
             "id": order_id,
             "status": status,
+            "status_description": None,
             "symbol": underlying,
             "order_class": "mleg" if len(legs) > 1 else "simple",
             "side": None if len(legs) > 1 else (legs[0]["side"] if legs else None),
@@ -944,7 +989,7 @@ class SchwabBroker:
             return self._dry_order(order_json, underlying, time_in_force, label)
         client = self._get_client()
         account_hash = self._hash()                      # refuses (BrokerError) unless a selected, still-linked account: nothing is sent then
-        self.log.warning("[LIVE] %s sending: %s", label, json.dumps(order_json))
+        self.log.warning("[LIVE] %s sending: %s", label, json.dumps(order_json), extra={"keep": True})
         try:
             # never blind-retry an order: a timeout or 5xx can follow an order Schwab DID accept, and a second POST would open a second position
             resp = self._request(client.place_order, account_hash, order_json, attempts=1)
@@ -1029,8 +1074,9 @@ class SchwabBroker:
     def close_spread_at_market(self, underlying: str, expiration: date, right: str, short_strike: float,
                                long_strike: float, qty: int, time_in_force: str = "gtc",
                                root: str | None = None, client_tag: str | None = None) -> dict:
-        price = round(self._spread_close_ask(underlying, expiration, right, short_strike, long_strike, root)
-                      + self.close_slippage, 2)
+        r = (root or _strip_index(underlying) or underlying).upper()
+        price = snap_spx_price(self._spread_close_ask(underlying, expiration, right, short_strike, long_strike, root)
+                               + self.close_slippage, r)
         tag = client_tag or "close_at_market"
         order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike, qty, price,
                                         time_in_force=time_in_force, root=root, client_tag=tag)
@@ -1041,7 +1087,9 @@ class SchwabBroker:
             if order["status"] == "filled":
                 return order
             if order["status"] in TERMINAL_STATUSES:
-                raise BrokerError(f"close order {order['id']} ended {order['status']} without fill")
+                why = order.get("status_description")
+                raise BrokerError(f"close order {order['id']} ended {order['status']} without fill"
+                                  + (f" -- Schwab says: {why}" if why else ""))
             if attempt >= self.close_max_retries:
                 break
             self.cancel_order(order["id"])
@@ -1051,20 +1099,33 @@ class SchwabBroker:
             remaining = qty - latest["filled_qty"]
             if remaining <= 0:
                 return latest
-            price = round(price + self.close_slippage, 2)
+            price = next_close_price(price, self.close_slippage, r)
             self.log.warning("close_spread_at_market retry %d/%d at %.2f", attempt + 1,
-                             self.close_max_retries, price)
+                             self.close_max_retries, price, extra={"keep": True})
             order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike,
                                             remaining, price, time_in_force=time_in_force, root=root,
                                             client_tag=tag)
         raise BrokerError(f"close_spread_at_market exhausted {self.close_max_retries} retries; "
                           f"last order {order['id']} status {order['status']}")
 
+    @staticmethod
+    def _order_root(raw: dict) -> str | None:
+        """The option root of a Schwab order (None for a stock order or an unreadable symbol)."""
+        for leg in raw.get("orderLegCollection") or []:
+            inst = leg.get("instrument") or {}
+            if str(inst.get("assetType", "")).upper() == "OPTION":
+                try:
+                    return parse_occ(str(inst.get("symbol", "")))["root"]
+                except BrokerError:
+                    return None
+        return None
+
     def replace_order_price(self, order_id: str, new_limit: float) -> dict:
         order_id = str(order_id)
         if self.dry_run or order_id.startswith("DRY-"):
             existing = self._dry_orders.get(order_id)
             if existing is not None:
+                new_limit = snap_spx_price(new_limit, self._order_root(existing["raw"]))
                 new_json = dict(existing["raw"], price=f"{new_limit:.2f}")
                 existing["status"] = "replaced"
                 return self._dry_order(new_json, existing["symbol"], existing["time_in_force"],
@@ -1073,6 +1134,11 @@ class SchwabBroker:
                                    "", "gtc", f"replace_order_price({order_id} -> {new_limit:.2f})")
         client = self._get_client()
         raw = self._json(self._request(client.get_order, order_id, self._hash()))
+        new_limit = snap_spx_price(new_limit, self._order_root(raw))
+        current = _f(raw.get("price"))
+        if current is not None and abs(current - new_limit) < 0.005:
+            self.log.info("replace_order %s skipped: %.2f is already the order's price", order_id, new_limit)
+            return self._normalize_order(raw)
         new_json = {
             "orderType": raw.get("orderType"),
             "session": raw.get("session", "NORMAL"),
@@ -1087,7 +1153,7 @@ class SchwabBroker:
         }
         if raw.get("complexOrderStrategyType"):
             new_json["complexOrderStrategyType"] = raw["complexOrderStrategyType"]
-        self.log.warning("[LIVE] replace_order %s sending: %s", order_id, json.dumps(new_json))
+        self.log.warning("[LIVE] replace_order %s sending: %s", order_id, json.dumps(new_json), extra={"keep": True})
         resp = self._request(client.replace_order, self._hash(), order_id, new_json)
         new_id = self._order_id_from_response(resp) or order_id
         order = self.get_order(new_id)

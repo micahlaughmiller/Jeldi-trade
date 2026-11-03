@@ -1159,7 +1159,7 @@ class Bot:
         if filled_qty == 0:
             log.info("[%s] ENTRY NOT FILLED (%s): order %s", strat, order.get("status"), order.get("id"))
             self.journal.event("ENTRY_UNFILLED", now, strategy=strat, order_id=order.get("id"),
-                               status=order.get("status"))
+                               status=order.get("status"), reason=order.get("status_description"))
             return f"not filled ({order.get('status')}){detail}", 0.0
         credit = float(order.get("filled_avg_price") or order.get("limit_price") or quote.mid)
         target, stop = strategy.exit_levels(strat)

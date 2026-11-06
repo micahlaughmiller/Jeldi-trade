@@ -310,19 +310,19 @@ def config_values(**env) -> dict:
     clean = {k: v for k, v in os.environ.items() if k not in ("SCHWAB_MODE", "LIVE_CAPITAL_FLOOR_USD", "LIVE_CAPITAL_PCT", "LIVE_MAX_CONTRACTS_PER_TRADE")}
     code = ("import dotenv; dotenv.load_dotenv = lambda *a, **k: False; import config, json; "
             "print(json.dumps([config.LIVE_CAPITAL_CAP_ENABLED, config.LIVE_CAPITAL_FLOOR_USD, config.LIVE_CAPITAL_PCT, "
-            "config.LIVE_MAX_CONTRACTS_PER_TRADE, config.HARD_MAX_CONTRACTS]))")
+            "config.LIVE_MAX_CONTRACTS_PER_TRADE, config.HARD_MAX_CONTRACTS, config.EXIT_PNL_BASIS]))")
     out = subprocess.run([sys.executable, "-c", code], cwd=str(FOLDER), env={**clean, **env}, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    return dict(zip(("enabled", "floor", "pct", "max", "hard"), json.loads(out.stdout)))
+    return dict(zip(("enabled", "floor", "pct", "max", "hard", "pnl_basis"), json.loads(out.stdout)))
 
 
 def test_the_shipped_config_values():
-    assert config_values(SCHWAB_MODE="sim") == {"enabled": False, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": None}
-    assert config_values(SCHWAB_MODE="dry_run") == {"enabled": True, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": 1}
-    assert config_values(SCHWAB_MODE="live") == {"enabled": True, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": 1}
-    assert config_values() == {"enabled": False, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": None}        # no mode set = sim
+    assert config_values(SCHWAB_MODE="sim") == {"enabled": False, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": None, "pnl_basis": "fill"}
+    assert config_values(SCHWAB_MODE="dry_run") == {"enabled": True, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": 1, "pnl_basis": "fill"}
+    assert config_values(SCHWAB_MODE="live") == {"enabled": True, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": 1, "pnl_basis": "fill"}
+    assert config_values() == {"enabled": False, "floor": 1000.0, "pct": 0.25, "max": 1, "hard": None, "pnl_basis": "fill"}        # no mode set = sim
     raised = config_values(SCHWAB_MODE="live", LIVE_MAX_CONTRACTS_PER_TRADE="2", LIVE_CAPITAL_FLOOR_USD="2500", LIVE_CAPITAL_PCT="0.5")
-    assert raised == {"enabled": True, "floor": 2500.0, "pct": 0.5, "max": 2, "hard": 2}
+    assert raised == {"enabled": True, "floor": 2500.0, "pct": 0.5, "max": 2, "hard": 2, "pnl_basis": "fill"}
 
 
 def test_the_scheduler_prints_the_broker_lines_and_never_fails_on_them():
@@ -807,3 +807,328 @@ def test_the_live_bots_log_callable_accepts_the_keep_tag_and_a_plain_callable_dr
     b.log = broker_mod._CallableLog(lines.append)                       # a plain callable: the tag is dropped, nothing raises
     b.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.88, root="SPXW")
     assert any("sending" in line for line in lines)
+
+
+# ---------------------------------------------------------------- resting exits and close pricing, live (2026-11-06)
+
+def test_an_oco_close_goes_out_live_as_one_oco_order(tmp_path, monkeypatch):
+    class OcoFake(LiveFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            children = []
+            for i, c in enumerate(order_json["childOrderStrategies"], start=1):
+                child = _raw_close(900 + i, "WORKING", float(c["price"]))
+                child["orderType"] = c["orderType"]
+                if "stopPrice" in c:
+                    child["stopPrice"] = float(c["stopPrice"])
+                children.append(child)
+            self.order_by_id["900"] = {"orderId": 900, "orderStrategyType": "OCO", "enteredTime": "2026-11-06T15:00:00+0000",
+                                       "childOrderStrategies": children}
+            self.orders_payload = [self.order_by_id["900"]]
+            return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/900"})
+
+    fake = OcoFake()
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    order = b.place_oco_close("SPX", EXP, "P", 7610, 7605, qty=1, target_debit=0.60, stop_price=1.40, stop_limit=1.55,
+                              root="SPXW", time_in_force="day")
+    assert order["id"] == "900" and order["order_class"] == "oco" and order["status"] == "new"
+    assert [c["exit_role"] for c in order["children"]] == ["target", "stop"] and [c["id"] for c in order["children"]] == ["901", "902"]
+    sent = fake.placed[0][1]
+    assert sent["orderStrategyType"] == "OCO" and sent["childOrderStrategies"][0]["price"] == "0.60"
+    assert sent["childOrderStrategies"][1]["stopPrice"] == "1.40" and sent["childOrderStrategies"][1]["price"] == "1.55"
+    listed = b.get_open_orders()
+    assert [o["id"] for o in listed] == ["901", "902"] and all(o["oco_parent_id"] == "900" for o in listed)
+
+
+def test_a_lost_reply_finds_the_close_that_already_filled(tmp_path, monkeypatch):
+    """2026-11-06: the close reached Schwab and filled; only the POST reply was lost. It is found again by its legs and price among
+    the recent orders whatever their status (newest first), so it is booked at its fill and not as a hand close at the mark."""
+    import httpx
+
+    class Lost(LiveFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            older = _raw_close(4000, "CANCELED", 1.80)                        # an identical close cancelled earlier today
+            older["enteredTime"] = "2026-11-06T14:00:00+0000"
+            newer = _raw_close(4242, "FILLED", 1.80, filled=1.0)              # the one just sent, filled
+            newer["enteredTime"] = datetime.now(broker_mod.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+            self.orders_payload = [older, newer]
+            self.order_by_id["4242"] = newer
+            raise httpx.ReadTimeout("no reply")
+
+    fake = Lost()
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")   # ask-side 1.80
+    assert order["id"] == "4242" and order["status"] == "filled" and order["filled_avg_price"] == 1.80
+    assert len(fake.placed) == 1                                                 # never re-sent
+
+
+def test_a_close_worked_across_two_orders_is_priced_across_both_fills(tmp_path, monkeypatch):
+    """A 2-lot close: 1 fills under the first order, the retry closes the other one tick higher -- the returned fill covers both."""
+    fake = CloseFake()
+    first = _raw_close(777, "WORKING", 1.80, filled=1.0)
+    first["quantity"] = 2.0
+    first["orderActivityCollection"] = [{"activityType": "EXECUTION", "executionType": "FILL", "quantity": 1.0,
+                                         "executionLegs": [{"legId": 1, "quantity": 1.0, "price": 9.50},
+                                                           {"legId": 2, "quantity": 1.0, "price": 7.70}]}]
+    fake.order_by_id["777"] = first
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=2, root="SPXW", time_in_force="day")
+    assert order["id"] == "778" and order["status"] == "filled"
+    assert order["filled_qty"] == 2 and order["filled_avg_price"] == pytest.approx(1.825)
+    assert order["fills"] == [(1, 1.80), (1, 1.85)]
+    assert [o["price"] for _, o in fake.placed] == ["1.80", "1.85"]
+    assert [o["orderLegCollection"][0]["quantity"] for _, o in fake.placed] == [2, 1]
+    assert fake.canceled == ["777"]
+
+
+def test_the_hard_stop_cancels_an_oco_once_through_its_parent(tmp_path, monkeypatch):
+    from fake_broker import FakeBroker
+
+    class WithOco(FakeBroker):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.cancelled: list[str] = []
+
+        def get_open_orders(self):
+            def leg(sym, intent):
+                return {"symbol": sym, "side": "buy", "position_intent": intent, "ratio_qty": 1, "status": "new", "filled_avg_price": None}
+            legs = [leg("SPXW260917P07610000", "buy_to_close"), leg("SPXW260917P07605000", "sell_to_close")]
+
+            def child(oid):
+                return {"id": oid, "status": "new", "symbol": "SPX", "order_class": "mleg", "qty": 1, "legs": legs, "oco_parent_id": "900"}
+            return [child("901"), child("902"), {"id": "555", "status": "new", "symbol": "SPX", "order_class": "mleg", "qty": 1, "legs": legs}]
+
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return True
+
+    fake = WithOco(equity=10_000, today=datetime(2026, 9, 17).date())
+    bot = make_bot(tmp_path, monkeypatch, fake)
+    assert bot.cancel_own_orders() == 2 and fake.cancelled == ["900", "555"]
+
+
+# ---------------------------------------------------------------- the OCO form: Schwab's preview decides (2026-11-06)
+
+class PreviewFake(LiveFake):
+    """Previews answer as scripted; a placed order is 777 (a plain target) or 900 (an OCO, children 901/902)."""
+
+    def __init__(self, preview=None, oco_children_status="WORKING"):
+        super().__init__()
+        self.previews: list[dict] = []
+        self.cancelled: list[str] = []
+        self.preview = preview if preview is not None else _resp(200, {"orderValidationResult": {"rejects": []}})
+        self.oco_children_status = oco_children_status
+
+    def preview_order(self, account_hash, order_json):
+        self.previews.append(order_json)
+        return self.preview
+
+    def cancel_order(self, order_id, account_hash):
+        self.cancelled.append(str(order_id))
+        return _resp(200, None)
+
+    def place_order(self, account_hash, order_json):
+        self.placed.append((account_hash, order_json))
+        if order_json.get("childOrderStrategies"):
+            children = []
+            for i, c in enumerate(order_json["childOrderStrategies"], start=1):
+                child = _raw_close(900 + i, self.oco_children_status, float(c["price"]),
+                                   desc="Stop orders are not supported for this product" if self.oco_children_status == "REJECTED" else None)
+                child["orderType"] = c["orderType"]
+                children.append(child)
+            self.order_by_id["900"] = {"orderId": 900, "orderStrategyType": "OCO", "enteredTime": "2026-11-06T15:00:00+0000",
+                                       "childOrderStrategies": children}
+            return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/900"})
+        self.order_by_id["777"] = _raw_close(777, "WORKING", float(order_json["price"]))
+        return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/777"})
+
+
+def _rest(b):
+    return b.place_oco_close("SPX", EXP, "P", 7610, 7605, qty=1, target_debit=0.60, stop_price=1.40, stop_limit=1.55,
+                             root="SPXW", time_in_force="day")
+
+
+def test_when_the_preview_passes_the_oco_is_sent(tmp_path, monkeypatch):
+    fake = PreviewFake()
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    order = _rest(b)
+    assert order["exit_mode"] == "oco" and order["id"] == "900" and [c["exit_role"] for c in order["children"]] == ["target", "stop"]
+    assert len(fake.previews) == 1 and fake.previews[0]["orderStrategyType"] == "OCO"
+    _rest(b)
+    assert len(fake.previews) == 1 and len(fake.placed) == 2                # judged once per session
+
+
+def test_when_the_preview_refuses_the_oco_the_target_alone_rests(tmp_path, monkeypatch, caplog):
+    fake = PreviewFake(preview=_resp(400, {"message": "OrderType must be one of those values: NET_CREDIT, NET_DEBIT, NET_ZERO or MARKET."}))
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        order = _rest(b)
+    assert order["exit_mode"] == "target" and order["id"] == "777" and order["status"] == "new"
+    assert [c["exit_role"] for c in order["children"]] == ["target"] and order["children"][0]["id"] == "777"
+    sent = fake.placed[0][1]
+    assert sent["orderType"] == "NET_DEBIT" and sent["price"] == "0.60" and "childOrderStrategies" not in sent
+    assert any("refused the OCO form" in r.getMessage() for r in caplog.records)
+    _rest(b)
+    assert len(fake.previews) == 1 and all("childOrderStrategies" not in o for _, o in fake.placed)
+
+
+def test_a_preview_that_reports_rejects_also_falls_back(tmp_path, monkeypatch):
+    fake = PreviewFake(preview=_resp(200, {"orderValidationResult": {"rejects": [{"activityMessage": "Complex orders cannot be part of a conditional order"}]}}))
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    assert _rest(b)["exit_mode"] == "target" and fake.placed[0][1]["orderType"] == "NET_DEBIT"
+
+
+def test_an_oco_rejected_after_acceptance_falls_back_for_the_session(tmp_path, monkeypatch, caplog):
+    fake = PreviewFake(oco_children_status="REJECTED")
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        order = _rest(b)
+    assert order["exit_mode"] == "target" and order["id"] == "777"
+    assert [o.get("orderStrategyType") for _, o in fake.placed] == ["OCO", "SINGLE"]
+    assert any("Schwab says: Stop orders are not supported" in r.getMessage() for r in caplog.records)
+    _rest(b)
+    assert [o.get("orderStrategyType") for _, o in fake.placed] == ["OCO", "SINGLE", "SINGLE"]
+
+
+def test_target_mode_never_tries_the_oco(tmp_path, monkeypatch):
+    fake = PreviewFake()
+    b = make(tmp_path, monkeypatch, fake, live=True, RESTING_EXIT_MODE="target")
+    select(tmp_path)
+    assert _rest(b)["exit_mode"] == "target" and fake.previews == [] and fake.placed[0][1]["orderType"] == "NET_DEBIT"
+
+
+def test_a_4xx_on_an_order_is_a_rejection_not_an_ambiguous_loss(tmp_path, monkeypatch):
+    class Refuses(LiveFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            return _resp(400, {"message": "Invalid price"})
+
+    fake = Refuses()
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    with pytest.raises(broker_mod.BrokerRejected, match="Invalid price"):
+        b.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=1.5, root="SPXW")
+    assert len(fake.placed) == 1 and not any(name == "get_orders_for_account" for name, _, _ in fake.calls)
+
+
+def test_an_oco_with_one_rejected_child_is_cancelled_and_falls_back(tmp_path, monkeypatch, caplog):
+    """The stop child is refused but the target child is WORKING: that leftover would double a later close, so it is cancelled
+    before the profit target alone is rested."""
+    class HalfRejected(PreviewFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            if order_json.get("childOrderStrategies"):
+                target = _raw_close(901, "WORKING", 0.60)
+                stop = _raw_close(902, "REJECTED", 1.55, desc="Stop orders are not supported for this product")
+                stop["orderType"] = "STOP_LIMIT"
+                self.order_by_id["900"] = {"orderId": 900, "orderStrategyType": "OCO", "enteredTime": "2026-11-06T15:00:00+0000",
+                                           "childOrderStrategies": [target, stop]}
+                return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/900"})
+            self.order_by_id["777"] = _raw_close(777, "WORKING", float(order_json["price"]))
+            return _resp(201, None, {"Location": "https://api.schwabapi.com/trader/v1/accounts/x/orders/777"})
+
+    fake = HalfRejected()
+    b = make(tmp_path, monkeypatch, fake, live=True)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        order = _rest(b)
+    assert order["exit_mode"] == "target" and order["id"] == "777"
+    assert fake.cancelled == ["900", "901"]                                  # the parent and the surviving child
+    assert any("Schwab says: Stop orders are not supported" in r.getMessage() for r in caplog.records)
+
+
+def test_a_lost_reply_never_adopts_a_resting_exits_child(tmp_path, monkeypatch):
+    import httpx
+
+    class Lost(LiveFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            target = _raw_close(901, "WORKING", 1.80)                        # a resting target at the very price of this close
+            self.orders_payload = [{"orderId": 900, "orderStrategyType": "OCO", "enteredTime": "2026-11-06T15:30:00+0000",
+                                    "childOrderStrategies": [target, dict(_raw_close(902, "WORKING", 2.00), orderType="STOP_LIMIT")]}]
+            raise httpx.ReadTimeout("no reply")
+
+    fake = Lost()
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    with pytest.raises(BrokerError, match="NOT re-sent"):
+        b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert len(fake.placed) == 1
+
+
+def test_the_hard_stop_leaves_tracked_resting_exits_and_unmanaged_legs_alone(tmp_path, monkeypatch):
+    from fake_broker import FakeBroker
+    from position_manager import OpenSpread
+    from strategy import BULLISH
+    import config
+
+    class WithOrders(FakeBroker):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.cancelled: list[str] = []
+
+        def get_open_orders(self):
+            def leg(sym, intent):
+                return {"symbol": sym, "side": "buy", "position_intent": intent, "ratio_qty": 1, "status": "new", "filled_avg_price": None}
+            mine = [leg("SPXW260917P07610000", "buy_to_close"), leg("SPXW260917P07605000", "sell_to_close")]
+            other = [leg("SPXW260917P07500000", "buy_to_close"), leg("SPXW260917P07495000", "sell_to_close")]
+            return [{"id": "901", "status": "new", "symbol": "SPX", "order_class": "mleg", "qty": 1, "legs": mine, "oco_parent_id": "900"},
+                    {"id": "555", "status": "new", "symbol": "SPX", "order_class": "mleg", "qty": 1, "legs": mine},
+                    {"id": "444", "status": "new", "symbol": "SPX", "order_class": "mleg", "qty": 1, "legs": other}]
+
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return True
+
+    fake = WithOrders(equity=10_000, today=datetime(2026, 9, 17).date())
+    bot = make_bot(tmp_path, monkeypatch, fake)
+    spread = OpenSpread(strategy="B", direction=BULLISH, setup="ORB", right="P", root="SPXW", expiration=bot.today,
+                        short_strike=7610.0, long_strike=7605.0, width=5, qty=1, entry_credit=1.0, entry_time=datetime(2026, 9, 17, 10, 0),
+                        current_price=1.0, best_price=1.0, profit_target=0.3, stop_loss=0.5)
+    bot.pm.open(spread)
+    spread.oco_id, spread.oco_target_id = "900", "901"
+    monkeypatch.setattr(config, "ADOPT_UNTRACKED_SPXW", False)
+    assert bot.cancel_own_orders() == 1 and fake.cancelled == ["555"]        # not the tracked resting exit, not the untracked spread's order
+    monkeypatch.setattr(config, "ADOPT_UNTRACKED_SPXW", True)
+    fake.cancelled.clear()
+    assert bot.cancel_own_orders() == 2 and fake.cancelled == ["555", "444"]  # adoptable legs: their orders are cancelled as before
+
+
+def test_a_lost_reply_ignores_an_identical_order_entered_before_the_post(tmp_path, monkeypatch):
+    """A close on the same strikes at the same price filled 3 minutes ago; the lookup only trusts orders entered after this POST."""
+    import httpx
+
+    class Lost(LiveFake):
+        def place_order(self, account_hash, order_json):
+            self.placed.append((account_hash, order_json))
+            earlier = _raw_close(4000, "FILLED", 1.80, filled=1.0)
+            earlier["enteredTime"] = (datetime.now(broker_mod.timezone.utc) - broker_mod.timedelta(minutes=3)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+            self.orders_payload = [earlier]
+            self.order_by_id["4000"] = earlier
+            raise httpx.ReadTimeout("no reply")
+
+    fake = Lost()
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    with pytest.raises(BrokerError, match="NOT re-sent"):
+        b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+
+
+def test_a_partial_fill_without_a_price_still_counts_toward_the_close(tmp_path, monkeypatch):
+    fake = CloseFake()
+    first = _raw_close(777, "WORKING", 1.80, filled=1.0)                      # 1 of 2 filled, no execution legs reported
+    first["quantity"] = 2.0
+    fake.order_by_id["777"] = first
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03)
+    select(tmp_path)
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=2, root="SPXW", time_in_force="day")
+    assert [o["orderLegCollection"][0]["quantity"] for _, o in fake.placed] == [2, 1]     # the retry is for ONE, not two
+    assert order["filled_qty"] == 2 and order["fills"] == [(1, 1.80), (1, 1.85)]

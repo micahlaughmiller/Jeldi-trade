@@ -146,6 +146,27 @@ MANUAL_HOLD_DELAYS_FORCE_CLOSE = False
 # realistic_exit_price = the tick immediately before the one that triggered the exit (prev_price),
 # not a flat slippage assumption -- the closest stand-in for where a live fill would realistically
 # land. The real broker fill is still recorded separately as pnl_actual_fill, for comparison only.
+# 2026-11-06: which exit price the OFFICIAL P/L (pnl, realized_pnl, the daily loss limit, the loss streaks, the cards)
+# is booked on. "prev_tick" = the tick before the trigger (above: the paper-trading stand-in); "fill" = the broker's
+# actual fill (exit_price), what a LIVE account really made or lost. The other price always stays beside it in the row
+# (exit_price / pnl_actual_fill, prev_tick_price / prev_tick_pnl).
+EXIT_PNL_BASIS = "prev_tick"
+# 2026-11-06: resting exits. Right after an entry fills, the bot places ONE OCO at the broker to close the spread: a
+# profit-target limit (buy to close at target_price) and a stop-limit (triggers at stop_price, limit a buffer above it),
+# so the exit sits at the broker ready to execute even if this script is slow or down. The script's own rules keep
+# running and cancel the OCO before closing early. Only a broker that can hold an OCO for a spread places one (Schwab
+# live / dry-run); the simulator and Alpaca never do, whatever this says.
+RESTING_EXITS = False                    # Alpaca cannot hold an OCO for a spread (paper)
+RESTING_EXIT_MODE = "oco"                # "oco": ask Schwab (previewOrder) whether it takes target + stop-limit on the spread, place it if so,
+                                         #        else rest the profit target alone (the stop stays with the bot); "target": never try the OCO
+RESTING_STOP_LIMIT_PCT_OF_WIDTH = 0.03   # the stop child's limit sits this fraction of the width above the stop ($0.15 on a $5 SPX spread)
+RESTING_EXITS_FOR_STOCKS = False         # F stock spreads: their targets sit inside the quote noise and some names refuse penny prices
+RESTING_EXIT_POLL_SEC = 5                # how often the resting order's status is read at the broker (12 requests/min per open spread)
+RESTING_EXIT_CANCEL_WAIT_SEC = 5         # after cancelling the OCO ahead of a script close: wait this long for the broker to confirm
+RESTING_EXIT_CANCEL_WAIT_FORCE_SEC = 20  # ... and this long at the hard stop, the stale-data watchdog and Ctrl-C (a single pass)
+RESTING_EXIT_UNRESOLVED_GRACE_SEC = 120  # a spread gone from the account whose resting order cannot be read as filled or dead waits
+                                         # this long before it is booked as a hand close at the last mark
+RESTING_EXIT_MAX_ATTEMPTS = 2            # an OCO that dies without a fill is re-placed once; after that the exits are script-managed
 LOG_DIR = "logs"
 
 UNDERLYING = "SPX"

@@ -958,3 +958,28 @@ def test_remaining_at_broker_filters_by_root(pm, broker):
     assert pm._remaining_at_broker(f) == 1
     broker._reduce_spread("TSLA", EXP2, "P", 100.0, 99.0, 1)
     assert pm._remaining_at_broker(f) == 0                                    # the SPXW legs do not count
+
+
+def test_exit_row_books_the_official_pnl_on_the_fill_when_the_basis_is_fill(pm, broker, monkeypatch):
+    # 2026-11-06: a LIVE account's result is the fill, so the Schwab folder ships EXIT_PNL_BASIS = "fill": pnl, position_pnl
+    # (-> realized_pnl, the daily loss limit, the loss streaks, the cards) all come from exit_price. The prev-tick
+    # diagnostics are unchanged, and realistic_exit_price names the price the official pnl was booked on.
+    monkeypatch.setattr(config, "EXIT_PNL_BASIS", "fill")
+    open_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 3.60, rising()) == []       # 1st confirming print at the stop: held
+    broker.spread_close_price = 3.65
+    row = tick(pm, et(10, 4), 3.61, rising())[0]            # 2nd confirming print: closes, fills at 3.65
+    assert row["exit_price"] == 3.65 and row["trigger_price"] == 3.61
+    assert row["pnl"] == pytest.approx(-65.00) and row["pnl_actual_fill"] == pytest.approx(-65.00)
+    assert row["position_pnl"] == pytest.approx(-65.00) and row["realistic_exit_price"] == pytest.approx(3.65)
+    assert row["prev_tick_price"] == pytest.approx(3.60) and row["prev_tick_pnl"] == pytest.approx(-60.00)
+
+
+def test_the_paper_basis_is_the_default_and_books_on_the_tick_before_the_trigger(pm, broker, monkeypatch):
+    monkeypatch.delattr(config, "EXIT_PNL_BASIS", raising=False)   # an older config without the key behaves as before
+    open_put_spread(pm, broker, qty=1)
+    assert tick(pm, et(10, 2), 3.60, rising()) == []
+    broker.spread_close_price = 3.65
+    row = tick(pm, et(10, 4), 3.61, rising())[0]
+    assert row["pnl"] == pytest.approx(-60.00) and row["realistic_exit_price"] == pytest.approx(3.60)
+    assert row["pnl_actual_fill"] == pytest.approx(-65.00)

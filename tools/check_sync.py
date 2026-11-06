@@ -63,6 +63,10 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
         "DAILY_LOSS_BASIS": ("'equity'", "'bot'", "2026-10-15: Schwab's account is shared with hand trades and the 45DTE bot, so its loss limit "
                              "counts only this bot's P/L (Alpaca: account equity)"),
         "MAX_OPEN_POSITIONS_TOTAL": ("2", "1", "2026-10-15: Schwab 0DTE (live go-live) holds ONE trade open at a time across B and F"),
+        "EXIT_PNL_BASIS": ("'prev_tick'", "'fill'", "2026-11-06: on Schwab (a real account) the official P/L is booked on the "
+                           "broker's actual fill (Alpaca paper: the tick before the trigger)"),
+        "RESTING_EXITS": ("False", "True", "2026-11-06: on Schwab the exit (profit-target limit + stop-limit) rests at the broker as "
+                          "an OCO right after the entry fills; Alpaca cannot hold one for a spread"),
     },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),

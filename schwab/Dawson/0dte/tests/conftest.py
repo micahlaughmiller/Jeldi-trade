@@ -167,3 +167,14 @@ def _pin_golive_caps_off(request, monkeypatch):
     machine's .env holds; test_golive_caps sets it itself. Alpaca configs have no such setting (raising=False)."""
     if request.module.__name__ != "test_golive_caps":
         monkeypatch.setattr(config, "HARD_MAX_CONTRACTS", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _pin_exit_pnl_basis(request, monkeypatch):
+    """The shared suite was written for the paper basis (the official P/L on the tick before the trigger, 2026-10-01) and
+    for script-managed exits; the Schwab folder ships EXIT_PNL_BASIS = "fill" and RESTING_EXITS = True (2026-11-06). Pin the
+    paper values -- except in the per-folder guard modules, which check each folder's real ones. Tests of the fill basis and
+    of the resting exits set them themselves."""
+    if request.module.__name__ not in GUARD_MODULES:
+        monkeypatch.setattr(config, "EXIT_PNL_BASIS", "prev_tick", raising=False)
+        monkeypatch.setattr(config, "RESTING_EXITS", False, raising=False)

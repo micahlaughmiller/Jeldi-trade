@@ -21,6 +21,7 @@ class FakeBroker:
     name = "fake"
     is_paper = True
     dry_run = False
+    supports_resting_exits = False      # tests of the resting exits set this True on their broker
 
     def __init__(self, equity: float = 10_000.0, today: date | None = None):
         self.equity = equity
@@ -38,6 +39,11 @@ class FakeBroker:
         self.chain_calls: list[tuple[str, date, str]] = []
         self.chain_errors: set[str] = set()
         self.fill_entries = True
+        self.oco_calls: list[dict] = []
+        self.oco_status = "accepted"         # what a placed OCO reports; "rejected" simulates Schwab refusing it
+        self.oco_reason: str | None = None
+        self.oco_failures = 0
+        self.oco_mode = "oco"                # "target": the broker rests the profit target alone (Schwab refused the OCO form)
         self.spot = 7500.0
         self.equity_history: list[float] = []
 
@@ -189,7 +195,56 @@ class FakeBroker:
         if o is None or o["status"] in ("filled", "canceled"):
             return False
         o["status"] = "canceled"
+        for child in o.get("children") or []:
+            if child["status"] not in ("filled", "canceled"):
+                child["status"] = "canceled"
         return True
+
+    # ------------------------------------------------------------------ resting exits (OCO)
+    def place_oco_close(self, underlying: str, expiration: date, right: str, short_strike: float, long_strike: float,
+                        qty: int, target_debit: float, stop_price: float, stop_limit: float, time_in_force: str = "day",
+                        root: str | None = None, client_tag: str | None = None) -> dict:
+        root = root or underlying
+        self.oco_calls.append({"right": right, "short": short_strike, "long": long_strike, "qty": qty, "target": target_debit,
+                               "stop": stop_price, "limit": stop_limit, "tif": time_in_force, "root": root})
+        if self.oco_failures > 0:
+            self.oco_failures -= 1
+            raise BrokerError("simulated OCO failure")
+        if self.oco_mode == "target":
+            order = self._order(root, qty, target_debit, self.oco_status, None, 0)
+            stored = self.orders[order["id"]]
+            stored["exit_role"], stored["spread"] = "target", (root, expiration, right, short_strike, long_strike)
+            stored["status_description"] = self.oco_reason
+            return dict(stored, exit_mode="target", children=[dict(stored)])
+        target = self._order(root, qty, target_debit, self.oco_status, None, 0)
+        stop = self._order(root, qty, stop_limit, self.oco_status, None, 0)
+        target, stop = self.orders[target["id"]], self.orders[stop["id"]]
+        target["exit_role"], stop["exit_role"], stop["stop_price"] = "target", "stop", stop_price
+        parent = {"id": str(uuid.uuid4()), "status": self.oco_status, "status_description": self.oco_reason, "symbol": root,
+                  "order_class": "oco", "side": None, "qty": qty, "filled_qty": 0, "limit_price": None, "filled_avg_price": None,
+                  "time_in_force": time_in_force, "legs": [], "children": [target, stop],
+                  "spread": (root, expiration, right, short_strike, long_strike),
+                  "submitted_at": datetime.now(config.ET), "filled_at": None, "raw": {}}
+        target["oco_parent_id"] = stop["oco_parent_id"] = parent["id"]
+        self.orders[parent["id"]] = parent
+        return dict(parent)
+
+    def fill_oco(self, parent_id: str, role: str, price: float, qty: int | None = None) -> None:
+        """Schwab fills one child of the OCO (and cancels the other); the spread leaves the account."""
+        parent = self.orders[parent_id]
+        if "children" not in parent:                              # a plain resting target
+            parent["status"], parent["filled_qty"], parent["filled_avg_price"] = "filled", qty or parent["qty"], price
+            root, expiration, right, short, long = parent["spread"]
+            self._reduce_spread(root, expiration, right, short, long, qty or parent["qty"])
+            return
+        for child in parent["children"]:
+            if child["exit_role"] == role:
+                child["status"], child["filled_qty"], child["filled_avg_price"] = "filled", qty or child["qty"], price
+            elif child["status"] not in ("filled",):
+                child["status"] = "canceled"
+        parent["status"], parent["filled_qty"], parent["filled_avg_price"] = "filled", qty or parent["qty"], price
+        root, expiration, right, short, long = parent["spread"]
+        self._reduce_spread(root, expiration, right, short, long, qty or parent["qty"])
 
     def cancel_all_orders(self) -> int:
         return sum(self.cancel_order(oid) for oid in list(self.orders))

@@ -951,3 +951,110 @@ def test_the_normalized_order_carries_schwabs_reason_text(brk):
     assert order["status"] == "rejected"
     assert order["status_description"] == "Option order price rounded to nearest 0.05 (not a penny pilot)"
     assert brk._normalize_order(RAW_FILLED)["status_description"] is None
+
+
+# ---------------------------------------------------------------- resting exits: the OCO (2026-11-06)
+
+def _oco_child(order_id, status, order_type, price, filled=0.0, stop_price=None, fills=None, desc=None):
+    raw = {"orderId": order_id, "status": status, "orderType": order_type, "price": price, "quantity": 1.0, "filledQuantity": filled,
+           "duration": "DAY", "session": "NORMAL", "orderStrategyType": "SINGLE", "complexOrderStrategyType": "VERTICAL",
+           "enteredTime": "2026-09-17T15:00:00+0000",
+           "orderLegCollection": [
+               {"legId": 1, "instruction": "BUY_TO_CLOSE", "quantity": 1.0,
+                "instrument": {"assetType": "OPTION", "symbol": "SPXW  260917P07610000", "underlyingSymbol": "$SPX"}},
+               {"legId": 2, "instruction": "SELL_TO_CLOSE", "quantity": 1.0,
+                "instrument": {"assetType": "OPTION", "symbol": "SPXW  260917P07605000", "underlyingSymbol": "$SPX"}}]}
+    if stop_price is not None:
+        raw["stopPrice"] = stop_price
+    if fills:
+        raw["closeTime"] = "2026-09-17T15:20:00+0000"
+        raw["orderActivityCollection"] = [{"activityType": "EXECUTION", "executionType": "FILL", "quantity": filled,
+                                           "executionLegs": [{"legId": 1, "quantity": filled, "price": fills[0]},
+                                                             {"legId": 2, "quantity": filled, "price": fills[1]}]}]
+    if desc:
+        raw["statusDescription"] = desc
+    return raw
+
+
+def _raw_oco(target_status="WORKING", stop_status="WORKING", target_fills=None, desc=None):
+    return {"orderId": 900, "orderStrategyType": "OCO", "enteredTime": "2026-09-17T15:00:00+0000",
+            "childOrderStrategies": [
+                _oco_child(901, target_status, "NET_DEBIT", 0.6, filled=1.0 if target_fills else 0.0, fills=target_fills, desc=desc),
+                _oco_child(902, stop_status, "STOP_LIMIT", 1.55, stop_price=1.4, desc=desc)]}
+
+
+def test_an_oco_close_is_a_target_limit_and_a_stop_limit_on_the_grid(brk, fake):
+    order = brk.place_oco_close("SPX", EXP, "P", 7610, 7605, qty=1, target_debit=0.63, stop_price=1.42, stop_limit=1.52,
+                                root="SPXW", time_in_force="day")
+    assert order["status"] == "dry_run" and order["order_class"] == "oco" and order["id"].startswith("DRY-")
+    raw = order["raw"]
+    assert raw["orderStrategyType"] == "OCO" and len(raw["childOrderStrategies"]) == 2
+    target, stop = raw["childOrderStrategies"]
+    assert target["orderType"] == "NET_DEBIT" and target["price"] == "0.60" and target["duration"] == "DAY"
+    assert stop["orderType"] == "STOP_LIMIT" and stop["stopPrice"] == "1.40" and stop["price"] == "1.55" and "stopType" not in stop
+    for child in (target, stop):
+        assert child["orderStrategyType"] == "SINGLE" and child["complexOrderStrategyType"] == "VERTICAL" and child["session"] == "NORMAL"
+        assert [l["instruction"] for l in child["orderLegCollection"]] == ["BUY_TO_CLOSE", "SELL_TO_CLOSE"]
+        assert [l["instrument"]["symbol"] for l in child["orderLegCollection"]] == ["SPXW  260917P07610000", "SPXW  260917P07605000"]
+        assert [l["quantity"] for l in child["orderLegCollection"]] == [1, 1]
+    assert [c["exit_role"] for c in order["children"]] == ["target", "stop"]
+    assert all(c["oco_parent_id"] == order["id"] for c in order["children"])
+    assert brk.get_order(order["children"][1]["id"])["exit_role"] == "stop"          # the children can be read too
+    assert brk.cancel_order(order["id"]) is True and brk.get_order(order["id"])["status"] == "canceled"
+    assert fake.calls == []
+
+
+def test_the_stops_limit_never_sits_at_or_below_the_stop(brk):
+    order = brk.place_oco_close("SPX", EXP, "P", 7610, 7605, qty=1, target_debit=0.60, stop_price=1.40, stop_limit=1.40, root="SPXW")
+    stop = order["raw"]["childOrderStrategies"][1]
+    assert stop["stopPrice"] == "1.40" and stop["price"] == "1.45"
+
+
+def test_a_stock_oco_keeps_penny_prices(brk):
+    order = brk.place_oco_close("AAPL", date(2026, 11, 20), "P", 150, 145, qty=1, target_debit=0.63, stop_price=1.42, stop_limit=1.47)
+    target, stop = order["raw"]["childOrderStrategies"]
+    assert target["price"] == "0.63" and stop["stopPrice"] == "1.42" and stop["price"] == "1.47"
+
+
+def test_a_configured_stop_type_is_sent(tmp_path, fake, monkeypatch):
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    b = Broker(make_config(tmp_path, RESTING_STOP_TYPE="MARK"), dry_run=True, log=logging.getLogger("test.broker"))
+    b._client = fake
+    b._sleep = lambda s: None
+    order = b.place_oco_close("SPX", EXP, "P", 7610, 7605, qty=1, target_debit=0.60, stop_price=1.40, stop_limit=1.55, root="SPXW")
+    assert order["raw"]["childOrderStrategies"][1]["stopType"] == "MARK"
+
+
+@pytest.mark.parametrize("price, up", [(1.52, 1.55), (1.55, 1.55), (1.56, 1.60), (0.01, 0.05), (3.07, 3.10), (0.80, 0.80)])
+def test_spx_prices_snap_up_to_the_grid(price, up):
+    assert broker_mod.snap_spx_price_up(price, "SPXW") == up
+    assert broker_mod.snap_spx_price_up(price, "AAPL") == round(price, 2)
+
+
+def test_an_oco_parent_is_normalized_with_its_children(brk):
+    order = brk._normalize_order(_raw_oco("FILLED", "CANCELED", target_fills=(9.50, 8.90)))
+    assert order["id"] == "900" and order["order_class"] == "oco" and order["status"] == "filled"
+    assert order["filled_avg_price"] == pytest.approx(0.60) and order["filled_qty"] == 1
+    assert [c["exit_role"] for c in order["children"]] == ["target", "stop"]
+    assert [c["status"] for c in order["children"]] == ["filled", "canceled"]
+    assert order["children"][1]["oco_parent_id"] == "900" and order["legs"] and order["symbol"] == "SPX"
+    assert brk._normalize_order(_raw_oco())["status"] == "new"
+    assert brk._normalize_order(_raw_oco("CANCELED", "CANCELED"))["status"] == "canceled"
+    rej = brk._normalize_order(_raw_oco("REJECTED", "REJECTED", desc="Stop orders are not supported for this product"))
+    assert rej["status"] == "rejected" and "not supported" in rej["status_description"]
+
+
+def test_open_orders_list_an_ocos_children_with_their_parent(brk, fake):
+    fake.orders_payload = [_raw_oco()]
+    orders = brk.get_open_orders()
+    assert [o["id"] for o in orders] == ["901", "902"] and all(o["oco_parent_id"] == "900" for o in orders)
+    assert all(o["legs"] for o in orders) and [o["exit_role"] for o in orders] == ["target", "stop"]
+    fake.orders_payload = [_raw_oco("FILLED", "CANCELED", target_fills=(9.50, 8.90))]
+    assert brk.get_open_orders() == []
+
+
+def test_a_half_rejected_oco_is_a_rejected_oco(brk):
+    raw = _raw_oco("WORKING", "REJECTED", desc="Stop orders are not supported for this product")
+    order = brk._normalize_order(raw)
+    assert order["status"] == "rejected" and "not supported" in order["status_description"]
+    assert [c["status"] for c in order["children"]] == ["new", "rejected"]

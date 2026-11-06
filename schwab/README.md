@@ -70,3 +70,27 @@ bot stopped (Ctrl+C), in order:
 8. Start each bot once and read its start-of-day report. A 0DTE bot prints `Schwab token: OK -- token is N days old ...` and, in dry_run or
    live, `Account: ...1234 (TYPE) [selected] -- ...`; a 45DTE bot prints `account ...1234 | token <file> | equity ...`. The last 4 digits and
    the token file must be the folder's own, as in the table above.
+
+## Resting exits at Schwab (6 Nov 2026)
+
+Right after an entry fills, the 0DTE bot places the close at Schwab so it sits there ready to execute even if the script is
+slow or down:
+
+- `RESTING_EXIT_MODE = "oco"` (the default): the bot first asks Schwab's order preview whether it accepts an OCO made of a
+  profit-target limit (buy to close at the target) and a stop-limit on the spread (stop at the stop price, limit a buffer above
+  it, `RESTING_STOP_LIMIT_PCT_OF_WIDTH`). If Schwab takes it, that OCO rests at Schwab. If Schwab refuses the form (likely: its
+  API has not accepted stop orders on two-leg spreads), the bot remembers that for the session and rests the profit-target limit
+  alone; the stop stays with the script, as before. `"target"` skips the OCO attempt and always rests the target alone.
+- The script's own exit rules keep running. Before any close of its own (stop, momentum reversal, trail, floor, end of day) it
+  cancels the resting order first and waits for Schwab to confirm; a resting order that filled in the meantime is booked at its
+  fill and no second close is sent.
+- A resting order that fills is booked as `OCO_TARGET` or `OCO_STOP` at Schwab's fill price. A resting order that dies without a
+  fill is placed again once, then the exits are script-managed for that spread. Every step is in the journal:
+  `RESTING_EXIT_PLACED` (with `mode`), `RESTING_EXIT_LOST`, `RESTING_EXIT_FAILED`, `RESTING_EXIT_CANCELLED`,
+  `RESTING_EXIT_CANCEL_FAILED`.
+- Strategy F (stock spreads) keeps script-managed exits unless `RESTING_EXITS_FOR_STOCKS = True`: its targets sit inside the
+  quote noise and some names refuse penny prices.
+- At the hard stop the bot books a resting exit that filled at the bell before closing, leaves a tracked spread's resting
+  order to that spread's own close, and never cancels orders on legs it does not manage.
+- The simulator and the Alpaca paper bots never rest anything (`RESTING_EXITS = False` on Alpaca; the simulator has no OCO).
+- `EXIT_PNL_BASIS = "fill"`: on Schwab the official P/L is the fill price, not the tick before the trigger.

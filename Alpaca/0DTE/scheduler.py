@@ -1169,6 +1169,7 @@ class Bot:
             qty=filled_qty, entry_credit=credit, entry_time=now_et(), current_price=credit,
             best_price=credit, profit_target=target, stop_loss=stop, entry_mid=quote.mid)
         self.pm.open(spread)
+        self.save_state()                    # 2026-11-06: the resting exit's ids must survive a crash right after the entry
         card = format_entry_card(spread, self.risk.state.for_strategy(strat).trades_today + 1)
         log.info("\n%s", card, extra={"keep": True})
         self.journal.card(card, now)
@@ -1253,6 +1254,11 @@ class Bot:
         # 2026-10-02: reconcile with what the broker actually holds first, so a spread closed (or a
         # contract cut) by hand in the broker UI is booked and dropped here instead of becoming a ghost
         # the exit rules keep trying to close. Throttled and confirmed inside the position manager.
+        resting = self.pm.check_resting_exits(now)     # 2026-11-06: an OCO that filled at the broker is booked at its fill first
+        if resting:
+            self.record_fills(resting)
+            if not self.pm.positions:
+                return
         external = self.pm.sync_external(now)
         if external:
             self.record_fills(external)
@@ -1316,6 +1322,29 @@ class Bot:
                 return False
         return True
 
+    def _order_legs_are_managed(self, order: dict) -> bool:
+        """Every leg of the order is a contract this bot manages: tracked now, in today's saved state, or adoptable under
+        ADOPT_UNTRACKED_SPXW / ADOPT_UNTRACKED_STOCK (the same rule bot_legs applies to positions)."""
+        from broker import parse_occ
+        tracked = {(p.root, p.right, p.expiration, float(k)) for p in self.pm.positions.values()
+                   for k in (p.short_strike, p.long_strike)}
+        for leg in order.get("legs") or []:
+            try:
+                c = parse_occ(leg["symbol"])
+            except Exception:      # noqa: BLE001
+                return False
+            key = (c["root"], c["right"], c["expiration"], float(c["strike"]))
+            if key in tracked:
+                continue
+            if c["root"] == config.OPTION_ROOT:
+                if config.ADOPT_UNTRACKED_SPXW or (c["right"], float(c["strike"]), c["expiration"]) in self._known_spxw():
+                    continue
+                return False
+            if key in self._saved_stock or getattr(config, "ADOPT_UNTRACKED_STOCK", True):
+                continue
+            return False
+        return True
+
     def cancel_own_orders(self) -> int:
         """Cancel the open orders on contracts this bot trades (SPXW expiring today, and F's stock options inside
         its DTE window on roots it holds) -- not every order in the account: a Schwab account is shared with the
@@ -1323,11 +1352,21 @@ class Bot:
         order whose legs we cannot read is left alone."""
         stock_roots = {p.root for p in self.pm.positions.values()}
         cancelled = 0
+        seen: set[str] = set()
+        resting = self.pm.resting_order_ids()
         for order in self.broker.get_open_orders():
             if not self.order_is_mine(order, stock_roots):
                 continue
+            if str(order.get("id")) in resting or str(order.get("oco_parent_id") or "") in resting:
+                continue                     # 2026-11-06: a tracked spread's resting exit is released by its own close, not here
+            if not self._order_legs_are_managed(order):
+                continue                     # an order on legs this bot will neither adopt nor close stays (it may be their only exit)
+            target = str(order.get("oco_parent_id") or order["id"])   # 2026-11-06: an OCO's children are cancelled through their parent, once
+            if target in seen:
+                continue
+            seen.add(target)
             try:
-                self.broker.cancel_order(order["id"])
+                self.broker.cancel_order(target)
                 cancelled += 1
             except BrokerError as e:
                 log.error("Could not cancel order %s: %s", order["id"], e)
@@ -1378,6 +1417,9 @@ class Bot:
         log.warning("FORCE CLOSE at %s: cancelling orders and closing everything.", now.strftime("%H:%M:%S"))
         cancelled = self.cancel_own_orders()
         log.info("Cancelled %d open orders.", cancelled)
+        resting = self.pm.check_resting_exits(now, force=True)   # 2026-11-06: a resting exit that filled at the bell is booked, not closed twice
+        if resting:
+            self.record_fills(resting)
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):
             legs = self.bot_legs(self.broker.get_positions())
             if legs:

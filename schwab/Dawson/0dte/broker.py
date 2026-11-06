@@ -100,6 +100,26 @@ def snap_spx_price(price: float, root: str | None) -> float:
     return round(max(1, steps) * SPX_PRICE_TICK, 2)
 
 
+def snap_spx_price_up(price: float, root: str | None) -> float:
+    """The same grid, rounded UP (a stop-limit's limit must sit at or above the buffer the strategy asked for)."""
+    price = round(float(price), 2)
+    if not is_spx_root(root):
+        return price
+    steps = int(price / SPX_PRICE_TICK - 1e-9) + 1 if abs(price / SPX_PRICE_TICK - round(price / SPX_PRICE_TICK)) > 1e-9 \
+        else int(round(price / SPX_PRICE_TICK))
+    return round(max(1, steps) * SPX_PRICE_TICK, 2)
+
+
+def exit_role(raw: dict) -> str | None:
+    """Which side of a resting exit a Schwab order is: 'stop' for a STOP/STOP_LIMIT child, 'target' for a limit child."""
+    t = str(raw.get("orderType", "")).upper()
+    if t in ("STOP", "STOP_LIMIT", "TRAILING_STOP", "TRAILING_STOP_LIMIT"):
+        return "stop"
+    if t in ("NET_DEBIT", "NET_CREDIT", "NET_ZERO", "LIMIT", "MARKET"):
+        return "target"
+    return None
+
+
 def next_close_price(price: float, step: float, root: str | None) -> float:
     """The next, higher limit for a close that did not fill: price + step, snapped for SPX/SPXW -- and always at
     least one tick above the last price, so a step smaller than the grid still escalates (0.80 + 0.03 -> 0.85)."""
@@ -139,6 +159,11 @@ _OCC_RE = re.compile(r"([A-Z.]{1,6})\s*(\d{6})([CP])(\d{8})")
 
 class BrokerError(Exception):
     pass
+
+
+class BrokerRejected(BrokerError):
+    """Schwab's validation refused the request outright (HTTP 4xx other than a rate limit or a timeout): it was never
+    accepted, so there is nothing to look for at the broker and nothing to re-send."""
 
 
 class SchwabAuthError(BrokerError):
@@ -249,6 +274,7 @@ class _CallableLog:
 class SchwabBroker:
     name = "schwab"
     is_paper = False
+    supports_resting_exits = True        # 2026-11-06: place_oco_close -- the exit rests at Schwab as an OCO
     _forced_dry_run_warned = False
 
     occ_symbol = staticmethod(occ_symbol)
@@ -294,6 +320,7 @@ class SchwabBroker:
 
         self.risk_free_rate = float(self._cfg("RISK_FREE_RATE", 0.04))
         self.close_slippage = float(self._cfg("CLOSE_SLIPPAGE", 0.05))
+        self._oco_supported: bool | None = None      # 2026-11-06: None until Schwab's preview has judged the OCO form once
         self.close_retry_sec = float(self._cfg("CLOSE_RETRY_SEC", 10.0))
         self.close_max_retries = int(self._cfg("CLOSE_MAX_RETRIES", 5))
         self.account_index = int(self._cfg("SCHWAB_ACCOUNT_INDEX", os.getenv("SCHWAB_ACCOUNT_INDEX", 0)))
@@ -455,7 +482,8 @@ class SchwabBroker:
                 self._sleep(0.5 * (2 ** attempt))
                 continue
             if resp.is_error and resp.status_code not in allow:
-                raise BrokerError(f"Schwab {name} failed: HTTP {resp.status_code} {resp.text[:400]}")
+                definite = 400 <= resp.status_code < 500 and resp.status_code not in (408, 429)
+                raise (BrokerRejected if definite else BrokerError)(f"Schwab {name} failed: HTTP {resp.status_code} {resp.text[:400]}")
             self._auth_dead_until = 0.0
             return resp
         raise BrokerError(f"Schwab {name} failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}")
@@ -795,6 +823,8 @@ class SchwabBroker:
         return "buy" if instruction.upper().startswith("BUY") else "sell"
 
     def _normalize_order(self, raw: dict) -> dict:
+        if raw.get("childOrderStrategies"):
+            return self._normalize_oco(raw)
         raw_status = str(raw.get("status", "")).upper()
         status = _STATUS_MAP.get(raw_status, "unknown")
         qty = int(round(_f(raw.get("quantity"), 0.0)))
@@ -876,13 +906,67 @@ class SchwabBroker:
             "raw": raw,
         }
 
-    def get_open_orders(self) -> list[dict]:
+    def _normalize_oco(self, raw: dict) -> dict:
+        """An OCO (one-cancels-other) parent as one order: its children normalised (each tagged with its exit_role and
+        oco_parent_id), the parent's status derived from them -- filled as soon as either child has a fill, rejected
+        when both are, canceled when both are dead -- and the fill (if any) carried at the top level."""
+        parent_id = str(raw.get("orderId", ""))
+        children = []
+        for c in raw.get("childOrderStrategies") or []:
+            child = self._normalize_order(c)
+            child["exit_role"] = exit_role(c)
+            child["oco_parent_id"] = parent_id
+            children.append(child)
+        filled = next((c for c in children if c["status"] == "filled" or int(c.get("filled_qty") or 0) > 0), None)
+        statuses = [c["status"] for c in children]
+        if filled is not None:
+            status = "filled" if filled["status"] == "filled" else "partially_filled"
+        elif children and any(s == "rejected" for s in statuses):
+            status = "rejected"              # one refused child is a refused OCO: the other child never protects the whole spread
+        elif children and all(s in TERMINAL_STATUSES for s in statuses):
+            status = "canceled" if "canceled" in statuses else statuses[0]
+        else:
+            status = _STATUS_MAP.get(str(raw.get("status", "")).upper(), "new")
+        why = raw.get("statusDescription") or next((c.get("status_description") for c in children
+                                                   if c.get("status_description") and c["status"] == "rejected"), None) \
+            or next((c.get("status_description") for c in children if c.get("status_description")), None)
+        first = children[0] if children else {}
+        return {
+            "id": parent_id,
+            "status": status,
+            "status_description": why,
+            "symbol": first.get("symbol", ""),
+            "order_class": "oco",
+            "side": None,
+            "qty": int(first.get("qty") or 0),
+            "filled_qty": int((filled or {}).get("filled_qty") or 0),
+            "limit_price": None,
+            "filled_avg_price": (filled or {}).get("filled_avg_price"),
+            "time_in_force": first.get("time_in_force", "day"),
+            "legs": list(first.get("legs") or []),
+            "children": children,
+            "submitted_at": _to_et(raw.get("enteredTime")) or first.get("submitted_at") or datetime.now(ET),
+            "filled_at": (filled or {}).get("filled_at"),
+            "raw": raw,
+        }
+
+    def _orders_since(self, since: timedelta) -> list[dict]:
+        """Every order entered within `since`, normalised; an OCO parent is flattened into its children (each with
+        oco_parent_id) so the legs can be read and the whole OCO cancelled through its parent."""
         client = self._get_client()
         now_utc = datetime.now(timezone.utc)
         resp = self._request(client.get_orders_for_account, self._hash(),
-                             from_entered_datetime=now_utc - timedelta(days=59),
-                             to_entered_datetime=now_utc)
-        orders = [self._normalize_order(o) for o in self._json(resp) or []]
+                             from_entered_datetime=now_utc - since, to_entered_datetime=now_utc)
+        orders: list[dict] = []
+        for raw in self._json(resp) or []:
+            if raw.get("childOrderStrategies"):
+                orders.extend(self._normalize_oco(raw)["children"])
+            else:
+                orders.append(self._normalize_order(raw))
+        return orders
+
+    def get_open_orders(self) -> list[dict]:
+        orders = self._orders_since(timedelta(days=59))
         return [o for o in orders if o["status"] not in TERMINAL_STATUSES and o["status"] != "unknown"]
 
     def get_order(self, order_id: str) -> dict | None:
@@ -943,6 +1027,20 @@ class SchwabBroker:
 
     def _synthetic_order(self, order_json: dict, underlying: str, time_in_force: str,
                          order_id: str, status: str) -> dict:
+        if order_json.get("childOrderStrategies"):
+            children = []
+            for i, c in enumerate(order_json["childOrderStrategies"], start=1):
+                child = self._synthetic_order(c, underlying, time_in_force, f"{order_id}-{i}", status)
+                child["exit_role"] = exit_role(c)
+                child["oco_parent_id"] = order_id
+                children.append(child)
+            first = children[0] if children else {}
+            return {
+                "id": order_id, "status": status, "status_description": None, "symbol": underlying, "order_class": "oco",
+                "side": None, "qty": int(first.get("qty") or 0), "filled_qty": 0, "limit_price": None, "filled_avg_price": None,
+                "time_in_force": time_in_force.lower(), "legs": list(first.get("legs") or []), "children": children,
+                "submitted_at": datetime.now(ET), "filled_at": None, "raw": order_json,
+            }
         leg_specs = order_json.get("orderLegCollection") or []
         qty = int(leg_specs[0]["quantity"]) if leg_specs else 0
         legs = [{
@@ -976,6 +1074,8 @@ class SchwabBroker:
         self.log.info("[DRY-RUN] %s would send: %s", label, json.dumps(order_json))
         order = self._synthetic_order(order_json, underlying, time_in_force, f"DRY-{uuid.uuid4()}", "dry_run")
         self._dry_orders[order["id"]] = order
+        for child in order.get("children") or []:
+            self._dry_orders[child["id"]] = child
         return order
 
     @staticmethod
@@ -990,14 +1090,17 @@ class SchwabBroker:
         client = self._get_client()
         account_hash = self._hash()                      # refuses (BrokerError) unless a selected, still-linked account: nothing is sent then
         self.log.warning("[LIVE] %s sending: %s", label, json.dumps(order_json), extra={"keep": True})
+        sent_at = datetime.now(timezone.utc)
         try:
             # never blind-retry an order: a timeout or 5xx can follow an order Schwab DID accept, and a second POST would open a second position
             resp = self._request(client.place_order, account_hash, order_json, attempts=1)
         except SchwabAuthError:
             raise
+        except BrokerRejected:
+            raise                                        # refused by validation: it never existed at Schwab
         except BrokerError as exc:
             try:
-                found = self._matching_working_order(order_json)
+                found = self._matching_working_order(order_json, sent_at)
             except BrokerError as exc2:
                 raise BrokerError(f"{label} may or may not have reached Schwab and was NOT re-sent ({exc}); looking for the resting order failed "
                                   f"too ({exc2}): check the account before restarting") from exc
@@ -1017,14 +1120,31 @@ class SchwabBroker:
             order = self._synthetic_order(order_json, underlying, time_in_force, order_id, "accepted")
         return order
 
-    def _matching_working_order(self, order_json: dict) -> dict | None:
-        """A resting order with exactly the legs, instructions, quantity and price of order_json (after place_order failed ambiguously), else None."""
-        wanted = sorted((leg["instruction"].lower(), to_occ(leg["instrument"]["symbol"])) for leg in order_json["orderLegCollection"])
-        qty = int(order_json["orderLegCollection"][0]["quantity"])
-        price = float(order_json["price"])
-        for order in self.get_open_orders():
+    def _matching_working_order(self, order_json: dict, sent_at: datetime | None = None) -> dict | None:
+        """The order Schwab holds for order_json after place_order failed ambiguously (a timeout, a 5xx): the NEWEST order
+        of the last few minutes with exactly its legs, instructions, quantity and price, whatever its status -- it may well
+        have filled already (2026-11-06; it used to look at resting orders only, so a close that filled before the lost reply
+        was booked as a hand close at the mark). For an OCO the match is on its first child and the parent is returned."""
+        spec = (order_json.get("childOrderStrategies") or [order_json])[0]
+        wanted = sorted((leg["instruction"].lower(), to_occ(leg["instrument"]["symbol"])) for leg in spec["orderLegCollection"])
+        qty = int(spec["orderLegCollection"][0]["quantity"])
+        price = float(spec["price"])
+        floor_time = (sent_at - timedelta(seconds=10)).astimezone(ET) if sent_at is not None else None   # only what was entered after the POST
+        recent = sorted(self._orders_since(timedelta(minutes=15)), key=lambda o: o.get("submitted_at") or datetime.min.replace(tzinfo=ET),
+                        reverse=True)
+        for order in recent:
+            entered = order.get("submitted_at")
+            if floor_time is not None and isinstance(entered, datetime) and entered < floor_time:
+                continue
+            if order.get("status") == "unknown":
+                continue
+            if order.get("oco_parent_id") and not order_json.get("childOrderStrategies"):
+                continue                     # a resting exit's child is never the close this bot just sent
             got = sorted((str(leg.get("position_intent", "")).lower(), leg["symbol"]) for leg in order.get("legs") or [])
             if got == wanted and int(order.get("qty") or 0) == qty and abs(float(order.get("limit_price") or 0.0) - price) < 0.005:
+                parent = order.get("oco_parent_id")
+                if parent:
+                    return self.get_order(parent) or order
                 return order
         return None
 
@@ -1059,6 +1179,96 @@ class SchwabBroker:
         label = f"place_close_spread({client_tag or und} {short_sym}/{long_sym} x{qty} @ {limit_debit:.2f})"
         return self._submit(order_json, und, time_in_force, label)
 
+    def place_oco_close(self, underlying: str, expiration: date, right: str, short_strike: float, long_strike: float,
+                        qty: int, target_debit: float, stop_price: float, stop_limit: float, time_in_force: str = "day",
+                        root: str | None = None, client_tag: str | None = None) -> dict:
+        """ONE OCO at Schwab that closes the spread either way: a NET_DEBIT limit at target_debit, or a STOP_LIMIT that
+        triggers when the spread's price reaches stop_price and then works a limit at stop_limit (both children buy the
+        short leg back and sell the long leg). SPX/SPXW prices sit on the $0.05 grid: the target and the stop are snapped
+        down, the stop's limit up (never at or below the stop). Nothing is clamped: it closes what the strategy holds."""
+        und, short_sym, long_sym = self._spread_legs(underlying, expiration, right, short_strike, long_strike, root)
+        r = (root or _strip_index(underlying) or underlying).upper()
+        legs = [("BUY_TO_CLOSE", short_sym), ("SELL_TO_CLOSE", long_sym)]
+        target = self._vertical_json("NET_DEBIT", target_debit, time_in_force, qty, legs)
+        stop_at = snap_spx_price(stop_price, r)
+        limit = snap_spx_price_up(stop_limit, r)
+        if limit <= stop_at:
+            limit = round(stop_at + (SPX_PRICE_TICK if is_spx_root(r) else 0.01), 2)
+        stop = self._vertical_json("STOP_LIMIT", limit, time_in_force, qty, legs)
+        stop["stopPrice"] = f"{stop_at:.2f}"
+        stop_type = str(self._cfg("RESTING_STOP_TYPE", "") or "").strip().upper()
+        if stop_type:
+            stop["stopType"] = stop_type
+        order_json = {"orderStrategyType": "OCO", "childOrderStrategies": [target, stop]}
+        label = (f"place_oco_close({client_tag or und} {short_sym}/{long_sym} x{qty} target {target['price']} "
+                 f"stop {stop_at:.2f} limit {stop['price']})")
+        mode = str(self._cfg("RESTING_EXIT_MODE", "oco") or "oco").strip().lower()
+        if mode == "oco" and self.dry_run:
+            return dict(self._submit(order_json, und, time_in_force, label), exit_mode="oco")
+        if mode == "oco" and self._oco_supported is not False:
+            if self._oco_supported is None:
+                self._oco_supported = self._oco_form_accepted(order_json)
+            if self._oco_supported:
+                try:
+                    order = self._submit(order_json, und, time_in_force, label)
+                except BrokerRejected as exc:
+                    self._oco_supported = False
+                    self.log.error("Schwab refused the OCO (%s): from now on the profit target alone rests at Schwab and the stop "
+                                   "stays with the bot", exc, extra={"keep": True})
+                else:
+                    if order.get("status") != "rejected":
+                        return dict(order, exit_mode="oco")
+                    self._oco_supported = False
+                    why = order.get("status_description")
+                    self.log.error("Schwab rejected the OCO %s%s: from now on the profit target alone rests at Schwab and the stop "
+                                   "stays with the bot", order.get("id"), f" -- Schwab says: {why}" if why else "", extra={"keep": True})
+                    for leftover in [order.get("id")] + [c.get("id") for c in order.get("children") or []
+                                                          if c.get("status") not in TERMINAL_STATUSES]:
+                        try:
+                            self.cancel_order(str(leftover))
+                        except BrokerError as exc:
+                            self.log.error("could not cancel the leftover %s of the rejected OCO: %s", leftover, exc, extra={"keep": True})
+        order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike, qty, target_debit,
+                                        time_in_force=time_in_force, root=root,
+                                        client_tag=f"{client_tag or 'resting'}-target")
+        return self._as_resting_target(order)
+
+    @staticmethod
+    def _as_resting_target(order: dict) -> dict:
+        """A plain resting profit-target order in the shape the position manager reads an OCO in: one child, the target."""
+        return dict(order, exit_mode="target", children=[dict(order, exit_role="target", oco_parent_id=None)])
+
+    def _oco_form_accepted(self, order_json: dict) -> bool:
+        """Ask Schwab's previewOrder whether it takes this OCO (a spread target + a spread stop-limit). False when the preview
+        refuses it (HTTP 4xx) or reports rejects; True when it passes -- or when the preview itself cannot be reached, in
+        which case the real order decides."""
+        client = self._get_client()
+        preview = getattr(client, "preview_order", None)
+        if preview is None:                          # a client without previewOrder: the real order decides
+            return True
+        try:
+            resp = self._request(preview, self._hash(), order_json, attempts=1)
+        except BrokerRejected as exc:
+            self.log.error("Schwab's preview refused the OCO form (%s): the profit target alone will rest at Schwab and the stop stays "
+                           "with the bot", exc, extra={"keep": True})
+            return False
+        except BrokerError as exc:
+            self.log.warning("could not preview the OCO (%s): the real order decides", exc, extra={"keep": True})
+            return True
+        try:
+            body = resp.json() if resp.content else {}
+        except ValueError:
+            body = {}
+        result = (body or {}).get("orderValidationResult") or {}
+        rejects = result.get("rejects") or []
+        if rejects:
+            why = "; ".join(str(r.get("activityMessage") or r.get("message") or r) for r in rejects)[:400]
+            self.log.error("Schwab's preview rejects the OCO form (%s): the profit target alone will rest at Schwab and the stop stays "
+                           "with the bot", why, extra={"keep": True})
+            return False
+        self.log.info("Schwab's preview accepts the OCO form", extra={"keep": True})
+        return True
+
     def _spread_close_ask(self, underlying: str, expiration: date, right: str, short_strike: float,
                           long_strike: float, root: str | None) -> float:
         lo, hi = sorted((short_strike, long_strike))
@@ -1082,10 +1292,22 @@ class SchwabBroker:
                                         time_in_force=time_in_force, root=root, client_tag=tag)
         if self.dry_run:
             return order
+        fills: list[tuple[int, float]] = []          # (qty, price) of every contract filled under the orders worked so far
+
+        def booked(final: dict, include_final: bool = True) -> dict:
+            """`final` with filled_qty / filled_avg_price covering every order of this close, not only the last one."""
+            done = list(fills)
+            if include_final and final.get("filled_avg_price") is not None and int(final.get("filled_qty") or 0) > 0:
+                done.append((int(final["filled_qty"]), float(final["filled_avg_price"])))
+            total = sum(q for q, _ in done)
+            if total <= 0:
+                return final
+            return dict(final, filled_qty=total, filled_avg_price=round(sum(q * px for q, px in done) / total, 4), fills=done)
+
         for attempt in range(self.close_max_retries + 1):
             order = self.wait_for_fill(order["id"], self.close_retry_sec, poll_sec=min(2.0, self.close_retry_sec))
             if order["status"] == "filled":
-                return order
+                return booked(order)
             if order["status"] in TERMINAL_STATUSES:
                 why = order.get("status_description")
                 raise BrokerError(f"close order {order['id']} ended {order['status']} without fill"
@@ -1095,10 +1317,17 @@ class SchwabBroker:
             self.cancel_order(order["id"])
             latest = self.wait_for_fill(order["id"], 5.0, poll_sec=1.0)
             if latest["status"] == "filled":
-                return latest
-            remaining = qty - latest["filled_qty"]
+                return booked(latest)
+            if int(latest.get("filled_qty") or 0) > 0:
+                px = latest.get("filled_avg_price")
+                if px is None:                       # the contracts are gone either way: count them, price them at the limit they were worked at
+                    px = latest.get("limit_price") if latest.get("limit_price") is not None else price
+                    self.log.warning("close_spread_at_market: %d contract(s) filled under %s without a fill price; booked at the limit %.2f",
+                                     int(latest["filled_qty"]), latest["id"], float(px), extra={"keep": True})
+                fills.append((int(latest["filled_qty"]), float(px)))
+            remaining = qty - sum(q for q, _ in fills)
             if remaining <= 0:
-                return latest
+                return booked(latest, include_final=False)
             price = next_close_price(price, self.close_slippage, r)
             self.log.warning("close_spread_at_market retry %d/%d at %.2f", attempt + 1,
                              self.close_max_retries, price, extra={"keep": True})

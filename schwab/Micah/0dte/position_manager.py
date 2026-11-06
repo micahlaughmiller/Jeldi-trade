@@ -90,6 +90,16 @@ class OpenSpread:
     # prior tick (prev_price) was taken -- the staleness watchdog and the official-exit-price age limit read these
     last_mark_at: datetime | None = None
     prev_price_at: datetime | None = None
+    # 2026-11-06: the resting exit -- the OCO (profit-target limit + stop-limit) this bot placed at the broker for this spread
+    oco_id: str | None = None               # the OCO's own order id at the broker; None = the exits are script-managed
+    oco_target_id: str | None = None
+    oco_stop_id: str | None = None
+    oco_target_price: float | None = None
+    oco_stop_price: float | None = None
+    oco_limit_price: float | None = None
+    oco_attempts: int = 0                   # OCOs placed for this spread (one that dies without a fill is re-placed once)
+    oco_cancel_requested: bool = False      # this bot asked the broker to cancel the resting exit (a late CANCELED is not a loss)
+    oco_booked_qty: int = 0                 # contracts of the resting exit's fill already booked (a partial fill is booked once)
 
     @property
     def remaining(self) -> int:
@@ -221,6 +231,8 @@ class PositionManager:
         self._hold_logged: datetime | None = None
         self._latch_logged: dict[str, datetime] = {}
 
+        self._oco_checked: dict[str, datetime] = {}      # 2026-11-06: when each resting OCO was last read
+        self._oco_unresolved: dict[str, datetime] = {}   # gone spreads whose resting order could not be read yet (first noticed)
     def open(self, spread: OpenSpread) -> str:
         key = self._store(spread)
         log.info("POSITION OPEN [%s] %s %s %dx %s %s/%s credit %.2f stop %.2f target %.2f",
@@ -228,6 +240,14 @@ class PositionManager:
                  spread.short_strike, spread.long_strike, spread.entry_credit,
                  spread.stop_price, spread.target_price)
         self.journal.event("ENTRY", spread.entry_time, strategy=spread.strategy, position=spread.to_dict())
+        if self.resting_exits_enabled(spread):
+            try:
+                self.place_resting_exit(spread, spread.entry_time)
+            except Exception as e:      # noqa: BLE001 -- the entry is booked; a surprise here must not unwind it
+                log.critical("[%s] placing the resting exit raised %s: %s -- the exits stay script-managed", key,
+                             type(e).__name__, e, extra={"keep": True})
+                self.journal.event("RESTING_EXIT_FAILED", spread.entry_time, strategy=spread.strategy, key=key,
+                                   error=f"{type(e).__name__}: {e}")
         return key
 
     def _store(self, spread: OpenSpread) -> str:
@@ -243,6 +263,281 @@ class PositionManager:
             key = tracked_as
         self.positions[key] = spread
         return key
+
+    # ----------------------------------------------- resting exits at the broker (2026-11-06)
+    # Right after an entry fills, the bot places ONE OCO at the broker that closes the spread either way: a profit-target
+    # limit (buy to close at target_price) or a stop-limit (triggers at stop_price, works a limit a buffer above it). The exit
+    # then sits at the broker ready to execute even if this script is slow or down. The script's own exit rules keep running:
+    # before any close of its own it cancels the OCO (a child that filled meanwhile is booked instead, never doubled).
+
+    def resting_exits_enabled(self, p: OpenSpread | None = None) -> bool:
+        """True when this folder asks for exits resting at the broker (config.RESTING_EXITS) and the broker can hold an OCO
+        for a spread (Schwab live / dry-run; never the simulator or Alpaca). Stock spreads (F) only when
+        RESTING_EXITS_FOR_STOCKS: their targets sit inside the quote noise, and penny prices are refused on some names."""
+        if not (bool(getattr(config, "RESTING_EXITS", False)) and bool(getattr(self.broker, "supports_resting_exits", False))):
+            return False
+        if p is not None and p.strategy in config.STOCK_STRATEGIES:
+            return bool(getattr(config, "RESTING_EXITS_FOR_STOCKS", False))
+        return True
+
+    def resting_stop_limit(self, p: OpenSpread) -> float:
+        """The stop child's limit: the stop plus RESTING_STOP_LIMIT_PCT_OF_WIDTH of the width (at least one cent). The broker
+        snaps SPX prices to its $0.05 grid -- this limit upward."""
+        pct = float(getattr(config, "RESTING_STOP_LIMIT_PCT_OF_WIDTH", 0.03))
+        return round(p.stop_price + max(0.01, round(pct * float(p.width), 2)), 2)
+
+    def place_resting_exit(self, p: OpenSpread, now: datetime) -> bool:
+        """Place the OCO that closes this spread at the broker. On any failure the exits stay script-managed, exactly as
+        before, and the failure is logged with the broker's reason."""
+        key = self.key_of(p)
+        target, stop, limit = p.target_price, p.stop_price, self.resting_stop_limit(p)
+        p.oco_attempts += 1
+        try:
+            order = self.broker.place_oco_close(p.underlying, p.expiration, p.right, p.short_strike, p.long_strike,
+                                                p.remaining, target, stop, limit, time_in_force="day", root=p.root,
+                                                client_tag=f"oco-{key.lower()}")
+        except BrokerError as e:
+            log.error("[%s] RESTING_EXIT_FAILED (the exits stay script-managed): %s", key, e, extra={"keep": True})
+            self.journal.event("RESTING_EXIT_FAILED", now, strategy=p.strategy, key=key, error=str(e),
+                               target=target, stop=stop, limit=limit, attempt=p.oco_attempts)
+            return False
+        if order.get("status") in ("rejected", "canceled", "expired"):
+            why = order.get("status_description")
+            log.error("[%s] RESTING_EXIT_FAILED: OCO %s ended %s%s (the exits stay script-managed)", key, order.get("id"),
+                      order.get("status"), f" -- Schwab says: {why}" if why else "", extra={"keep": True})
+            self.journal.event("RESTING_EXIT_FAILED", now, strategy=p.strategy, key=key, oco_id=order.get("id"),
+                               status=order.get("status"), error=why, target=target, stop=stop, limit=limit,
+                               attempt=p.oco_attempts)
+            return False
+        children = order.get("children") or []
+        mode = order.get("exit_mode") or ("oco" if len(children) > 1 else "target")
+        p.oco_id = str(order["id"])
+        p.oco_target_id = next((str(c["id"]) for c in children if c.get("exit_role") == "target"), None)
+        p.oco_stop_id = next((str(c["id"]) for c in children if c.get("exit_role") == "stop"), None)
+        p.oco_target_price, p.oco_stop_price, p.oco_limit_price = target, stop, limit
+        self._oco_checked[key] = now
+        if mode == "oco":
+            log.warning("[%s] RESTING EXIT at the broker: OCO %s (%s) -- buy to close %d at %.2f (target), or stop %.2f limit %.2f",
+                        key, p.oco_id, order.get("status"), p.remaining, target, stop, limit, extra={"keep": True})
+        else:
+            log.warning("[%s] RESTING EXIT at the broker: profit target %s (%s) -- buy to close %d at %.2f; the stop %.2f stays "
+                        "with the bot", key, p.oco_id, order.get("status"), p.remaining, target, stop, extra={"keep": True})
+        self.journal.event("RESTING_EXIT_PLACED", now, strategy=p.strategy, key=key, oco_id=p.oco_id, mode=mode,
+                           target_id=p.oco_target_id, stop_id=p.oco_stop_id, target=target, stop=stop, limit=limit,
+                           qty=p.remaining, status=order.get("status"), attempt=p.oco_attempts)
+        return True
+
+    def resting_order_ids(self) -> set[str]:
+        """Every order id that is a tracked position's resting exit (parent and children)."""
+        ids: set[str] = set()
+        for p in self.positions.values():
+            ids.update(str(i) for i in (p.oco_id, p.oco_target_id, p.oco_stop_id) if i)
+        return ids
+
+    @staticmethod
+    def _clear_oco(p: OpenSpread) -> None:
+        p.oco_id = p.oco_target_id = p.oco_stop_id = None
+        p.oco_cancel_requested = False
+        p.oco_booked_qty = 0
+
+    @staticmethod
+    def _filled_child(order: dict | None) -> dict | None:
+        """The OCO child that filled (fully or in part), else None."""
+        for child in (order or {}).get("children") or []:
+            if child.get("status") == "filled" or int(child.get("filled_qty") or 0) > 0:
+                return child
+        return None
+
+    _OCO_DEAD = ("canceled", "rejected", "expired", "replaced")
+    _OCO_LIVE = ("new", "accepted", "pending", "partially_filled")
+
+    @classmethod
+    def _resting_live(cls, order: dict | None) -> bool:
+        """True while any child of the resting order (or the order itself) can still fill."""
+        if not order:
+            return False
+        children = order.get("children") or [order]
+        return any(c.get("status") in cls._OCO_LIVE for c in children)
+
+    def _read_resting(self, p: OpenSpread) -> dict | None:
+        """The OCO's current state: the parent order, or -- when the broker does not serve the parent by id -- the state
+        rebuilt from its two children. None when nothing can be read."""
+        order = self.broker.get_order(p.oco_id)
+        if order is not None and "children" not in order:        # a plain resting target: it is its own (only) child
+            order = dict(order, children=[dict(order, exit_role="target")])
+        if order is not None or not (p.oco_target_id or p.oco_stop_id):
+            return order
+        children = []
+        for cid in (p.oco_target_id, p.oco_stop_id):
+            child = self.broker.get_order(cid) if cid else None
+            if child is not None:
+                child.setdefault("exit_role", "target" if str(cid) == str(p.oco_target_id) else "stop")
+                children.append(child)
+        if not children:
+            return None
+        if any(c.get("status") == "filled" or int(c.get("filled_qty") or 0) > 0 for c in children):
+            status = "filled"
+        elif all(c.get("status") in self._OCO_DEAD for c in children):
+            status = "canceled"
+        else:
+            status = "new"
+        return {"id": p.oco_id, "status": status, "children": children}
+
+    def check_resting_exits(self, now: datetime, force: bool = False) -> list[dict]:
+        """Read each resting OCO every RESTING_EXIT_POLL_SEC: a filled child is booked at its real fill (before the external
+        sync could mistake the closed spread for a hand close); an OCO that died without a fill is re-placed once, after that
+        the exits are script-managed."""
+        rows: list[dict] = []
+        poll = float(getattr(config, "RESTING_EXIT_POLL_SEC", 3))
+        for key, p in list(self.positions.items()):
+            if not p.oco_id:
+                continue
+            last = self._oco_checked.get(key)
+            if not force and last is not None and (now - last).total_seconds() < poll:
+                continue
+            self._oco_checked[key] = now
+            try:
+                order = self._read_resting(p)
+            except BrokerError as e:
+                log.error("[%s] could not read the resting OCO %s: %s", key, p.oco_id, e)
+                continue
+            rows += self._settle_resting(p, order, now)
+        return rows
+
+    def _settle_resting(self, p: OpenSpread, order: dict | None, now: datetime) -> list[dict]:
+        key = self.key_of(p)
+        filled = self._filled_child(order)
+        if filled is not None:
+            rows = self._book_resting_fill(p, filled, now)
+            if rows or key not in self.positions or self._resting_live(order):
+                return rows
+        if order is None:
+            log.error("[%s] the resting OCO %s cannot be read at the broker (kept; read again next poll)", key, p.oco_id)
+            return []
+        status = order.get("status")
+        if filled is not None and not self._resting_live(order):
+            status = "canceled"                                    # the rest of a partly filled resting order is dead
+        if status in self._OCO_DEAD and p.oco_cancel_requested:
+            log.warning("[%s] the resting OCO %s is %s as this bot asked: its close goes ahead on the next tick", key, p.oco_id, status,
+                        extra={"keep": True})
+            self.journal.event("RESTING_EXIT_CANCELLED", now, strategy=p.strategy, key=key, oco_id=p.oco_id, reason="late confirm")
+            self._clear_oco(p)
+            return []
+        if status in self._OCO_DEAD:
+            why = order.get("status_description")
+            again = p.oco_attempts < int(getattr(config, "RESTING_EXIT_MAX_ATTEMPTS", 2))
+            log.error("[%s] the resting OCO %s is %s without a fill%s: %s", key, p.oco_id, status,
+                      f" -- Schwab says: {why}" if why else "",
+                      "placing a new one" if again else "the exits are script-managed now", extra={"keep": True})
+            self.journal.event("RESTING_EXIT_LOST", now, strategy=p.strategy, key=key, oco_id=p.oco_id, status=status,
+                               error=why, replaced=again)
+            self._clear_oco(p)
+            if again:
+                self.place_resting_exit(p, now)
+        return []
+
+    def _book_resting_fill(self, p: OpenSpread, child: dict, now: datetime) -> list[dict]:
+        """Book the contracts an OCO child closed, at the broker's fill, as OCO_TARGET or OCO_STOP."""
+        key = self.key_of(p)
+        filled_qty = int(child.get("filled_qty") or 0) or (p.remaining + p.oco_booked_qty)   # a "filled" child without a count: all of it
+        qty = min(filled_qty - p.oco_booked_qty, p.remaining)
+        if qty <= 0:
+            return []                                              # this fill was booked already
+        p.oco_booked_qty += qty
+        price = child.get("filled_avg_price")
+        if price is None:
+            price = child.get("limit_price")
+        exit_price = round(float(price), 2) if price is not None else round(p.current_price, 2)
+        reason = "OCO_TARGET" if child.get("exit_role") == "target" else "OCO_STOP"
+        oco_id = p.oco_id
+        filled_at = child.get("filled_at")
+        when = filled_at if isinstance(filled_at, datetime) and filled_at <= now else now   # the fill's own time when Schwab gives it
+        p.close_fail_count = 0
+        p.close_blocked_until = None
+        rows = self._book_fill(p, key, qty, reason, when, round(p.current_price, 2), exit_price)
+        for row in rows:
+            row["oco_id"] = oco_id
+        self._oco_unresolved.pop(key, None)
+        if key in self.positions and p.remaining > 0:
+            # a partial fill: the OCO keeps working for the remainder at the broker, so it stays tracked and is still cancelled
+            # before any close of this bot's own
+            log.warning("[%s] the resting exit closed %d, %d still rest at the broker", key, qty, p.remaining, extra={"keep": True})
+        else:
+            self._clear_oco(p)
+            self._oco_checked.pop(key, None)
+        return rows
+
+    def _resting_outcome(self, p: OpenSpread, now: datetime) -> tuple[list[dict], bool]:
+        """Before booking a spread that left the broker as a hand close: (rows, settled). A resting order that filled is
+        booked (rows); one that is dead without a fill is settled (the spread really was closed by hand); one that cannot be
+        read, or still reads live, is not settled -- Schwab may simply not show the fill yet."""
+        try:
+            order = self._read_resting(p)
+        except BrokerError as e:
+            log.error("[%s] could not read the resting OCO %s before booking an external close: %s", self.key_of(p),
+                      p.oco_id, e)
+            return [], False
+        filled = self._filled_child(order)
+        if filled is not None:
+            rows = self._book_resting_fill(p, filled, now)
+            if rows:
+                return rows, True
+        return [], order is not None and not self._resting_live(order)
+
+    def _release_resting(self, p: OpenSpread, now: datetime, reason: str, force: bool = False) -> tuple[list[dict], bool]:
+        """Cancel the resting OCO before this bot sends a close of its own. Returns (rows, done): done=True means nothing
+        more may be sent this pass -- the OCO filled meanwhile (booked in rows), or its state is not settled, and an exit
+        that may still fill is never doubled. The exit rule fires again on the next tick and tries once more."""
+        key = self.key_of(p)
+        oco_id = p.oco_id
+        known = True
+        cancel_error: BrokerError | None = None
+        p.oco_cancel_requested = True
+        try:
+            known = self.broker.cancel_order(oco_id)
+            if not known:                      # the broker does not know the parent id: cancel the children themselves
+                for cid in (p.oco_target_id, p.oco_stop_id):
+                    if cid:
+                        self.broker.cancel_order(cid)
+        except BrokerError as e:
+            cancel_error = e                   # a cancel of an order that already filled or died can be refused: the state decides
+            log.error("[%s] cancel of the resting OCO %s refused (%s): reading its state before the %s close", key, oco_id, e,
+                      reason, extra={"keep": True})
+        wait = float(getattr(config, "RESTING_EXIT_CANCEL_WAIT_FORCE_SEC", 20)) if force \
+            else float(getattr(config, "RESTING_EXIT_CANCEL_WAIT_SEC", 5))
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                order = self._read_resting(p)
+            except BrokerError as e:
+                log.error("[%s] the resting OCO %s could not be read after the cancel (%s): the %s close waits", key, oco_id,
+                          e, reason, extra={"keep": True})
+                return [], True
+            filled = self._filled_child(order)
+            if filled is not None:
+                rows = self._book_resting_fill(p, filled, now)
+                if rows:
+                    log.warning("[%s] the resting OCO %s filled as it was cancelled: booking that fill, no %s close is sent",
+                                key, oco_id, reason, extra={"keep": True})
+                    return rows, True
+                if key not in self.positions:
+                    return [], True
+            settled = order is None or not self._resting_live(order)
+            if settled or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+        if not settled or (order is None and (known or cancel_error is not None)):
+            state = order.get("status") if order is not None else "unreadable"
+            log.error("[%s] the resting OCO %s is %s after the cancel: the %s close waits for it (next tick tries again)", key,
+                      oco_id, state, reason, extra={"keep": True})
+            if cancel_error is not None:
+                self.journal.event("RESTING_EXIT_CANCEL_FAILED", now, strategy=p.strategy, key=key, oco_id=oco_id,
+                                   error=str(cancel_error), state=state, reason=reason)
+            return [], True
+        self.journal.event("RESTING_EXIT_CANCELLED", now, strategy=p.strategy, key=key, oco_id=oco_id, reason=reason,
+                           cancel_error=str(cancel_error) if cancel_error is not None else None)
+        self._clear_oco(p)
+        return [], False
 
     def key_of(self, p: OpenSpread) -> str:
         return next((k for k, v in self.positions.items() if v is p), p.key)
@@ -839,6 +1134,21 @@ class PositionManager:
         """Book contracts that left the broker without this bot closing them (closed by hand). Their
         fill price is unknown, so the last accepted mark stands in; the row says external=True."""
         key = self.key_of(p)
+        if p.oco_id:
+            rows, settled = self._resting_outcome(p, now)
+            if rows:
+                return rows
+            if not settled:
+                first = self._oco_unresolved.setdefault(key, now)
+                grace = float(getattr(config, "RESTING_EXIT_UNRESOLVED_GRACE_SEC", 120))
+                if (now - first).total_seconds() < grace:
+                    log.warning("[%s] gone from the broker but its resting exit %s cannot be read as filled or dead yet: waiting "
+                                "(up to %.0fs) before booking it as a hand close", key, p.oco_id, grace)
+                    return []
+                log.error("[%s] resting exit %s still unreadable after %.0fs: booking the %s at the last mark", key, p.oco_id, grace,
+                          reason, extra={"keep": True})
+                self.journal.event("RESTING_EXIT_UNRESOLVED", now, strategy=p.strategy, key=key, oco_id=p.oco_id, reason=reason)
+            self._oco_unresolved.pop(key, None)
         qty = min(qty, p.remaining)
         if qty <= 0:
             return []
@@ -924,6 +1234,10 @@ class PositionManager:
                 log.warning("[%s] MANUAL_HOLD file present: NOT closing (%s) -- delete logs/%s to resume",
                             key, reason, config.MANUAL_HOLD_FILE, extra={"keep": True})
             return []
+        if p.oco_id:
+            rows, done = self._release_resting(p, now, reason, force=retry_latched)   # the hard stop / watchdog / Ctrl-C wait longer
+            if done:
+                return rows
         pre_rows: list[dict] = []
         order = None
         left = p.remaining - qty
@@ -993,6 +1307,13 @@ class PositionManager:
         exit_price = order.get("filled_avg_price") if order else None
         exit_price = float(exit_price) if exit_price is not None else spread_price
         fill_qty = p.remaining - left
+        return pre_rows + self._book_fill(p, key, fill_qty, reason, now, spread_price, exit_price)
+
+    def _book_fill(self, p: OpenSpread, key: str, fill_qty: int, reason: str, now: datetime, spread_price: float,
+                   exit_price: float) -> list[dict]:
+        """Book `fill_qty` contracts closed at `exit_price` (the broker's fill) against the `spread_price` that triggered the
+        exit: the official P/L (config.EXIT_PNL_BASIS), the prev-tick diagnostics, the row, the CLOSED line and the EXIT event.
+        Used by the bot's own closes and by a resting OCO's fill."""
         # 2026-09-30: diagnostic instrumentation for a live anomaly -- ASTRA's reported price jumped
         # from 5.21 to ~6.10 in the ONE TICK between reporting and exiting, too large a move for that
         # second's real underlying action. prev_price is current_price as of the PRIOR tick (captured
@@ -1019,7 +1340,12 @@ class PositionManager:
         # pnl_actual_fill) for comparison -- it's just no longer what the bot's own risk management
         # reacts to. This is a genuine, deliberate divergence from the broker's own account equity,
         # which still reflects the real fill; that gap is the whole point, not a bug.
-        realistic_exit_price = round(prev_price, 2) if prev_price is not None else round(spread_price, 2)
+        prev_tick_price = round(prev_price, 2) if prev_price is not None else round(spread_price, 2)
+        # 2026-11-06: config.EXIT_PNL_BASIS picks the official exit price: "fill" = the broker's actual fill (a LIVE
+        # account's real result), anything else = the prev-tick stand-in above (paper). realistic_exit_price in the row
+        # is always the price the official pnl was booked on; the fill itself is always exit_price / pnl_actual_fill.
+        pnl_basis = "fill" if str(getattr(config, "EXIT_PNL_BASIS", "prev_tick")).lower() == "fill" else "prev_tick"
+        realistic_exit_price = round(exit_price, 2) if pnl_basis == "fill" else prev_tick_price
         pnl = round((p.entry_credit - realistic_exit_price) * 100 * fill_qty, 2)
         pnl_actual_fill = round((p.entry_credit - exit_price) * 100 * fill_qty, 2)
         p.closed_qty += fill_qty
@@ -1034,10 +1360,10 @@ class PositionManager:
                              exit_slippage=exit_slippage, realistic_exit_price=realistic_exit_price,
                              prev_price=prev_price, prev_tick_pnl=prev_tick_pnl, prev_tick_jump=prev_tick_jump,
                              entry_slippage=entry_slippage)
-        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (OFFICIAL, realistic "
-                    "@%.2f) | actual broker fill would've booked %.2f | prev-tick %.2f (jump %+.2f, pnl "
+        log.warning("[%s] CLOSED %d @ %.2f (%s, trigger %.2f, slippage %+.2f) pnl %.2f (OFFICIAL, on the %s "
+                    "@%.2f) | actual broker fill books %.2f | prev-tick %.2f (jump %+.2f, pnl "
                     "would've been %.2f) | position realized %.2f, %d left",
-                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, realistic_exit_price,
+                    key, fill_qty, exit_price, reason, spread_price, exit_slippage, pnl, pnl_basis, realistic_exit_price,
                     pnl_actual_fill,
                     prev_price if prev_price is not None else float("nan"),
                     prev_tick_jump if prev_tick_jump is not None else float("nan"),
@@ -1046,7 +1372,7 @@ class PositionManager:
         self.journal.event("EXIT", now, **row)
         if p.remaining == 0:
             del self.positions[key]
-        return pre_rows + [row]
+        return [row]
 
     def _make_row(self, p: OpenSpread, key: str, now: datetime, fill_qty: int, reason: str, *, exit_price: float,
                   pnl: float, pnl_actual_fill: float, trigger_price: float, exit_slippage: float,

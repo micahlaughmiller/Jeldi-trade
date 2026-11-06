@@ -355,3 +355,11 @@ def test_a_force_close_waits_longer_for_the_cancel(pm, broker, monkeypatch):
     open_b_put_spread(pm, broker, qty=1, credit=1.00)
     pm.force_close(et(15, 30), {"B": 1.10})
     assert waits == [True]
+
+
+def test_at_the_hard_stop_a_dead_resting_order_is_not_replaced(pm, broker, journal):
+    p = open_b_put_spread(pm, broker, qty=1, credit=1.00)
+    broker.cancel_order(p.oco_id)                                             # the owner cancelled it in the app before the bell
+    assert pm.check_resting_exits(et(13, 0), force=True, replace=False) == []
+    assert p.oco_id is None and len(broker.oco_calls) == 1                   # retired, not placed again
+    assert events(journal, "RESTING_EXIT_LOST")[0]["replaced"] is False

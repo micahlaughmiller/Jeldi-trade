@@ -383,7 +383,7 @@ class PositionManager:
             status = "new"
         return {"id": p.oco_id, "status": status, "children": children}
 
-    def check_resting_exits(self, now: datetime, force: bool = False) -> list[dict]:
+    def check_resting_exits(self, now: datetime, force: bool = False, replace: bool = True) -> list[dict]:
         """Read each resting OCO every RESTING_EXIT_POLL_SEC: a filled child is booked at its real fill (before the external
         sync could mistake the closed spread for a hand close); an OCO that died without a fill is re-placed once, after that
         the exits are script-managed."""
@@ -401,10 +401,10 @@ class PositionManager:
             except BrokerError as e:
                 log.error("[%s] could not read the resting OCO %s: %s", key, p.oco_id, e)
                 continue
-            rows += self._settle_resting(p, order, now)
+            rows += self._settle_resting(p, order, now, replace=replace)
         return rows
 
-    def _settle_resting(self, p: OpenSpread, order: dict | None, now: datetime) -> list[dict]:
+    def _settle_resting(self, p: OpenSpread, order: dict | None, now: datetime, replace: bool = True) -> list[dict]:
         key = self.key_of(p)
         filled = self._filled_child(order)
         if filled is not None:
@@ -425,7 +425,7 @@ class PositionManager:
             return []
         if status in self._OCO_DEAD:
             why = order.get("status_description")
-            again = p.oco_attempts < int(getattr(config, "RESTING_EXIT_MAX_ATTEMPTS", 2))
+            again = replace and p.oco_attempts < int(getattr(config, "RESTING_EXIT_MAX_ATTEMPTS", 2))
             log.error("[%s] the resting OCO %s is %s without a fill%s: %s", key, p.oco_id, status,
                       f" -- Schwab says: {why}" if why else "",
                       "placing a new one" if again else "the exits are script-managed now", extra={"keep": True})

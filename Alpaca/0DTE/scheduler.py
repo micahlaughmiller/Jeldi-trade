@@ -1417,7 +1417,7 @@ class Bot:
         log.warning("FORCE CLOSE at %s: cancelling orders and closing everything.", now.strftime("%H:%M:%S"))
         cancelled = self.cancel_own_orders()
         log.info("Cancelled %d open orders.", cancelled)
-        resting = self.pm.check_resting_exits(now, force=True)   # 2026-11-06: a resting exit that filled at the bell is booked, not closed twice
+        resting = self.pm.check_resting_exits(now, force=True, replace=False)   # a resting exit that filled at the bell is booked, not closed twice; a dead one is not re-placed at the hard stop
         if resting:
             self.record_fills(resting)
         for attempt in range(1, config.CLOSE_MAX_RETRIES + 1):

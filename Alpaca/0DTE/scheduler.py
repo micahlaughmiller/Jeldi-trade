@@ -119,6 +119,7 @@ class Bot:
         self.once = once
         self.done = False
         self.broker = Broker(config, dry_run=dry_run, log=log.info)
+        market_data.set_token_path_provider(lambda: getattr(self.broker, "token_path", None))   # the feeds read the token the broker uses
         self.journal = Journal(LOG_DIR, config.TRADER_NAME)
         self.pm = PositionManager(self.broker, self.journal)
         self.risk: RiskManager | None = None
@@ -790,6 +791,7 @@ class Bot:
         if self.last_orb_candle is not None:
             candles = candles[candles.index > self.last_orb_candle]
         signal = None
+        late = None
         for t, candle in candles.iterrows():
             fired = self.orb_setup.update(candle)
             self.last_orb_candle = t.to_pydatetime()
@@ -800,7 +802,26 @@ class Bot:
             if t == candles.index[-1]:
                 signal = (fired, self.last_orb_candle, self.orb_setup.entry_kind)
             else:
-                log.info("Stale ORB %s signal on replayed candle %s ignored.", fired, t.strftime("%H:%M"))
+                late = (fired, t.to_pydatetime(), self.orb_setup.entry_kind)
+        if signal is None and late is not None:
+            # 2026-11-10: several candles arrived in one pass (the data feed stalled); a signal on an older one used to be dropped
+            # as stale while the setup was marked DONE as if entered -- the move was never traded. It is taken when it is recent
+            # (ORB_LATE_SIGNAL_MAX_MIN) and the newest candle has not closed back inside the range (the setup is still DONE).
+            fired, t, kind = late
+            max_age = timedelta(minutes=float(getattr(config, "ORB_LATE_SIGNAL_MAX_MIN", 10)))
+            interval = timedelta(minutes=int(str(config.ORB_CANDLE_INTERVAL).rstrip("m")))
+            sign = 1.0 if fired == strategy.BULLISH else -1.0
+            break_close = self.orb_setup.break_close
+            still_going = break_close is not None and sign * (float(candles.iloc[-1].close) - break_close) > 0   # not just above the range
+            if self.orb_setup.state == strategy.OrbSetup.DONE and still_going and now - t <= max_age + interval:
+                log.warning("Late ORB %s signal from candle %s taken (%d candles arrived at once; the move is still beyond the level)",
+                            fired, t.strftime("%H:%M"), len(candles), extra={"keep": True})
+                signal = (fired, t, kind)
+            else:
+                why = ("the range was re-entered since" if self.orb_setup.state != strategy.OrbSetup.DONE
+                       else "the move gave back the break" if not still_going else "too old")
+                log.warning("Stale ORB %s signal on replayed candle %s ignored (%s)", fired, t.strftime("%H:%M"), why,
+                            extra={"keep": True})
         return signal
 
     def try_orb_entry(self, now: datetime, direction: str, candle_time: datetime,
@@ -1469,6 +1490,25 @@ class Bot:
             return [f"Broker notes unavailable ({type(e).__name__})"]
 
     @staticmethod
+    def _spx_data_report_line() -> str:
+        """Where the SPX candles, opening range, spot and basis come from, and the opening-range window the breakouts use."""
+        open_dt = datetime.combine(datetime.now(config.ET).date(), config.MARKET_OPEN)
+        or_end = (open_dt + timedelta(minutes=int(config.OPENING_RANGE_MINUTES))).strftime("%H:%M")
+        orb_from = (open_dt + timedelta(minutes=int(config.OVERNIGHT_ENTRY_END_MIN))).strftime("%H:%M")
+        window = (f"opening range {config.MARKET_OPEN.strftime('%H:%M')}-{or_end} ET, ORB entries from {orb_from} to "
+                  f"{config.LAST_ENTRY_TIME.strftime('%H:%M')} ET")
+        source = str(getattr(config, "SPX_CANDLE_SOURCE", "yahoo"))
+        if source != "schwab":
+            return f"SPX data: {'Yahoo ' + config.SPX_SYMBOL if source == 'yahoo' else source} 1-minute bars; {window}"
+        try:
+            usable, reason = market_data.live_es_status()
+        except Exception as e:      # noqa: BLE001 -- a report line must never stop the bot from starting
+            return f"SPX data: Schwab {getattr(config, 'SPX_SCHWAB_SYMBOL', '$SPX')} (status unavailable: {type(e).__name__}); {window}"
+        if usable:
+            return f"SPX data: Schwab {getattr(config, 'SPX_SCHWAB_SYMBOL', '$SPX')} 1-minute bars (live); {window}"
+        return f"SPX data: Yahoo {config.SPX_SYMBOL} until Schwab is readable ({reason}); {window}"
+
+    @staticmethod
     def _live_es_report_line() -> str:
         try:
             usable, reason = market_data.live_es_status()
@@ -1516,6 +1556,7 @@ class Bot:
             f"Phase: {strategy.phase(now)}   News day: {strategy.is_news_day(now.date())} "
             f"(mode {config.NEWS_DAY_MODE})   Level source: {config.BREAKOUT_LEVEL_SOURCE}",
             self._live_es_report_line(),
+            self._spx_data_report_line(),
             self._daily_limit_line(),
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
                 f"| {k}: trades {s.trades_today} losses-in-a-row {s.consecutive_losses} P/L {fmt_money(s.realized_pnl)}"

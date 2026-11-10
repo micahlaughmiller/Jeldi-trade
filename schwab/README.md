@@ -94,3 +94,20 @@ slow or down:
   order to that spread's own close, and never cancels orders on legs it does not manage.
 - The simulator and the Alpaca paper bots never rest anything (`RESTING_EXITS = False` on Alpaca; the simulator has no OCO).
 - `EXIT_PNL_BASIS = "fill"`: on Schwab the official P/L is the fill price, not the tick before the trigger.
+
+## Schwab data for everything, 15-minute opening range (10 Nov 2026)
+
+- `SPX_CANDLE_SOURCE = "schwab"`: the Schwab bots read the SPX candles, the opening range, the spot used by the data layer and
+  the SPX-ES basis from Schwab's own `$SPX` one-minute price history, through the same read-only client the live ES feed uses
+  (the folder's token). If Schwab cannot be read for a moment the series falls back to Yahoo `^GSPC` and the log says so
+  ("SPX data: ..."). The overnight ES levels and the basis use the live ES bars when they are there.
+- `OPENING_RANGE_MINUTES = 15` and `OVERNIGHT_ENTRY_END_MIN = 15`: the opening range is 09:30-09:45 ET (08:30-08:45 Central)
+  and range breaks are tradable from 09:45 ET (08:45 Central) until `LAST_ENTRY_TIME`. The ON_BREAK overnight-level setup only
+  runs in those first 15 minutes now; Strategy C (not enabled on Schwab) keeps its own window, `C_ENTRY_END_MIN` minutes after
+  the open. The start-of-day report prints the window ("SPX data: ... opening range 09:30-09:45 ET, ORB entries from 09:45 to
+  12:00 ET"). The Schwab series holds one day of regular-hours bars: Strategies D/E (multi-day windows) are not supported on
+  the Schwab source and stay on Yahoo if ever enabled there. A Schwab request that fails, or a series that stops advancing,
+  switches to Yahoo for `SPX_SCHWAB_RETRY_SEC` before Schwab is asked again.
+- A breakout signal found on a candle that arrived late (several candles at once after a data stall) is taken while it is at
+  most `ORB_LATE_SIGNAL_MAX_MIN` old and the newest candle has not closed back inside the range; it used to be dropped as stale.
+- The Alpaca paper bots keep Yahoo data and the 30-minute range (`tools/check_sync.py` lists the three settings as intentional).

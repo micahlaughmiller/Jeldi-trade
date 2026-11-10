@@ -13,8 +13,12 @@ def _clear_es_cache():
     # get_es_candles_live caches its raw fetch for DATA_CACHE_SEC (20s) -- without clearing between
     # tests, a fast-running suite reuses a previous test's cached result across unrelated tests.
     market_data._CACHE.clear()
+    market_data._SPX_LIVE["fail_until"] = 0.0          # a back-off left by one test must not blind the next
+    market_data._SPX_SOURCE["state"] = None
     yield
     market_data._CACHE.clear()
+    market_data._SPX_LIVE["fail_until"] = 0.0
+    market_data._SPX_SOURCE["state"] = None
 
 
 def _write_token(path, access_token="atok", expires_in=1800, expires_at=None):
@@ -831,3 +835,219 @@ def test_live_es_backoff_active_follows_the_failure_window():
     assert market_data.live_es_backoff_active() is True
     market_data._ES_LIVE["fail_until"] = 0.0
     assert market_data.live_es_backoff_active() is False
+
+
+# ---------------------------------------------------------------------------------------------------
+# 2026-11-10: SPX data from Schwab's own $SPX price history (SPX_CANDLE_SOURCE "schwab"), Yahoo the moment it is not readable.
+
+def _spx_minute_bars(start_ms: int, n: int, base: float = 7800.0) -> list[dict]:
+    return [{"open": base + i, "high": base + i + 1, "low": base + i - 1, "close": base + i + 0.5, "volume": 10,
+             "datetime": start_ms + i * 60_000} for i in range(n)]
+
+
+class _SpxResp:
+    status_code = 200
+
+    def __init__(self, candles):
+        self._c = candles
+
+    def json(self):
+        return {"candles": self._c}
+
+
+class _SpxClient:
+    def __init__(self, candles):
+        self.candles, self.calls = candles, []
+
+    def get_price_history_every_minute(self, symbol, **kwargs):
+        self.calls.append((symbol, kwargs))
+        return _SpxResp(self.candles)
+
+
+def test_the_schwab_spx_series_is_read_regular_hours_only_and_cached(monkeypatch):
+    from datetime import datetime, timedelta
+    now = datetime(2026, 11, 10, 9, 50, 5, tzinfo=config.ET)
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    client = _SpxClient(_spx_minute_bars(start_ms, 20))
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "schwab")
+    got = market_data._spx_1m_schwab(now)
+    assert got is not None
+    df1, fetched = got
+    assert len(df1) == 20 and list(df1.columns) == ["open", "high", "low", "close", "volume"]
+    assert client.calls[0][0] == "$SPX" and client.calls[0][1]["need_extended_hours_data"] is False
+    market_data._spx_1m_schwab(now)
+    assert len(client.calls) == 1                                        # cached within DATA_CACHE_SEC
+
+
+def test_the_spx_series_falls_back_to_yahoo_when_schwab_cannot_be_read(monkeypatch, caplog):
+    import logging
+    from datetime import datetime
+    now = datetime(2026, 11, 10, 9, 50, 5, tzinfo=config.ET)
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "schwab")
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: None)
+    yahoo = (pd.DataFrame(columns=market_data._COLUMNS), 123.0)
+    monkeypatch.setattr(market_data, "_spx_1m", lambda: yahoo)
+    with caplog.at_level(logging.WARNING):
+        assert market_data._spx_series(now) == yahoo
+    assert any("SPX data: Yahoo" in r.getMessage() for r in caplog.records)
+
+    class Boom:
+        def get_price_history_every_minute(self, *a, **k):
+            raise requests.ConnectionError("down")
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: Boom())
+    market_data._CACHE.clear()
+    assert market_data._spx_series(now) == yahoo                          # a failing request is also just "use Yahoo"
+
+
+def test_yahoo_source_never_touches_schwab(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "yahoo")
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: (_ for _ in ()).throw(AssertionError("not called")))
+    yahoo = (pd.DataFrame(columns=market_data._COLUMNS), 1.0)
+    monkeypatch.setattr(market_data, "_spx_1m", lambda: yahoo)
+    assert market_data._spx_series(datetime(2026, 11, 10, 10, 0, tzinfo=config.ET)) == yahoo
+
+
+def test_the_opening_range_and_spot_read_the_schwab_series(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "schwab")
+    monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 15)
+    now = datetime(2026, 11, 10, 9, 46, 5, tzinfo=config.ET)
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    bars = _spx_minute_bars(start_ms, 16)
+    bars[3]["high"] = 7900.0                                              # the high of the 15-minute range
+    bars[15]["high"] = 9999.0                                             # 09:45 is outside the range
+    client = _SpxClient(bars)
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    monkeypatch.setattr(market_data._time, "time", lambda: now.timestamp())
+    levels = market_data.get_opening_range(now)
+    assert levels is not None and levels.high == 7900.0 and levels.low == pytest.approx(7799.0)
+    assert levels.established_at == datetime(2026, 11, 10, 9, 45, tzinfo=config.ET)
+    assert market_data.get_spot(config.SPX_SYMBOL, now) == pytest.approx(7815.5)
+    assert len(client.calls) == 1                                         # one series for both
+
+
+def test_overnight_levels_and_basis_use_live_es_when_available(monkeypatch):
+    from datetime import datetime, timedelta
+    now = datetime(2026, 11, 10, 9, 40, tzinfo=config.ET)
+    es_start = datetime(2026, 11, 9, 18, 0, tzinfo=config.ET)
+    es_bars = pd.DataFrame([{"open": 7850.0, "high": 7850.0 + (5 if i == 100 else 0), "low": 7840.0 - (7 if i == 200 else 0),
+                             "close": 7845.0, "volume": 1.0} for i in range(16 * 60)],
+                           index=pd.DatetimeIndex([es_start + timedelta(minutes=i) for i in range(16 * 60)]))
+    monkeypatch.setattr(market_data, "live_es_available", lambda: True)
+    monkeypatch.setattr(market_data, "_es_1m_live", lambda lookback, when: (es_bars, now.timestamp()))
+    monkeypatch.setattr(market_data, "_download", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Yahoo must not be read")))
+    levels = market_data.get_overnight_levels(now)
+    assert levels is not None and levels.high == 7855.0 and levels.low == 7833.0
+    spx = pd.DataFrame([{"open": 1, "high": 1, "low": 1, "close": 7900.0, "volume": 1}],
+                       index=pd.DatetimeIndex([datetime(2026, 11, 10, 9, 30, tzinfo=config.ET)]))
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (spx, now.timestamp()))
+    assert market_data.get_spx_es_basis(now) == pytest.approx(7900.0 - 7845.0)
+
+
+def test_get_candles_routes_spx_candles_through_schwab_in_schwab_mode(monkeypatch):
+    from datetime import datetime
+    now = datetime(2026, 11, 10, 9, 50, 5, tzinfo=config.ET)
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    client = _SpxClient(_spx_minute_bars(start_ms, 20))
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "schwab")
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
+    monkeypatch.setattr(market_data, "_spx_1m", lambda: pytest.fail("Yahoo must not be read"))
+    monkeypatch.setattr(market_data, "get_spx_candles_via_alpaca", lambda *a, **k: pytest.fail("Alpaca must not be read"))
+    monkeypatch.setattr(market_data._time, "time", lambda: now.timestamp())
+    df = market_data.get_candles(config.SPX_SYMBOL, "5m", 180, now)
+    assert len(df) == 4 and df["high"].iloc[0] == pytest.approx(7805.0)     # 20 one-minute bars -> four complete 5-minute candles
+    assert df["volume"].iloc[0] == 50
+
+
+def test_a_failed_schwab_spx_request_backs_off_and_a_stalled_series_counts_as_failed(monkeypatch):
+    from datetime import datetime, timedelta
+    now = datetime(2026, 11, 10, 10, 0, 5, tzinfo=config.ET)
+    monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "schwab")
+    monkeypatch.setattr(config, "SPX_SCHWAB_RETRY_SEC", 60, raising=False)
+
+    class Boom:
+        def __init__(self):
+            self.calls = 0
+
+        def get_price_history_every_minute(self, *a, **k):
+            self.calls += 1
+            raise requests.ConnectionError("down")
+    boom = Boom()
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: boom)
+    market_data._SPX_LIVE["fail_until"] = 0.0
+    assert market_data._spx_1m_schwab(now) is None
+    assert market_data._spx_1m_schwab(now) is None
+    assert market_data._spx_1m_schwab(now) is None
+    assert boom.calls == 1                                                    # one failed request, then back-off
+    market_data._SPX_LIVE["fail_until"] = 0.0
+    stale_start = int((now - timedelta(minutes=30)).timestamp() * 1000)
+    stalled = _SpxClient(_spx_minute_bars(stale_start, 10))                   # newest bar 20 minutes old, in session
+    monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: stalled)
+    assert market_data._spx_1m_schwab(now) is None and len(stalled.calls) == 1
+    assert market_data._SPX_LIVE["fail_until"] > 0
+    market_data._SPX_LIVE["fail_until"] = 0.0
+
+
+def test_the_opening_range_waits_for_its_last_minute_bar(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 15)
+    monkeypatch.setattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)
+    now = datetime(2026, 11, 10, 9, 45, 5, tzinfo=config.ET)
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    bars = _spx_minute_bars(start_ms, 14)                                     # 09:30..09:43 -- the 09:44 bar has not arrived
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars), now.timestamp()))
+    assert market_data.get_opening_range(now) is None                        # waits
+    later = datetime(2026, 11, 10, 9, 48, 30, tzinfo=config.ET)              # 3.5 min after the window: the gap is accepted
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars), later.timestamp()))
+    levels = market_data.get_opening_range(later)
+    assert levels is not None and levels.high == pytest.approx(7814.0)
+    bars15 = _spx_minute_bars(start_ms, 15)
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars15), now.timestamp()))
+    assert market_data.get_opening_range(now).high == pytest.approx(7815.0)  # complete: accepted at once
+
+
+def test_an_index_candle_without_volume_is_still_a_candle():
+    from datetime import datetime
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    bars = [{k: v for k, v in b.items() if k != "volume"} for b in _spx_minute_bars(start_ms, 3)]
+    df = market_data._es_minutes(bars)
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"] and (df["volume"] == 0).all()
+
+
+def test_the_feeds_read_the_token_the_broker_is_using(monkeypatch, tmp_path):
+    """The broker may have switched to a sibling folder's newer login: the feeds follow it instead of the folder's own stale file."""
+    own = tmp_path / "token.json"                                            # the folder's own file: expired
+    _write_token(own, expires_at=__import__("time").time() - 10)
+    sibling = tmp_path / "sibling" / "token.json"
+    sibling.parent.mkdir()
+    _write_token(sibling, access_token="newer-login")
+    monkeypatch.setattr(config, "SCHWAB_APP_KEY", "key")
+    monkeypatch.setattr(config, "SCHWAB_TOKEN_PATH", str(own))
+    try:
+        market_data.set_token_path_provider(None)
+        assert market_data._schwab_read_only_client() is None                # own file only: expired
+        market_data.set_token_path_provider(lambda: sibling)
+        client = market_data._schwab_read_only_client()
+        assert client is not None and client.session.headers["Authorization"] == "Bearer newer-login"
+        market_data.set_token_path_provider(lambda: (_ for _ in ()).throw(RuntimeError("broker gone")))
+        assert market_data._token_path() == str(own)                         # a failing provider falls back to the config path
+        market_data.set_token_path_provider(lambda: None)
+        assert market_data._token_path() == str(own)
+    finally:
+        market_data.set_token_path_provider(None)
+
+
+def test_the_basis_uses_complete_minutes_only(monkeypatch):
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(config, "CANDLE_SETTLE_SEC", 2.0)
+    open_dt = datetime(2026, 11, 10, 9, 30, tzinfo=config.ET)
+    idx = pd.DatetimeIndex([open_dt, open_dt + timedelta(minutes=1)])
+    spx = pd.DataFrame({"open": [1, 1], "high": [1, 1], "low": [1, 1], "close": [7900.0, 7910.0], "volume": [1, 1]}, index=idx)
+    es = pd.DataFrame({"open": [1, 1], "high": [1, 1], "low": [1, 1], "close": [7845.0, 7850.0], "volume": [1, 1]}, index=idx)
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (spx, 0.0))
+    monkeypatch.setattr(market_data, "_es_minutes_any", lambda when: es)
+    assert market_data.get_spx_es_basis(open_dt + timedelta(seconds=1)) is None          # the 09:30 bar is still forming
+    assert market_data.get_spx_es_basis(open_dt + timedelta(minutes=1, seconds=1)) is None   # not settled yet (2 s)
+    assert market_data.get_spx_es_basis(open_dt + timedelta(minutes=1, seconds=3)) == pytest.approx(55.0)   # the 09:30 bar

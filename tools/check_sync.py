@@ -67,6 +67,12 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
                            "broker's actual fill (Alpaca paper: the tick before the trigger)"),
         "RESTING_EXITS": ("False", "True", "2026-11-06: on Schwab the exit (profit-target limit + stop-limit) rests at the broker as "
                           "an OCO right after the entry fills; Alpaca cannot hold one for a spread"),
+        "SPX_CANDLE_SOURCE": ("'yahoo'", "'schwab'", "2026-11-10: the live Schwab bots read SPX candles, the opening range, the spot "
+                              "and the basis from Schwab's own $SPX price history (Alpaca paper: Yahoo)"),
+        "OPENING_RANGE_MINUTES": ("30", "15", "2026-11-10: Schwab live: a 15-minute opening range, breaks tradable from 09:45 ET "
+                                  "(08:45 Central); Alpaca keeps 30"),
+        "OVERNIGHT_ENTRY_END_MIN": ("30", "15", "2026-11-10: Schwab live: the ORB phase starts 15 minutes after the open, with the "
+                                    "15-minute opening range; Alpaca keeps 30"),
     },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),

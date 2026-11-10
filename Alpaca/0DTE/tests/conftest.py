@@ -178,3 +178,14 @@ def _pin_exit_pnl_basis(request, monkeypatch):
     if request.module.__name__ not in GUARD_MODULES:
         monkeypatch.setattr(config, "EXIT_PNL_BASIS", "prev_tick", raising=False)
         monkeypatch.setattr(config, "RESTING_EXITS", False, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _pin_data_source_and_opening_range(request, monkeypatch):
+    """The shared suite describes the Alpaca paper setup (Yahoo SPX data, a 30-minute opening range); the Schwab folder ships Schwab
+    data and a 15-minute range (2026-11-10). Pin the Alpaca values -- except in the per-folder guard modules, which check each
+    folder's real ones."""
+    if request.module.__name__ not in GUARD_MODULES:
+        monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "yahoo", raising=False)
+        monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 30, raising=False)
+        monkeypatch.setattr(config, "OVERNIGHT_ENTRY_END_MIN", 30, raising=False)

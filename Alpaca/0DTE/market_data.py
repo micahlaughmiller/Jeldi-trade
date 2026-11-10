@@ -88,9 +88,31 @@ def _es_failed(reason: str) -> None:
     _es_report(False, reason)
 
 
+_TOKEN_PATH_PROVIDER: dict = {"fn": None}
+
+
+def set_token_path_provider(fn) -> None:
+    """2026-11-10: the data feeds read the token file the BROKER is using. The Schwab broker may switch to a sibling folder's
+    newer login (same app key) and from then on only that file is refreshed; this folder's own token.json goes stale within
+    the hour and the feeds would fall back to Yahoo while the bot trades live. The scheduler installs the broker's path here."""
+    _TOKEN_PATH_PROVIDER["fn"] = fn
+
+
+def _token_path() -> str:
+    fn = _TOKEN_PATH_PROVIDER["fn"]
+    if fn is not None:
+        try:
+            found = fn()
+            if found:
+                return str(found)
+        except Exception:       # noqa: BLE001 -- the provider must never take the feed down; the config path is the fallback
+            pass
+    return str(getattr(config, "SCHWAB_TOKEN_PATH", "") or "").strip()
+
+
 def _es_token_check():
     """(client, "") when a read-only Schwab client can be built from the token file right now, else (None, why not). No logging."""
-    token_path = str(getattr(config, "SCHWAB_TOKEN_PATH", "") or "").strip()
+    token_path = _token_path()
     api_key = str(getattr(config, "SCHWAB_APP_KEY", "") or "").strip()
     if not token_path or not api_key:
         return None, "SCHWAB_APP_KEY / SCHWAB_TOKEN_PATH not configured"
@@ -147,18 +169,17 @@ def live_es_available() -> bool:
 def _es_minutes(candles: list) -> pd.DataFrame:
     df = pd.DataFrame(candles)
     df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert(config.ET)
+    if "volume" not in df.columns:            # an index ($SPX) has no volume
+        df["volume"] = 0.0
     return df.set_index("datetime")[["open", "high", "low", "close", "volume"]].sort_index()
 
 
-def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
-    """Real ES futures candles via Schwab (config.ES_SCHWAB_SYMBOL, e.g. "/ES"), resampled to
-    interval_min. Returns None -- never raises -- if Schwab cross-auth isn't configured in this
-    folder's .env, the shared token has expired, or the call fails for any reason (the failure is logged once and the feed
-    is left alone for ES_LIVE_RETRY_SEC). Candles are COMPLETE ones only, by the same rule as the SPX series (_candles_from_1m)."""
+def _es_1m_live(lookback_min: int, now: datetime) -> tuple[pd.DataFrame, float] | None:
+    """The live ES 1-minute series (Schwab, extended hours, at least the last 24 h) and when it was fetched; None -- never
+    raises -- when the read-only client cannot be built or the request fails (logged once, feed left alone for ES_LIVE_RETRY_SEC)."""
     client = _schwab_read_only_client()
     if client is None:
         return None
-    now = _now(now)
     # Cached like _download's yfinance calls: at TICK_SECONDS=1 (fast-as-Alpaca-allows polling) an
     # uncached call here would hit Schwab's API every single tick -- this keeps it to at most one real request per
     # DATA_CACHE_SEC (sooner right after a minute closes: _fresh), regardless of tick rate.
@@ -192,6 +213,19 @@ def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | No
         fetched = _time.time()
         _CACHE[cache_key] = (_time.monotonic(), df1, fetched)
         _es_report(True)
+    return df1, fetched
+
+
+def get_es_candles_live(interval_min: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame | None:
+    """Real ES futures candles via Schwab (config.ES_SCHWAB_SYMBOL, e.g. "/ES"), resampled to
+    interval_min. Returns None -- never raises -- if Schwab cross-auth isn't configured in this
+    folder's .env, the shared token has expired, or the call fails for any reason (the failure is logged once and the feed
+    is left alone for ES_LIVE_RETRY_SEC). Candles are COMPLETE ones only, by the same rule as the SPX series (_candles_from_1m)."""
+    now = _now(now)
+    got = _es_1m_live(lookback_min, now)
+    if got is None:
+        return None
+    df1, fetched = got
     return _candles_from_1m(df1, fetched, interval_min, lookback_min, now)
 
 
@@ -507,11 +541,20 @@ def _prior_session_date(now: datetime) -> datetime:
     return d
 
 
+def _es_minutes_any(now: datetime) -> pd.DataFrame:
+    """ES 1-minute bars (extended hours): Schwab's live series when the read-only client can be built, else Yahoo ES=F."""
+    got = _es_1m_live(1440, now) if live_es_available() else None
+    if got is not None and not got[0].empty:
+        return got[0]
+    return _download(config.ES_SYMBOL, "2d", "1m", True)
+
+
 def get_overnight_levels(now: datetime | None = None) -> Levels | None:
     now = _now(now)
     start = at_time(_prior_session_date(now), config.OVERNIGHT_SESSION_START)
     end = at_time(now, config.MARKET_OPEN)
-    df = _download(config.ES_SYMBOL, "5d", "5m", True)
+    # 2026-11-10: the live ES series (Schwab) when it is there -- the same bars the breakouts are confirmed on -- else Yahoo
+    df = _es_minutes_any(now) if live_es_available() else _download(config.ES_SYMBOL, "5d", "5m", True)
     window = df[(df.index >= start) & (df.index < end)]
     if window.empty:
         return None
@@ -521,10 +564,13 @@ def get_overnight_levels(now: datetime | None = None) -> Levels | None:
 def get_spx_es_basis(now: datetime | None = None) -> float | None:
     now = _now(now)
     open_dt = at_time(now, config.MARKET_OPEN)
-    spx = _spx_1m()[0]
-    es = _download(config.ES_SYMBOL, "2d", "1m", True)
+    spx = _spx_series(now)[0]
+    es = _es_minutes_any(now)
     common = spx.index.intersection(es.index)
-    common = common[(common >= open_dt) & (common <= now)]
+    # 2026-11-10: complete minutes only -- at 09:30:02 both snapshots can still carry the forming 09:30 bar, and the first basis is
+    # latched for the day (the same settle rule every candle consumer applies)
+    cutoff = now - timedelta(seconds=float(getattr(config, "CANDLE_SETTLE_SEC", 2.0)))
+    common = common[(common >= open_dt) & (common + timedelta(minutes=1) <= cutoff)]
     if common.empty:
         return None
     t = common[0]       # 2026-10-08: the FIRST common minute from the open -- the same number for every persona and every
@@ -545,7 +591,7 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
             # substitute the ~10 min delayed Yahoo ES=F series for it -- the caller sees "no candles yet", and after a failure
             # live_es_available() is False so the next tick confirms on SPX candles instead
             return pd.DataFrame(columns=_COLUMNS)
-    if symbol == config.SPX_SYMBOL and getattr(config, "SPX_CANDLE_SOURCE", "yahoo") == "yahoo":
+    if symbol == config.SPX_SYMBOL and getattr(config, "SPX_CANDLE_SOURCE", "yahoo") in ("yahoo", "schwab"):
         return get_spx_candles_yahoo(int(interval.rstrip("m")), lookback_min, now)
     if symbol == config.SPX_SYMBOL:
         live = get_spx_candles_via_alpaca(int(interval.rstrip("m")), lookback_min, now)
@@ -565,9 +611,82 @@ def get_candles(symbol: str, interval: str = "2m", lookback_min: int = 180,
 
 
 def _spx_1m() -> tuple[pd.DataFrame, float]:
-    """The ONE SPX series: Yahoo ^GSPC 1-minute bars, 5 days (enough for a Monday's multi-session D/E window), shared by every
-    persona. Candles, the opening range, the spot and the basis all read this."""
+    """The Yahoo SPX series: ^GSPC 1-minute bars, 5 days (enough for a Monday's multi-session D/E window), shared by every
+    persona through the snapshot file."""
     return _download_snapshot(config.SPX_SYMBOL, "5d", "1m", False)
+
+
+_SPX_SOURCE: dict = {"state": None}
+
+
+def _spx_source_report(label: str) -> None:
+    """Log the SPX data source once per change (steady state is silent)."""
+    if _SPX_SOURCE["state"] == label:
+        return
+    _SPX_SOURCE["state"] = label
+    log.warning("SPX data: %s", label, extra={"keep": True})
+
+
+_SPX_LIVE: dict = {"fail_until": 0.0}      # a failed $SPX request is not repeated before this monotonic time (SPX_SCHWAB_RETRY_SEC)
+
+
+def _spx_failed(symbol: str, err: Exception) -> None:
+    _SPX_LIVE["fail_until"] = _time.monotonic() + float(getattr(config, "SPX_SCHWAB_RETRY_SEC", 60))
+    _report_feed_health((symbol, "1m"), False, err)
+
+
+def _spx_1m_schwab(now: datetime) -> tuple[pd.DataFrame, float] | None:
+    """The SPX 1-minute series from Schwab's price history (config.SPX_SCHWAB_SYMBOL, "$SPX"), regular hours, cached like the
+    live ES series (one request per DATA_CACHE_SEC, sooner right after a minute closes). None -- never raises -- when the
+    read-only client cannot be built or the request fails; the caller falls back to Yahoo."""
+    symbol = str(getattr(config, "SPX_SCHWAB_SYMBOL", "$SPX"))
+    key = ("spx_schwab", symbol)
+    hit = _CACHE.get(key)
+    if hit and len(hit) > 2 and _time.monotonic() - hit[0] < config.DATA_CACHE_SEC and _fresh(hit[2], "1m", df=hit[1]):
+        return hit[1], hit[2]
+    if _time.monotonic() < _SPX_LIVE["fail_until"]:
+        return None                          # a request failed a moment ago: Yahoo until the back-off has passed
+    client = _schwab_read_only_client()
+    if client is None:
+        return None
+    status = None
+    try:
+        start = now - timedelta(minutes=max(int(getattr(config, "SPX_SCHWAB_LOOKBACK_MIN", 1440)), 60))
+        resp = client.get_price_history_every_minute(symbol, start_datetime=start, end_datetime=now,
+                                                     need_extended_hours_data=False)
+        status = getattr(resp, "status_code", None)
+        data = resp.json()
+        candles = data.get("candles") if isinstance(data, dict) else None
+        if not candles:
+            _spx_failed(symbol, RuntimeError("no candles" + (f" (HTTP {status})" if status else "")))
+            return None
+        df1 = _es_minutes(candles)
+        max_age = float(getattr(config, "SPX_SCHWAB_MAX_BAR_AGE_SEC", 300))
+        age = (now - df1.index[-1]).total_seconds()
+        if max_age and _in_session(now.timestamp()) and age > max_age:
+            # a series that stopped advancing is as useless as a failed request: Yahoo, not a frozen "live" feed
+            _spx_failed(symbol, RuntimeError(f"newest bar is {age / 60:.0f} min old"))
+            return None
+    except Exception as e:      # noqa: BLE001 -- an optional feed must never take the bot down
+        _spx_failed(symbol, e)
+        return None
+    fetched = _time.time()
+    _CACHE[key] = (_time.monotonic(), df1, fetched)
+    _report_feed_health((symbol, "1m"), True, None)
+    return df1, fetched
+
+
+def _spx_series(now: datetime | None = None) -> tuple[pd.DataFrame, float]:
+    """The ONE SPX 1-minute series: Schwab's $SPX price history when SPX_CANDLE_SOURCE is "schwab" (Yahoo ^GSPC the moment it
+    cannot be read), else Yahoo ^GSPC. Candles, the opening range, the spot and the basis all read this."""
+    now = _now(now)
+    if getattr(config, "SPX_CANDLE_SOURCE", "yahoo") == "schwab":
+        got = _spx_1m_schwab(now)
+        if got is not None:
+            _spx_source_report(f"Schwab {getattr(config, 'SPX_SCHWAB_SYMBOL', '$SPX')} 1-minute bars")
+            return got
+        _spx_source_report(f"Yahoo {config.SPX_SYMBOL} 1-minute bars (Schwab {getattr(config, 'SPX_SCHWAB_SYMBOL', '$SPX')} not readable)")
+    return _spx_1m()
 
 
 def _candles_from_1m(df1: pd.DataFrame, fetched_wall: float, minutes: int, lookback_min: int, now: datetime) -> pd.DataFrame:
@@ -596,9 +715,9 @@ def _candles_from_1m(df1: pd.DataFrame, fetched_wall: float, minutes: int, lookb
 
 
 def get_spx_candles_yahoo(minutes: int, lookback_min: int, now: datetime | None = None) -> pd.DataFrame:
-    """SPX candles from the single shared Yahoo ^GSPC 1-minute series, complete candles only (see _candles_from_1m)."""
+    """SPX candles from the one SPX 1-minute series (Schwab or Yahoo, see _spx_series), complete candles only (_candles_from_1m)."""
     now = _now(now)
-    df1, fetched = _spx_1m()
+    df1, fetched = _spx_series(now)
     return _candles_from_1m(df1, fetched, minutes, lookback_min, now)
 
 
@@ -608,18 +727,24 @@ def get_opening_range(now: datetime | None = None) -> Levels | None:
     end = start + timedelta(minutes=config.OPENING_RANGE_MINUTES)
     if now < end:
         return None
-    df, fetched = _spx_1m()
+    df, fetched = _spx_series(now)
     if fetched < end.timestamp() + float(getattr(config, "CANDLE_SETTLE_SEC", 2.0)):
         return None         # the snapshot may still hold the last opening-range minute half-formed: wait for the next one
     window = df[(df.index >= start) & (df.index < end)]
     if window.empty:
+        return None
+    # 2026-11-10: the range is fixed for the day the moment it is returned, so it waits for its LAST minute bar (the one most
+    # likely to be missing from a fresh snapshot) -- unless the bar is still missing CANDLE_GAP_TOLERANCE_SEC after the window
+    # ended, then what is there is accepted (a data gap must not block the whole day), as _candles_from_1m does
+    last_minute = end - timedelta(minutes=1)
+    if window.index[-1] < last_minute and fetched < end.timestamp() + float(getattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)):
         return None
     return Levels(float(window["high"].max()), float(window["low"].min()), end)
 
 
 def get_spot(symbol: str = "^GSPC", now: datetime | None = None) -> float | None:
     now = _now(now)
-    df = _spx_1m()[0] if symbol == config.SPX_SYMBOL else _download(symbol, "2d", "1m", symbol == config.ES_SYMBOL)
+    df = _spx_series(now)[0] if symbol == config.SPX_SYMBOL else _download(symbol, "2d", "1m", symbol == config.ES_SYMBOL)
     df = df[df.index <= now]
     if df.empty:
         return None

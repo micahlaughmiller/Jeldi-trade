@@ -23,3 +23,9 @@ def test_the_shipped_exit_booking_and_resting_exits():
     """2026-11-06: the paper bot keeps the tick-before-the-trigger basis and script-managed exits (Alpaca cannot hold an OCO)."""
     assert config.EXIT_PNL_BASIS == "prev_tick"
     assert config.RESTING_EXITS is False
+
+
+def test_the_shipped_data_source_and_opening_range():
+    """The paper bots keep Yahoo SPX data and the 30-minute opening range."""
+    assert config.SPX_CANDLE_SOURCE == "yahoo"
+    assert config.OPENING_RANGE_MINUTES == 30 and config.OVERNIGHT_ENTRY_END_MIN == 30

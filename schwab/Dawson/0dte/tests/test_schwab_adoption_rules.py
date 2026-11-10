@@ -28,3 +28,9 @@ def test_the_shipped_exit_booking_and_resting_exits():
     assert config.EXIT_PNL_BASIS == "fill"
     assert config.RESTING_EXITS is True
     assert config.RESTING_STOP_LIMIT_PCT_OF_WIDTH == 0.03 and config.RESTING_EXIT_MAX_ATTEMPTS == 2
+
+
+def test_the_shipped_data_source_and_opening_range():
+    """2026-11-10: live Schwab data for everything, and a 15-minute opening range with breaks tradable from 09:45 ET (08:45 Central)."""
+    assert config.SPX_CANDLE_SOURCE == "schwab" and config.SPX_SCHWAB_SYMBOL == "$SPX"
+    assert config.OPENING_RANGE_MINUTES == 15 and config.OVERNIGHT_ENTRY_END_MIN == 15

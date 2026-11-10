@@ -235,8 +235,9 @@ MARKET_OPEN = time(9, 30)
 # of genuine SPX-equivalent session data from the candle series signal detection relies on.
 MARKET_CLOSE = time(16, 0)
 OVERNIGHT_SESSION_START = time(18, 0)
-OPENING_RANGE_MINUTES = 30
-OVERNIGHT_ENTRY_END_MIN = 30
+OPENING_RANGE_MINUTES = 30             # the opening range is the first N minutes after the open; Alpaca paper: Yahoo, 30-minute opening range
+OVERNIGHT_ENTRY_END_MIN = 30           # the overnight-level setups end and the ORB phase begins N minutes after the open
+ORB_LATE_SIGNAL_MAX_MIN = 10             # an ORB signal found on a replayed candle this recent is still taken (see scheduler.orb_signal)
 # 2026-10-05: HARD STOP at 1:00 pm Eastern (12:00 noon Central), no matter what: every open spread is closed, every
 # working order is cancelled and the bot exits for the day (it was 15:30). 2026-10-07: NEW ENTRIES stop at 12:00 noon
 # Eastern (11:00 Central) -- the last hour (12:00-13:00 ET) only manages what is already open, then the hard stop.
@@ -259,8 +260,15 @@ DATA_CACHE_SEC = 20
 # into a shared snapshot (shared_cache.py) instead of once per persona, and a candle is emitted only when its LAST 1-minute bar
 # has been seen in a snapshot fetched at least CANDLE_SETTLE_SEC after that bar ended (it used to be emitted at the clock
 # boundary from whatever bars had arrived: the last minute moved a 5-minute close by >= 1 pt in 49% of candles).
-#   SPX_CANDLE_SOURCE "yahoo" (this) | "spy" (the older Alpaca SPY bars x a calibrated ratio, kept for rollback)
-SPX_CANDLE_SOURCE = "yahoo"
+#   SPX_CANDLE_SOURCE "yahoo" | "schwab" (2026-11-10: Schwab's own $SPX 1-minute price history through the folder's token, the
+#   same read-only client the live ES feed uses; Yahoo the moment it cannot be read) | "spy" (the older Alpaca SPY bars x a
+#   calibrated ratio, kept for rollback)
+SPX_CANDLE_SOURCE = "yahoo"                  # Alpaca paper: Yahoo, 30-minute opening range
+SPX_SCHWAB_SYMBOL = "$SPX"
+SPX_SCHWAB_LOOKBACK_MIN = 1440           # minutes of $SPX history asked of Schwab per request: covers the B/F/ORB windows; D/E's
+                                         # multi-day window (D_E_LOOKBACK_MIN) is NOT covered, D/E stay on the Yahoo source
+SPX_SCHWAB_MAX_BAR_AGE_SEC = 300         # a Schwab $SPX series whose newest bar is older than this (in session) counts as failed
+SPX_SCHWAB_RETRY_SEC = 60                # after a failed $SPX request Yahoo is used and Schwab is not asked again for this long
 CANDLE_SETTLE_SEC = 2.0
 # While the bar that just closed is still missing from a session snapshot, re-download at most this often (shared by all personas).
 CANDLE_RETRY_SEC = 3.0

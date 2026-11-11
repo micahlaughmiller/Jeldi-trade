@@ -721,26 +721,68 @@ def get_spx_candles_yahoo(minutes: int, lookback_min: int, now: datetime | None 
     return _candles_from_1m(df1, fetched, minutes, lookback_min, now)
 
 
+
 def get_opening_range(now: datetime | None = None) -> Levels | None:
+    """Build the opening range from completed 5-minute candle bodies only.
+    
+    Uses the OPEN and CLOSE prices, completely ignoring upper and lower wicks.
+    """
     now = _now(now)
     start = at_time(now, config.MARKET_OPEN)
     end = start + timedelta(minutes=config.OPENING_RANGE_MINUTES)
+
+    # Do not establish the range until the full opening window has ended.
     if now < end:
         return None
-    df, fetched = _spx_series(now)
-    if fetched < end.timestamp() + float(getattr(config, "CANDLE_SETTLE_SEC", 2.0)):
-        return None         # the snapshot may still hold the last opening-range minute half-formed: wait for the next one
-    window = df[(df.index >= start) & (df.index < end)]
+
+    # Retrieve underlying SPX 1-minute data.
+    df1, fetched = _spx_series(now)
+
+    # Wait until the opening range data has settled.
+    if fetched < end.timestamp() + float(
+        getattr(config, "CANDLE_SETTLE_SEC", 2.0)
+    ):
+        return None
+
+    # Convert 1-minute data into completed 5-minute candles.
+    df5 = _candles_from_1m(
+        df1,
+        fetched,
+        5,
+        config.CANDLE_LOOKBACK_MIN,
+        now
+    )
+
+    # Select only the opening range candles (09:30–09:45 ET).
+    window = df5[
+        (df5.index >= start) &
+        (df5.index < end)
+    ]
+
     if window.empty:
         return None
-    # 2026-11-10: the range is fixed for the day the moment it is returned, so it waits for its LAST minute bar (the one most
-    # likely to be missing from a fresh snapshot) -- unless the bar is still missing CANDLE_GAP_TOLERANCE_SEC after the window
-    # ended, then what is there is accepted (a data gap must not block the whole day), as _candles_from_1m does
-    last_minute = end - timedelta(minutes=1)
-    if window.index[-1] < last_minute and fetched < end.timestamp() + float(getattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)):
-        return None
-    return Levels(float(window["high"].max()), float(window["low"].min()), end)
 
+    # Require the final 5-minute candle (09:40–09:45 ET).
+    last_candle_start = end - timedelta(minutes=5)
+
+    if (
+        window.index[-1] < last_candle_start
+        and fetched < end.timestamp() + float(
+            getattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)
+        )
+    ):
+        return None
+
+    # Calculate opening range using OPEN and CLOSE only.
+    # Upper and lower wicks are completely ignored.
+    body_high = window[["open", "close"]].max(axis=1)
+    body_low = window[["open", "close"]].min(axis=1)
+
+    return Levels(
+        high=float(body_high.max()),
+        low=float(body_low.min()),
+        established_at=end
+    )
 
 def get_spot(symbol: str = "^GSPC", now: datetime | None = None) -> float | None:
     now = _now(now)

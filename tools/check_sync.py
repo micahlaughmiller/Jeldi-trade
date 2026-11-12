@@ -56,10 +56,11 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
                                  "hand trades, so it never adopts or force-closes SPXW legs it did not open"),
         "ADOPT_UNTRACKED_STOCK": ("True", "False", "2026-10-15: the same for single-stock option legs now that Schwab runs Strategy F: "
                                   "it never adopts or force-closes stock legs it did not open"),
-        "STRATEGIES": ("('B',)", "('B', 'F')", "2026-10-15: Schwab 0DTE trades B and F only (live go-live)"),
-        "DAILY_LOSS_LIMIT_PCT": ("0.1", "0.01", "2026-10-15: Schwab live go-live: acceptable daily loss is 1% (Alpaca 10%)"),
+        "STRATEGIES": ("('B',)", "('B', 'C', 'F')", "2026-10-15: Schwab 0DTE trades B and F (live go-live); 2026-11-12: C as well"),
+        "DAILY_LOSS_LIMIT_PCT": ("0.1", "0.025", "2026-10-15: Schwab live go-live: acceptable daily loss 1% (Alpaca 10%); 2026-11-12: 2.5%"),
         "DAILY_LOSS_LIMIT_EXEMPT": ("('F',)", "()", "2026-10-15: on Schwab F follows the daily loss limit (Alpaca: F is exempt)"),
-        "DAILY_PROFIT_TARGET_PCT": ("None", "0.02", "2026-10-15: Schwab live go-live: no new entries once 2% is banked (Alpaca: no target)"),
+        "DAILY_PROFIT_TARGET_PCT": ("None", "0.05", "2026-10-15: Schwab live go-live: no new entries once the daily goal is banked "
+                                   "(Alpaca: no target); 2026-11-12: 5%"),
         "DAILY_LOSS_BASIS": ("'equity'", "'bot'", "2026-10-15: Schwab's account is shared with hand trades and the 45DTE bot, so its loss limit "
                              "counts only this bot's P/L (Alpaca: account equity)"),
         "MAX_OPEN_POSITIONS_TOTAL": ("2", "1", "2026-10-15: Schwab 0DTE (live go-live) holds ONE trade open at a time across B and F"),
@@ -73,6 +74,13 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
                                   "(08:45 Central); Alpaca keeps 30"),
         "OVERNIGHT_ENTRY_END_MIN": ("30", "15", "2026-11-10: Schwab live: the ORB phase starts 15 minutes after the open, with the "
                                     "15-minute opening range; Alpaca keeps 30"),
+        "MAX_TRADES_PER_DAY": ("5", "3", "2026-11-12: Schwab live: 3 trades a day per strategy (Alpaca 5)"),
+        "MAX_TRADES_TOTAL_PER_DAY": ("None", "3", "2026-11-12: Schwab live: 3 trades a day across every strategy together (Alpaca: off)"),
+        "MAX_CONSECUTIVE_LOSSES": ("5", "2", "2026-11-12: Schwab live: 2 consecutive losses stop the day (Alpaca 5)"),
+        "LIMITS_BY_STRATEGY": ("{'A': {'MAX_TRADES_PER_DAY': 5, 'MAX_CONSECUTIVE_LOSSES': 5, 'COOLDOWN_MIN': 30}, 'B': {}, 'C': {'MAX_TRADES_PER_DAY': 3}, 'D': {'MAX_TRADES_PER_DAY': 3}, 'E': {'MAX_TRADES_PER_DAY': 3}, 'F': {'MAX_TRADES_PER_DAY': 3, 'MAX_CONSECUTIVE_LOSSES': 7, 'MAX_CONCURRENT_POSITIONS': 3}}",
+                               "{'A': {'MAX_TRADES_PER_DAY': 3, 'MAX_CONSECUTIVE_LOSSES': 2, 'COOLDOWN_MIN': 10}, 'B': {}, 'C': {'MAX_TRADES_PER_DAY': 3}, 'D': {'MAX_TRADES_PER_DAY': 3}, 'E': {'MAX_TRADES_PER_DAY': 3}, 'F': {'MAX_TRADES_PER_DAY': 3, 'MAX_CONSECUTIVE_LOSSES': 7, 'MAX_CONCURRENT_POSITIONS': 3}}",
+                               "2026-11-12: Schwab live: A's own limits 3 trades, 2 losses, 10-minute cool-down (Alpaca 5 / 5 / 30)"),
+        "STOP_LOSS": ("0.6", "0.3", "2026-11-12: Schwab live: STOP_LOSS 0.30 -- Strategy A's stop; B, C, D and E read B_STOP_LOSS (Alpaca 0.60)"),
     },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),

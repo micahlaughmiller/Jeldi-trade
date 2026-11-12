@@ -721,10 +721,9 @@ def get_spx_candles_yahoo(minutes: int, lookback_min: int, now: datetime | None 
     return _candles_from_1m(df1, fetched, minutes, lookback_min, now)
 
 
-
 def get_opening_range(now: datetime | None = None) -> Levels | None:
     """Build the opening range from completed 5-minute candle bodies only.
-    
+
     Uses the OPEN and CLOSE prices, completely ignoring upper and lower wicks.
     """
     now = _now(now)
@@ -744,12 +743,14 @@ def get_opening_range(now: datetime | None = None) -> Levels | None:
     ):
         return None
 
-    # Convert 1-minute data into completed 5-minute candles.
+    # Convert 1-minute data into completed 5-minute candles. 2026-11-12: the lookback always reaches back to the open --
+    # CANDLE_LOOKBACK_MIN (180) alone would drop the 09:30 candle from 12:31 ET on and hand a late restart a partial range.
+    lookback_min = max(int(config.CANDLE_LOOKBACK_MIN), int((now - start).total_seconds() // 60) + 5)
     df5 = _candles_from_1m(
         df1,
         fetched,
         5,
-        config.CANDLE_LOOKBACK_MIN,
+        lookback_min,
         now
     )
 
@@ -783,6 +784,7 @@ def get_opening_range(now: datetime | None = None) -> Levels | None:
         low=float(body_low.min()),
         established_at=end
     )
+
 
 def get_spot(symbol: str = "^GSPC", now: datetime | None = None) -> float | None:
     now = _now(now)

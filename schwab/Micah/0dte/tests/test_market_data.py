@@ -916,13 +916,14 @@ def test_the_opening_range_and_spot_read_the_schwab_series(monkeypatch):
     now = datetime(2026, 11, 10, 9, 46, 5, tzinfo=config.ET)
     start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
     bars = _spx_minute_bars(start_ms, 16)
-    bars[3]["high"] = 7900.0                                              # the high of the 15-minute range
-    bars[15]["high"] = 9999.0                                             # 09:45 is outside the range
+    bars[4]["close"] = 7900.0                                             # the 09:30 candle closes at the range's body high
+    bars[3]["high"], bars[7]["low"] = 9999.0, 1.0                         # wicks: ignored (the range is candle bodies only)
+    bars[15]["open"] = 9999.0                                             # 09:45 is outside the range
     client = _SpxClient(bars)
     monkeypatch.setattr(market_data, "_schwab_read_only_client", lambda: client)
     monkeypatch.setattr(market_data._time, "time", lambda: now.timestamp())
     levels = market_data.get_opening_range(now)
-    assert levels is not None and levels.high == 7900.0 and levels.low == pytest.approx(7799.0)
+    assert levels is not None and levels.high == 7900.0 and levels.low == pytest.approx(7800.0)   # the 09:30 candle's open
     assert levels.established_at == datetime(2026, 11, 10, 9, 45, tzinfo=config.ET)
     assert market_data.get_spot(config.SPX_SYMBOL, now) == pytest.approx(7815.5)
     assert len(client.calls) == 1                                         # one series for both
@@ -990,22 +991,40 @@ def test_a_failed_schwab_spx_request_backs_off_and_a_stalled_series_counts_as_fa
     market_data._SPX_LIVE["fail_until"] = 0.0
 
 
-def test_the_opening_range_waits_for_its_last_minute_bar(monkeypatch):
+def test_the_opening_range_waits_for_its_last_five_minute_candle(monkeypatch):
+    """The 09:40 candle is complete only with its 09:44 bar; until then (or CANDLE_GAP_TOLERANCE_SEC after the window) the range waits."""
     from datetime import datetime
     monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 15)
     monkeypatch.setattr(config, "CANDLE_GAP_TOLERANCE_SEC", 180)
     now = datetime(2026, 11, 10, 9, 45, 5, tzinfo=config.ET)
     start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
-    bars = _spx_minute_bars(start_ms, 14)                                     # 09:30..09:43 -- the 09:44 bar has not arrived
+    bars = _spx_minute_bars(start_ms, 14)                                     # 09:30..09:43 -- the 09:44 bar has not arrived (09:40 candle incomplete)
     monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars), now.timestamp()))
     assert market_data.get_opening_range(now) is None                        # waits
     later = datetime(2026, 11, 10, 9, 48, 30, tzinfo=config.ET)              # 3.5 min after the window: the gap is accepted
     monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars), later.timestamp()))
     levels = market_data.get_opening_range(later)
-    assert levels is not None and levels.high == pytest.approx(7814.0)
+    assert levels is not None and levels.high == pytest.approx(7813.5)      # the body high: the 09:43 close (bodies only, no wicks)
     bars15 = _spx_minute_bars(start_ms, 15)
     monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars15), now.timestamp()))
-    assert market_data.get_opening_range(now).high == pytest.approx(7815.0)  # complete: accepted at once
+    assert market_data.get_opening_range(now).high == pytest.approx(7814.5)  # complete: accepted at once (the 09:44 close)
+
+
+def test_the_opening_range_is_the_whole_window_long_after_the_open(monkeypatch):
+    """A restart at 12:40 ET rebuilds the 09:30-09:45 range from the day's series: the candle lookback never drops its first candles
+    (CANDLE_LOOKBACK_MIN alone would leave the 09:40 candle only and a wrong range)."""
+    from datetime import datetime
+    monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 15)
+    monkeypatch.setattr(config, "CANDLE_LOOKBACK_MIN", 180)
+    now = datetime(2026, 11, 10, 12, 40, 5, tzinfo=config.ET)
+    start_ms = int(datetime(2026, 11, 10, 9, 30, tzinfo=config.ET).timestamp() * 1000)
+    bars = _spx_minute_bars(start_ms, 190)                                    # 09:30..12:39
+    bars[0]["open"] = 7790.0                                                  # the 09:30 candle opens at the range low
+    bars[4]["close"] = 7890.0                                                 # ... and closes at the range high
+    monkeypatch.setattr(market_data, "_spx_series", lambda when=None: (market_data._es_minutes(bars), now.timestamp()))
+    levels = market_data.get_opening_range(now)
+    assert levels is not None and levels.high == pytest.approx(7890.0) and levels.low == pytest.approx(7790.0)
+    assert levels.established_at == datetime(2026, 11, 10, 9, 45, tzinfo=config.ET)
 
 
 def test_an_index_candle_without_volume_is_still_a_candle():

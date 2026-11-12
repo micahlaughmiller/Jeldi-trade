@@ -313,6 +313,7 @@ BREAKOUT_LEVEL_SOURCE = "ES_TO_SPX"
 # reversible if ever revisited, not deleted. Identical to Alpaca/0DTE/config.py.
 # 2026-10-15: Schwab 0DTE trades B (SPX) and F (single-stock ORB) only -- C, D and E stay off. With MAX_OPEN_POSITIONS_TOTAL = 1 below, one
 # trade is open at a time across both. F had never run on Schwab before this date (allow-listed in tools/check_sync.py).
+# 2026-11-12 (edited on GitHub): Strategy C (the ES overnight-level break, its own C_ENTRY_END_MIN window) is on as well; D and E stay off.
 STRATEGIES = ("B", "C", "F")
 # Strategies that trade single-stock option roots with one position per ticker. They are excluded from
 # every SPX signal fan-out (strategy.spx_strategies) and from SPXW adoption; cards append the ticker.
@@ -346,6 +347,8 @@ MAX_CONTRACTS_PER_TRADE = 10
 # 2026-10-01: narrowing every strategy to a uniform 5 trades/day/persona across the board -- enough
 # live data gathered to start cutting toward an actual live-trading version rather than wide-open
 # exploratory limits. Identical to Alpaca/0DTE/config.py.
+# 2026-11-12 (Schwab live, edited on GitHub): 3 trades a day per strategy and 3 across every strategy together, 2 consecutive losses,
+# A's own limits 3 / 2 / 10 min (allow-listed in tools/check_sync.py; Alpaca keeps 5 / off / 5 and 5 / 5 / 30).
 MAX_TRADES_PER_DAY = 3
 # 2026-10-07: optional ONE cap across every strategy of a persona (B, C, D, E and F together): once this many trades have
 # been taken today (closed, plus those still open) no strategy enters again. OFF (None): the same day the user asked for
@@ -361,7 +364,7 @@ MAX_CONSECUTIVE_LOSSES = 2
 # before it may enter again). 2026-09-21: 11-16 A trades per persona re-bought the same breakout every
 # five minutes; capping at 3 trades would have cut the day's loss by 84%.
 LIMITS_BY_STRATEGY = {
-    "A": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 2, "COOLDOWN_MIN": 10},   # 2026-09-22: 5 trades to test the exit floors
+    "A": {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 2, "COOLDOWN_MIN": 10},   # 2026-09-22: 5 trades to test the exit floors; 2026-11-12: 3 / 2 / 10 min on Schwab
     "B": {},
     # 2026-09-25: 5 trades/day per strategy for the new multi-strategy personas (each active
     # strategy independently gets its own 5/day allowance, not a combined cap).
@@ -375,6 +378,7 @@ LIMITS_BY_STRATEGY = {
 }
 # 2026-10-15 (Schwab live go-live): acceptable daily loss is 1% and the daily goal is 2% of the day's start equity -- the capital cap (see
 # LIVE_CAPITAL_*), so $10 and $20 at the $1,000 minimum. Alpaca keeps 10% and no target (allow-listed in tools/check_sync.py).
+# 2026-11-12 (edited on GitHub): a 2.5% loss limit and a 5% daily goal ($25 and $50 at the $1,000 minimum).
 DAILY_LOSS_LIMIT_PCT = 0.025
 # Per-strategy concurrency cap and the limit() fallback for strategies without their own entry (A-E are
 # single-slot by dict-key construction; only F's entry path consults this).
@@ -419,6 +423,9 @@ ORB_ENTRY_KINDS_BY_STRATEGY = {"A": ("MOMENTUM", "PULLBACK"), "B": ("MOMENTUM", 
                                "F": ("MOMENTUM", "PULLBACK")}
 
 PROFIT_TARGET = 0.30
+# 2026-11-12 (edited on GitHub): 0.30 on Schwab (Alpaca 0.60). NOTE: PROFIT_TARGET / STOP_LOSS are Strategy A's exit levels
+# (strategy.EXIT_LEVELS_BY_STRATEGY); B, C, D and E read B_PROFIT_TARGET / B_STOP_LOSS below and F scales its own per position,
+# so the live B and C stop is still B_STOP_LOSS.
 STOP_LOSS = 0.30
 # Real seconds the spread price must sit at/above the stop before it actually closes (default 0 =
 # immediate, today's behavior everywhere except A). 2026-09-23: five personas hit an identical

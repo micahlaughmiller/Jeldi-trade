@@ -103,7 +103,7 @@ slow or down:
   ("SPX data: ..."). The overnight ES levels and the basis use the live ES bars when they are there.
 - `OPENING_RANGE_MINUTES = 15` and `OVERNIGHT_ENTRY_END_MIN = 15`: the opening range is 09:30-09:45 ET (08:30-08:45 Central)
   and range breaks are tradable from 09:45 ET (08:45 Central) until `LAST_ENTRY_TIME`. The ON_BREAK overnight-level setup only
-  runs in those first 15 minutes now; Strategy C (not enabled on Schwab) keeps its own window, `C_ENTRY_END_MIN` minutes after
+  runs in those first 15 minutes now; Strategy C (on Schwab since 12 Nov 2026) keeps its own window, `C_ENTRY_END_MIN` minutes after
   the open. The start-of-day report prints the window ("SPX data: ... opening range 09:30-09:45 ET, ORB entries from 09:45 to
   12:00 ET"). The Schwab series holds one day of regular-hours bars: Strategies D/E (multi-day windows) are not supported on
   the Schwab source and stay on Yahoo if ever enabled there. A Schwab request that fails, or a series that stops advancing,
@@ -111,3 +111,16 @@ slow or down:
 - A breakout signal found on a candle that arrived late (several candles at once after a data stall) is taken while it is at
   most `ORB_LATE_SIGNAL_MAX_MIN` old and the newest candle has not closed back inside the range; it used to be dropped as stale.
 - The Alpaca paper bots keep Yahoo data and the 30-minute range (`tools/check_sync.py` lists the three settings as intentional).
+
+## Opening range from candle bodies, Strategy C on, tighter day limits (12 Nov 2026, edited on GitHub)
+
+- `market_data.get_opening_range` builds the range from the completed 5-minute candles of the opening window (09:30-09:45 ET
+  on Schwab, three candles; 09:30-10:00 on Alpaca, six) using each candle's OPEN and CLOSE only: the wicks are ignored. The
+  range still waits for its last candle (the 09:40 one) and accepts a gap only `CANDLE_GAP_TOLERANCE_SEC` after the window.
+  The candle lookback always reaches back to the open, so a restart late in the day rebuilds the same range. Shared by all
+  three 0DTE folders.
+- Schwab config (Micah and Dawson, identical): `STRATEGIES = ("B", "C", "F")` (C = the ES overnight-level break, its own
+  `C_ENTRY_END_MIN` window), `MAX_TRADES_PER_DAY = 3`, `MAX_TRADES_TOTAL_PER_DAY = 3`, `MAX_CONSECUTIVE_LOSSES = 2`, A's own
+  limits 3 / 2 / 10 min, `DAILY_LOSS_LIMIT_PCT = 0.025`, `DAILY_PROFIT_TARGET_PCT = 0.05`, `STOP_LOSS = 0.30`. `STOP_LOSS` is
+  Strategy A's stop: B, C, D and E read `B_STOP_LOSS` (0.50) and F scales its own per position, so the live stop did not
+  change. Alpaca keeps its values (`tools/check_sync.py` lists every difference as intentional).

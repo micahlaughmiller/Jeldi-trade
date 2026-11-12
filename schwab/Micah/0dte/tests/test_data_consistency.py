@@ -114,7 +114,7 @@ def test_the_opening_range_comes_from_the_same_series_and_waits_for_a_settled_sn
     assert market_data.get_opening_range(at(10, 0, 5)) is None                                      # the 09:59 bar may be forming
     monkeypatch.setattr(market_data, "_spx_1m", lambda: (snap, epoch(at(10, 0, 3))))
     levels = market_data.get_opening_range(at(10, 0, 5))
-    assert levels.high == 7800.0 + 29 + 1.0 and levels.low == 7800.0 - 1.0
+    assert levels.high == 7800.0 + 29 and levels.low == 7800.0 - 0.5         # candle bodies only: the 09:59 close, the 09:30 open
     assert market_data.get_opening_range(at(9, 59)) is None
 
 

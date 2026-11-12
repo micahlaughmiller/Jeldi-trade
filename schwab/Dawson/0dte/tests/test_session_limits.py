@@ -92,6 +92,60 @@ def test_with_the_total_cap_off_only_the_per_strategy_caps_apply():
     assert config.MAX_TRADES_TOTAL_PER_DAY is None and rm.trading_allowed("A")[0] is True
 
 
+# ------------------------------------------------- a daily cap shared by B and C (2026-11-12)
+
+def test_b_and_c_share_a_daily_cap(monkeypatch):
+    """Micah, 12 Nov 2026: "all B and C strategies to be a total of 1-3 trades a day" -- B and C together take at most 3 a day."""
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "C"): 3})
+    rm = RiskManager(10_000)
+    rm.record_trade("B", 10.0)
+    rm.record_trade("C", 10.0)
+    assert rm.trading_allowed("B")[0] is True and rm.trading_allowed("C")[0] is True          # 2 of 3
+    ok, reason = rm.trading_allowed("B", open_by_strategy={"C": 1})                            # ... and the third is open in C
+    assert ok is False and reason == "SHARED_MAX_TRADES_PER_DAY (B+C 3/3)"
+    rm.record_trade("B", 10.0)
+    for strat in ("B", "C"):
+        ok, reason = rm.trading_allowed(strat)
+        assert ok is False and reason == "SHARED_MAX_TRADES_PER_DAY (B+C 3/3)"
+    for strat in ("A", "D", "F"):                                                              # not in the group: untouched
+        assert rm.trading_allowed(strat)[0] is True, strat
+
+
+def test_the_shared_cap_counts_open_positions_and_f_style_entries_once(monkeypatch):
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "C"): 3, ("F",): 2})
+    rm = RiskManager(10_000)
+    assert rm.trading_allowed("B", open_by_strategy={"B": 1, "C": 1})[0] is True               # two open, none closed
+    ok, reason = rm.trading_allowed("C", open_by_strategy={"B": 2, "C": 1})                    # three open
+    assert ok is False and reason == "SHARED_MAX_TRADES_PER_DAY (B+C 3/3)"
+    rm.record_entry("F")
+    rm.record_entry("F")                                                                       # F counts at entry ...
+    ok, reason = rm.trading_allowed("F", open_by_strategy={"F": 2})                            # ... its open spreads are those entries
+    assert ok is False and reason == "SHARED_MAX_TRADES_PER_DAY (F 2/2)"
+    assert rm.trading_allowed("B", open_by_strategy={"F": 2})[0] is True                       # F's cap is F's
+
+
+def test_without_the_open_counts_the_shared_cap_knows_this_strategy_s_own_open_positions(monkeypatch):
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "C"): 2})
+    rm = RiskManager(10_000)
+    rm.record_trade("C", 10.0)
+    assert rm.trading_allowed("B")[0] is True
+    assert rm.trading_allowed("B", open_count=1)[0] is False                                   # 1 closed C + 1 open B
+
+
+def test_the_shared_cap_survives_a_restart(monkeypatch):
+    """The counts live in the per-strategy day state the state file already holds; a group member with no state yet counts 0."""
+    from risk_manager import DayState
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "C"): 3})
+    rm = RiskManager(10_000)
+    for strat in ("B", "B", "C"):
+        rm.record_trade(strat, 10.0)
+    restored = RiskManager(10_000, DayState.from_dict(rm.state.to_dict()))
+    assert restored.trading_allowed("B") == (False, "SHARED_MAX_TRADES_PER_DAY (B+C 3/3)")
+    fresh = RiskManager(10_000, DayState.from_dict({"start_equity": 10_000, "strategies": {"B": {"trades_today": 1}}}))
+    assert fresh.trading_allowed("B")[0] is True and "C" not in fresh.state.strategies           # C has no state yet: counts 0, none made for it
+    assert fresh.trading_allowed("C")[0] is True
+
+
 # ------------------------------------------------- at most 2 trades open at one time (2026-10-08)
 
 @pytest.fixture(autouse=True)

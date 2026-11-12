@@ -30,6 +30,7 @@ def test_the_shipped_trade_limits():
     assert config.MAX_TRADES_PER_DAY == 3 and config.MAX_TRADES_TOTAL_PER_DAY == 3 and config.MAX_CONSECUTIVE_LOSSES == 2
     assert config.LIMITS_BY_STRATEGY["A"] == {"MAX_TRADES_PER_DAY": 3, "MAX_CONSECUTIVE_LOSSES": 2, "COOLDOWN_MIN": 10}
     assert config.STOP_LOSS == 0.30 and config.B_STOP_LOSS == 0.50 and config.C_STOP_LOSS == config.B_STOP_LOSS
+    assert config.MAX_TRADES_PER_DAY_SHARED == {("B", "C"): 3}                       # B and C: at most 3 trades a day between them
 
 
 def test_the_shipped_exit_booking_and_resting_exits():

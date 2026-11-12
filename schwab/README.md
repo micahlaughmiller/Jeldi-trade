@@ -124,3 +124,13 @@ slow or down:
   limits 3 / 2 / 10 min, `DAILY_LOSS_LIMIT_PCT = 0.025`, `DAILY_PROFIT_TARGET_PCT = 0.05`, `STOP_LOSS = 0.30`. `STOP_LOSS` is
   Strategy A's stop: B, C, D and E read `B_STOP_LOSS` (0.50) and F scales its own per position, so the live stop did not
   change. Alpaca keeps its values (`tools/check_sync.py` lists every difference as intentional).
+- `MAX_TRADES_PER_DAY_SHARED = {("B", "C"): 3}` (Micah, 12 Nov: "all B and C strategies to be a total of 1-3 trades a day"): B and
+  C together take at most 3 trades a day -- closed trades plus open positions, any mix (2 + 1, 3 + 0 ...). Each strategy's own
+  `MAX_TRADES_PER_DAY` (3) and `MAX_TRADES_TOTAL_PER_DAY` (3 across B, C and F together, set on GitHub the same morning) still
+  apply. The total cap is checked first and its count is never smaller, so today it is the one that refuses (journaled as
+  SIGNAL_SKIPPED `TOTAL_MAX_TRADES_PER_DAY`) and F's trades use up the same 3; the shared cap holds B + C at 3 on its own the
+  day the total cap is raised or turned off (e.g. to give F its own 3), journaled as `SHARED_MAX_TRADES_PER_DAY`. The
+  start-of-day report prints the caps ("Trade caps today: per strategy B 3, C 3, F 3; 3 across every strategy together; B+C
+  share 3; 1 open at a time; losses in a row that stop a strategy: B 2, C 2, F 7"), and the first refusal with a given set of
+  reasons reaches the console and the log file ("No new entries: ..."). The lower end of "1-3" is not a limit the bot can
+  promise: it takes what its setups signal. Alpaca paper: `{}` (off).

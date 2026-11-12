@@ -194,8 +194,9 @@ def _pin_data_source_and_opening_range(request, monkeypatch):
 @pytest.fixture(autouse=True)
 def _pin_trade_limits(request, monkeypatch):
     """The shared suite (test_session_limits included) describes the Alpaca trade limits: 5 trades a day per strategy, no total cap,
-    5 consecutive losses, A's own 5 / 5 / 30-minute limits and STOP_LOSS 0.60 (Strategy A's stop); the Schwab folder ships 3 / 3 / 2,
-    3 / 2 / 10 and 0.30 (2026-11-12). Pin the Alpaca values -- except in the per-folder guard modules, which check each folder's real ones."""
+    5 consecutive losses, A's own 5 / 5 / 30-minute limits, STOP_LOSS 0.60 (Strategy A's stop) and no cap shared by a group; the Schwab
+    folder ships 3 / 3 / 2, 3 / 2 / 10, 0.30 and B + C sharing 3 a day (2026-11-12). Pin the Alpaca values -- except in the per-folder
+    guard modules, which check each folder's real ones."""
     if request.module.__name__ not in GUARD_MODULES:
         monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
         monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
@@ -203,3 +204,4 @@ def _pin_trade_limits(request, monkeypatch):
         monkeypatch.setattr(config, "LIMITS_BY_STRATEGY", {**config.LIMITS_BY_STRATEGY,
                                                            "A": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 5, "COOLDOWN_MIN": 30}})
         monkeypatch.setattr(config, "STOP_LOSS", 0.60)
+        monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {}, raising=False)       # Schwab: B and C share 3 a day

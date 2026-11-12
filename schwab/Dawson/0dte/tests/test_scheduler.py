@@ -1183,6 +1183,18 @@ def test_an_open_position_counts_toward_the_total_cap_within_one_signal(bot, mon
     assert [(r["strategy"], r["reason_code"]) for r in skipped(bot)] == [("B", "TOTAL_MAX_TRADES_PER_DAY")]   # ... B is refused
 
 
+def test_a_shared_cap_blocks_its_group_through_the_scheduler_and_is_journaled(bot, monkeypatch):
+    """2026-11-12: a daily cap shared by a group (Schwab: B and C, 3 a day). A and B share 3 here: A's two closes and the position A
+    opens on this signal fill it, so B is refused on the same signal with the shared-cap code (the open position counts)."""
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("A", "B"): 3})
+    for strat in ("A", "A"):
+        bot.risk.record_trade(strat, 10.0)
+    bot.enter(et(10, 15), "ORB", BULLISH)
+    assert set(bot.pm.positions) == {"A"}                                              # A takes the third ...
+    assert [(r["strategy"], r["reason_code"]) for r in skipped(bot)] == [("B", "SHARED_MAX_TRADES_PER_DAY")]   # ... B is refused
+    assert bot.pm.open_counts() == {"A": 1}
+
+
 def test_nothing_enters_from_noon_eastern_and_the_bot_keeps_managing_until_the_hard_stop(bot, monkeypatch):
     import pandas as pd
     calls = []
@@ -2046,6 +2058,50 @@ def test_the_start_report_shows_the_days_limits_in_dollars(bot, monkeypatch, cap
     bot.report_start(et(9, 25), bot.broker.get_account(), [])
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Daily limits:"))
     assert "measured on account equity" in line and "no profit target" in line and "exempt from the loss limit: F" in line
+
+
+def test_the_start_report_states_the_days_trade_caps(bot, monkeypatch, caplog):
+    """2026-11-12: the morning console says how many trades the bot may take (Schwab live: 3 each, 3 together, B+C share 3, 1 open)."""
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "STRATEGIES", ("B", "C", "F"))
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 3)
+    monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", 3)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "C"): 3})
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", 1)
+    monkeypatch.setattr(config, "MAX_CONSECUTIVE_LOSSES", 2)
+    bot.report_start(et(9, 25), bot.broker.get_account(), [])
+    line = next(r for r in caplog.records if r.getMessage().startswith("Trade caps today:"))
+    assert line.keep is True
+    assert line.getMessage() == ("Trade caps today: per strategy B 3, C 3, F 3; 3 across every strategy together; B+C share 3; "
+                                 "1 open at a time; losses in a row that stop a strategy: B 2, C 2, F 7")
+    monkeypatch.setattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {})
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
+    caplog.clear()
+    bot.report_start(et(9, 25), bot.broker.get_account(), [])
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Trade caps today:"))
+    assert "no cap across strategies" in line and "share" not in line and "no cap on open positions" in line
+
+
+def test_a_refused_entry_reaches_the_log_once_per_reason_set(bot, monkeypatch, caplog):
+    """2026-11-12: the first refusal with a given set of reasons is kept (console + log file); repeats of the same reasons are not,
+    a different reason set is kept again, and an entry in between resets it."""
+    caplog.set_level("INFO")
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("A", "B"): 2})
+    bot.risk.record_trade("A", 10.0)
+    bot.risk.record_trade("B", 10.0)
+    equity = bot.broker.get_account()["equity"]
+    assert bot.entry_possible(equity, "ORB") is False
+    assert bot.entry_possible(equity, "ORB") is False
+    kept = [r for r in caplog.records if r.getMessage().startswith("No new entries:") and getattr(r, "keep", False)]
+    assert len(kept) == 1 and "SHARED_MAX_TRADES_PER_DAY (A+B 2/2)" in kept[0].getMessage()
+    bot.risk.record_trade("A", -10.0)                                                 # a different reason set: kept again
+    assert bot.entry_possible(equity, "ORB") is False
+    kept = [r for r in caplog.records if r.getMessage().startswith("No new entries:") and getattr(r, "keep", False)]
+    assert len(kept) == 2
+    bot._last_no_entry = None
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {})
+    assert bot.entry_possible(equity, "ORB") is True and bot._last_no_entry is None
 
 
 def test_the_per_strategy_entry_check_sees_the_bots_open_loss_on_the_bot_basis(bot, monkeypatch):

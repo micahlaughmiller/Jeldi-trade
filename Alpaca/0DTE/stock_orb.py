@@ -724,7 +724,7 @@ class StockOrbTrader:
             exempt_open_pnl=bot.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT), own_open_pnl=bot.pm.open_pnl(bot.loss_limit_strategies()),
             open_spx=bot.pm.open_spx_count(),
             open_total=bot.pm.open_total_count(), close_blocked=bot.pm.any_close_blocked(),
-            halt=bot.entry_halt_reason())
+            halt=bot.entry_halt_reason(), open_by_strategy=bot.pm.open_counts())   # the caps shared by a group count every member's open positions
         if not allowed:
             log.info("[F] No new entries: %s", reason)
             self._skip(now, sig, reason)

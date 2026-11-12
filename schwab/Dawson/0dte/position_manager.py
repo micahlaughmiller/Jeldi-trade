@@ -1046,6 +1046,14 @@ class PositionManager:
         """Open non-stock positions (A-E count a trade only when it closes, so the daily total cap needs these)."""
         return sum(1 for p in self.positions.values() if p.strategy not in config.STOCK_STRATEGIES)
 
+    def open_counts(self) -> dict[str, int]:
+        """Open positions per strategy: the daily caps shared by a group of strategies (MAX_TRADES_PER_DAY_SHARED) count a group's open
+        positions with its closed trades."""
+        counts: dict[str, int] = {}
+        for p in self.positions.values():
+            counts[p.strategy] = counts.get(p.strategy, 0) + 1
+        return counts
+
     def manual_hold(self) -> bool:
         """True while the owner has asked the bot to stand down from closing (see config.MANUAL_HOLD_FILE)."""
         folder = HERE / config.LOG_DIR

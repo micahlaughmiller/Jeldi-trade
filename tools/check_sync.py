@@ -81,6 +81,8 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
                                "{'A': {'MAX_TRADES_PER_DAY': 3, 'MAX_CONSECUTIVE_LOSSES': 2, 'COOLDOWN_MIN': 10}, 'B': {}, 'C': {'MAX_TRADES_PER_DAY': 3}, 'D': {'MAX_TRADES_PER_DAY': 3}, 'E': {'MAX_TRADES_PER_DAY': 3}, 'F': {'MAX_TRADES_PER_DAY': 3, 'MAX_CONSECUTIVE_LOSSES': 7, 'MAX_CONCURRENT_POSITIONS': 3}}",
                                "2026-11-12: Schwab live: A's own limits 3 trades, 2 losses, 10-minute cool-down (Alpaca 5 / 5 / 30)"),
         "STOP_LOSS": ("0.6", "0.3", "2026-11-12: Schwab live: STOP_LOSS 0.30 -- Strategy A's stop; B, C, D and E read B_STOP_LOSS (Alpaca 0.60)"),
+        "MAX_TRADES_PER_DAY_SHARED": ("{}", "{('B', 'C'): 3}", "2026-11-12: Schwab live: B and C together take at most 3 trades a day "
+                                      "(Micah: 'all B and C strategies to be a total of 1-3 trades a day'); Alpaca paper: off"),
     },
     "45DTE": {
         "EXIT_DTE_ENABLED": ("True", "False", "2026-10-02: Schwab never force-closes on DTE; positions ride to expiration"),

@@ -29,6 +29,7 @@ from broker import Broker, BrokerError
 from journal import Journal, format_close_card, format_day_table, format_entry_card
 from position_manager import OpenSpread, PositionManager, occ_expiration, occ_root, option_legs
 from risk_manager import DayState, RiskManager, contracts_for, tier
+from risk_manager import limit as strategy_limit
 from strategy import Phase
 
 if TYPE_CHECKING:   # stock_orb (and through it orb_scanner + yfinance) is imported lazily, by F personas only
@@ -141,6 +142,7 @@ class Bot:
         self.last_orb_candle: datetime | None = None
         self.pending_momentum: dict[str, PendingMomentum] = {}
         self.last_entry_blocks: dict[str, str] = {}   # strategy -> why entry_possible() refused it (for SIGNAL_SKIPPED)
+        self._last_no_entry: str | None = None        # the last refusal text that reached the console/log (repeats are chatter)
         self.last_continuation_check: dict[str, datetime] = {}
         self.today: date = now_et().date()
         self.es_setup: strategy.TwoCandleBreak | None = None   # Strategy C, ES-sourced overnight levels
@@ -655,15 +657,23 @@ class Bot:
                 continue
             allowed, reason = self.risk.trading_allowed(strat, equity, now_et(), setup,
                                                         exempt_open_pnl=exempt_open, own_open_pnl=own_open, open_spx=self.pm.open_spx_count(),
-                                                        open_total=self.pm.open_total_count(),
+                                                        open_total=self.pm.open_total_count(), open_by_strategy=self.pm.open_counts(),
                                                         close_blocked=self.pm.any_close_blocked(),
                                                         halt=self.entry_halt_reason())
             if allowed:
+                self._last_no_entry = None
                 return True
             reasons.append(reason)
             blocks[strat] = reason
         self.last_entry_blocks = blocks
-        log.info("No new entries: %s", "; ".join(reasons))
+        text = "; ".join(reasons)
+        # 2026-11-12: a refusal reaches the console and the log file (keep) the first time its reasons appear -- a day cap refusing
+        # a signal at 09:50 must be visible to the operator -- and is debug chatter while the same reasons repeat
+        if text != self._last_no_entry:
+            self._last_no_entry = text
+            log.info("No new entries: %s", text, extra={"keep": True})
+        else:
+            log.info("No new entries: %s", text)
         return False
 
     def signal_skipped(self, now: datetime, strat: str, setup: str, direction: str, kind: str | None, reason: str,
@@ -1125,6 +1135,7 @@ class Bot:
                                                     exempt_open_pnl=self.pm.open_pnl(config.DAILY_LOSS_LIMIT_EXEMPT),
                                                     own_open_pnl=self.pm.open_pnl(self.loss_limit_strategies()),
                                                     open_spx=self.pm.open_spx_count(), open_total=self.pm.open_total_count(),
+                                                    open_by_strategy=self.pm.open_counts(),
                                                     close_blocked=self.pm.any_close_blocked(),
                                                     halt=self.entry_halt_reason())
         if not allowed:
@@ -1530,6 +1541,22 @@ class Bot:
         exempt = f"; exempt from the loss limit: {', '.join(config.DAILY_LOSS_LIMIT_EXEMPT)}" if config.DAILY_LOSS_LIMIT_EXEMPT else ""
         return f"Daily limits: {loss}; {goal}{exempt}"
 
+    def _trade_cap_line(self) -> str:
+        """The day's trade-count caps as the risk manager applies them (2026-11-12: the morning console says how many trades the bot
+        may take today, which strategies share a pool, how many may be open at once and the loss streak that stops a strategy)."""
+        active = tuple(config.STRATEGIES)
+        parts = ["per strategy " + ", ".join(f"{s} {strategy_limit(s, 'MAX_TRADES_PER_DAY')}" for s in active)]
+        total = getattr(config, "MAX_TRADES_TOTAL_PER_DAY", None)
+        parts.append(f"{total} across every strategy together" if total else "no cap across strategies")
+        for group, cap in (getattr(config, "MAX_TRADES_PER_DAY_SHARED", None) or {}).items():
+            if cap:
+                parts.append(f"{'+'.join(group)} share {cap}")
+        open_cap = getattr(config, "MAX_OPEN_POSITIONS_TOTAL", None)
+        parts.append(f"{open_cap} open at a time" if open_cap else "no cap on open positions")
+        parts.append("losses in a row that stop a strategy: " + ", ".join(
+            f"{s} {strategy_limit(s, 'MAX_CONSECUTIVE_LOSSES')}" for s in active))
+        return "Trade caps today: " + "; ".join(parts)
+
     def report_start(self, now: datetime, acct: dict, positions: list[dict]) -> None:
         pnl = self.broker.get_pnl_summary()
         t = tier(acct["equity"])
@@ -1558,6 +1585,7 @@ class Bot:
             self._live_es_report_line(),
             self._spx_data_report_line(),
             self._daily_limit_line(),
+            self._trade_cap_line(),
             f"Day state: trades {day.trades_today} realized {fmt_money(day.realized_pnl)} " + " ".join(
                 f"| {k}: trades {s.trades_today} losses-in-a-row {s.consecutive_losses} P/L {fmt_money(s.realized_pnl)}"
                 for k, s in day.strategies.items()),

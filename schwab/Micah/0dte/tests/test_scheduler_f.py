@@ -134,6 +134,25 @@ def test_spx_signal_never_reaches_f(bot, data, caplog):
     assert bot.entry_possible(10_000.0) is True
 
 
+def test_f_s_entry_gate_passes_every_strategy_s_open_positions_to_the_shared_caps(bot, data, monkeypatch):
+    """2026-11-12: the daily caps shared by a group (MAX_TRADES_PER_DAY_SHARED) count the other members' OPEN positions too, so F's own
+    gate hands the risk manager every strategy's open count, as the SPX gates do."""
+    rank(bot, data)
+    seen = {}
+    real = bot.risk.trading_allowed
+
+    def spy(strat, *a, **kw):
+        seen.update(kw)
+        return real(strat, *a, **kw)
+    monkeypatch.setattr(bot.risk, "trading_allowed", spy)
+    bot.pm.open(f_spread("AMZN", qty=1, width=10.0, credit=1.0))
+    bot.f.enter(et(10, 0), signal())                                                  # enters TSLA: two F spreads open now
+    assert seen["open_by_strategy"] == {"F": 1} and seen["open_count"] == 1 and bot.pm.open_counts() == {"F": 2}
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {("B", "F"): 2})
+    bot.risk.record_trade("B", 10.0)                                                   # B closed 1 + F open 2 = 3 of the group's 2
+    assert bot.f.enter(et(10, 0), signal("AAPL")).startswith("skip: SHARED_MAX_TRADES_PER_DAY (B+F 3/2)")
+
+
 def test_entry_rejections_are_journaled_with_ticker(bot, data):
     rank(bot, data)
     b = bot.broker

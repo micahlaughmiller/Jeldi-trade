@@ -351,6 +351,13 @@ MAX_TRADES_PER_DAY = 5
 # been taken today (closed, plus those still open) no strategy enters again. OFF (None): the same day the user asked for
 # per-strategy limits instead -- B 5 a day (MAX_TRADES_PER_DAY above), C, D, E and F 3 a day each (LIMITS_BY_STRATEGY below).
 MAX_TRADES_TOTAL_PER_DAY = None
+# 2026-11-12 (Micah: "all B and C strategies to be a total of 1-3 trades a day"): a daily trade cap SHARED by a group of strategies.
+# {(strategies...): cap}: the group's trades today -- closed, plus those still open, plus F-style entries -- may not exceed the cap,
+# so with {("B", "C"): 3} B and C take at most 3 a day between them (2 + 1, 3 + 0, any mix). Each strategy's own MAX_TRADES_PER_DAY
+# and the all-strategies MAX_TRADES_TOTAL_PER_DAY still apply on top. A strategy outside every group is untouched. The lower end
+# of "1-3" is not something a limit can promise: the bot takes what its setups signal. Journal reason: SHARED_MAX_TRADES_PER_DAY.
+# Alpaca paper: off (Schwab live: B and C share 3 a day; allow-listed in tools/check_sync.py).
+MAX_TRADES_PER_DAY_SHARED = {}
 # 2026-10-08: at most this many trades OPEN at one time across ALL of a persona's strategies (B, C, D, E and F together;
 # before this each of B-E had its own single slot and F up to 3, so 7 could be open). None = off. A trade being
 # decided is refused while this many are open; positions adopted from the broker at a restart are not counted against a

@@ -162,7 +162,8 @@ class RiskManager:
                         now: datetime | None = None, setup: str | None = None,
                         open_count: int = 0, exempt_open_pnl: float = 0.0,
                         open_spx: int = 0, open_total: int = 0, close_blocked: bool = False,
-                        halt: str | None = None, own_open_pnl: float = 0.0) -> tuple[bool, str]:
+                        halt: str | None = None, own_open_pnl: float = 0.0,
+                        open_by_strategy: dict[str, int] | None = None) -> tuple[bool, str]:
         """`setup` is the setup of the entry being considered. The cool-down only blocks re-entry into
         the SAME setup that just exited (2026-09-23: an early ON_BREAK exit was blocking a later, genuinely
         different ORB signal that represented the morning's move continuing into the day) -- if either the
@@ -171,7 +172,9 @@ class RiskManager:
         ones plus those); `exempt_open_pnl` is the open P/L of the DAILY_LOSS_LIMIT_EXEMPT strategies
         (PositionManager.open_pnl: marks plus partial-close bookings on still-open positions), removed
         from account equity before the drawdown check so nothing of theirs ever trips the SPX limit. `own_open_pnl` is the open
-        P/L of every strategy that counts toward the limit; it is used only when config.DAILY_LOSS_BASIS is "bot"."""
+        P/L of every strategy that counts toward the limit; it is used only when config.DAILY_LOSS_BASIS is "bot". `open_by_strategy`
+        is every strategy's open positions (PositionManager.open_counts) for the caps shared by a group of strategies
+        (MAX_TRADES_PER_DAY_SHARED); without it only this strategy's `open_count` is known."""
         block = self.transient_block(open_total, close_blocked, halt)
         if block:
             return False, block
@@ -185,6 +188,19 @@ class RiskManager:
             taken = sum(max(st.entries_today, st.trades_today) for st in self.state.strategies.values()) + open_spx
             if taken >= total_cap:
                 return False, f"TOTAL_MAX_TRADES_PER_DAY ({taken}/{total_cap})"
+        # 2026-11-12: a daily cap shared by a group of strategies (Micah: "all B and C strategies to be a total of 1-3 trades a day"):
+        # the group's closed trades plus its open positions (A-E count a trade when it closes) or its recorded entries (F counts at entry)
+        opens = open_by_strategy if open_by_strategy is not None else {strat: open_count}
+        for group, cap in (getattr(config, "MAX_TRADES_PER_DAY_SHARED", None) or {}).items():
+            if not cap or strat not in group:
+                continue
+            taken = 0
+            for member in group:
+                st = self.state.strategies.get(member)
+                closed, entered = (st.trades_today, st.entries_today) if st is not None else (0, 0)
+                taken += max(entered, closed + int(opens.get(member, 0)))
+            if taken >= cap:
+                return False, f"SHARED_MAX_TRADES_PER_DAY ({'+'.join(group)} {taken}/{cap})"
         if s.consecutive_losses >= limit(strat, "MAX_CONSECUTIVE_LOSSES"):
             return False, f"{strat}: MAX_CONSECUTIVE_LOSSES ({s.consecutive_losses})"
         if s.manual_cooldown_until and now is not None:

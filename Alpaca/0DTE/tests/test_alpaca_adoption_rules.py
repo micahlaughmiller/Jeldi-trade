@@ -25,6 +25,12 @@ def test_the_shipped_exit_booking_and_resting_exits():
     assert config.RESTING_EXITS is False
 
 
+def test_the_shipped_trade_limits():
+    """Alpaca paper: 5 trades a day per strategy, no total cap, no cap shared by a group (Schwab live: 3 / 3 and B + C share 3, 2026-11-12)."""
+    assert config.MAX_TRADES_PER_DAY == 5 and config.MAX_TRADES_TOTAL_PER_DAY is None and config.MAX_CONSECUTIVE_LOSSES == 5
+    assert config.MAX_TRADES_PER_DAY_SHARED == {} and config.STOP_LOSS == 0.60
+
+
 def test_the_shipped_data_source_and_opening_range():
     """The paper bots keep Yahoo SPX data and the 30-minute opening range."""
     assert config.SPX_CANDLE_SOURCE == "yahoo"

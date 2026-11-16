@@ -320,6 +320,11 @@ class SchwabBroker:
 
         self.risk_free_rate = float(self._cfg("RISK_FREE_RATE", 0.04))
         self.close_slippage = float(self._cfg("CLOSE_SLIPPAGE", 0.05))
+        # 2026-11-16: "mid" starts a close at the spread mid + CLOSE_MID_OFFSET (Micah: "buy the mid or plus 5 cents of mid"); "natural"
+        # at the ask side + CLOSE_SLIPPAGE as before. The last attempt of a close is always marketable (ask side + slippage).
+        self.close_price_basis = str(self._cfg("CLOSE_PRICE_BASIS", "natural") or "natural").strip().lower()
+        self.close_mid_offset = float(self._cfg("CLOSE_MID_OFFSET", 0.05))
+        self.close_mid_attempts = int(self._cfg("CLOSE_MID_ATTEMPTS", 2))     # orders worked at the mid before the close goes marketable
         self._oco_supported: bool | None = None      # 2026-11-06: None until Schwab's preview has judged the OCO form once
         self.close_retry_sec = float(self._cfg("CLOSE_RETRY_SEC", 10.0))
         self.close_max_retries = int(self._cfg("CLOSE_MAX_RETRIES", 5))
@@ -1271,6 +1276,12 @@ class SchwabBroker:
 
     def _spread_close_ask(self, underlying: str, expiration: date, right: str, short_strike: float,
                           long_strike: float, root: str | None) -> float:
+        return self._spread_close_quote(underlying, expiration, right, short_strike, long_strike, root)[0]
+
+    def _spread_close_quote(self, underlying: str, expiration: date, right: str, short_strike: float,
+                            long_strike: float, root: str | None) -> tuple[float, float]:
+        """(natural, mid) of buying the spread back: natural = short ask - long bid (what a marketable buy pays), mid = short mid -
+        long mid (what the strategy marks the spread at)."""
         lo, hi = sorted((short_strike, long_strike))
         chain = self.get_option_chain(underlying, expiration, right, strike_min=lo - 1e-6, strike_max=hi + 1e-6)
         r = (root or _strip_index(underlying) or underlying).upper()
@@ -1279,14 +1290,22 @@ class SchwabBroker:
         long_q = by_strike.get((long_strike, r)) or next((q for q in chain if q["strike"] == long_strike), None)
         if short_q is None or long_q is None:
             raise BrokerError(f"could not quote spread {short_strike}/{long_strike} {right} {expiration}")
-        return max(short_q["ask"] - long_q["bid"], 0.01)
+        natural = max(float(short_q["ask"]) - float(long_q["bid"]), 0.01)
+        mid = max((float(short_q["bid"]) + float(short_q["ask"])) / 2 - (float(long_q["bid"]) + float(long_q["ask"])) / 2, 0.01)
+        return natural, round(mid, 4)
 
     def close_spread_at_market(self, underlying: str, expiration: date, right: str, short_strike: float,
                                long_strike: float, qty: int, time_in_force: str = "gtc",
-                               root: str | None = None, client_tag: str | None = None) -> dict:
+                               root: str | None = None, client_tag: str | None = None, urgent: bool = False) -> dict:
+        """Work a buy-to-close until it fills. 2026-11-16 (CLOSE_PRICE_BASIS "mid"): the first CLOSE_MID_ATTEMPTS orders sit at the
+        spread mid + CLOSE_MID_OFFSET (re-quoted each retry, never below the previous order + a tick); every later retry is marketable,
+        the ask side + CLOSE_SLIPPAGE re-quoted at that moment and climbing a tick a retry. `urgent` (a stop, the hard stop, a flatten)
+        skips the mid phase: marketable from the first order, as every close was before."""
         r = (root or _strip_index(underlying) or underlying).upper()
-        price = snap_spx_price(self._spread_close_ask(underlying, expiration, right, short_strike, long_strike, root)
-                               + self.close_slippage, r)
+        natural, mid = self._spread_close_quote(underlying, expiration, right, short_strike, long_strike, root)
+        marketable = snap_spx_price(natural + self.close_slippage, r)          # the ask side + slippage: fills at once in a normal market
+        mid_attempts = self.close_mid_attempts if (self.close_price_basis == "mid" and not urgent) else 0
+        price = snap_spx_price(mid + self.close_mid_offset, r) if mid_attempts > 0 else marketable
         tag = client_tag or "close_at_market"
         order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike, qty, price,
                                         time_in_force=time_in_force, root=root, client_tag=tag)
@@ -1328,9 +1347,17 @@ class SchwabBroker:
             remaining = qty - sum(q for q, _ in fills)
             if remaining <= 0:
                 return booked(latest, include_final=False)
-            price = next_close_price(price, self.close_slippage, r)
-            self.log.warning("close_spread_at_market retry %d/%d at %.2f", attempt + 1,
-                             self.close_max_retries, price, extra={"keep": True})
+            retry_no = attempt + 1
+            try:                                                   # 2026-11-16: every retry is priced off a fresh quote
+                natural, mid = self._spread_close_quote(underlying, expiration, right, short_strike, long_strike, root)
+                marketable = snap_spx_price(natural + self.close_slippage, r)
+            except BrokerError as e:
+                self.log.warning("close_spread_at_market: retry %d could not re-quote the spread (%s); climbing from the last order", retry_no,
+                                 e, extra={"keep": True})
+            want = snap_spx_price(mid + self.close_mid_offset, r) if retry_no < mid_attempts else marketable
+            price = max(next_close_price(price, self.close_slippage, r), want)   # never below the previous order + a tick
+            self.log.warning("close_spread_at_market retry %d/%d at %.2f%s", retry_no, self.close_max_retries, price,
+                             " (marketable)" if retry_no >= mid_attempts else " (mid)", extra={"keep": True})
             order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike,
                                             remaining, price, time_in_force=time_in_force, root=root,
                                             client_tag=tag)

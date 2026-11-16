@@ -1266,9 +1266,11 @@ class PositionManager:
                 log.warning("[%s] CLOSING %d/%d %s (%s) at market, spread mid %.2f",
                             key, qty, p.remaining, p.right, reason, spread_price)
             try:
+                # 2026-11-16: a stop, the hard stop, a flatten or Ctrl-C is marketable at once; a profit exit starts at the mid + 0.05
+                urgent = any(k in str(reason).upper() for k in getattr(config, "CLOSE_URGENT_REASON_KEYWORDS", ("STOP", "FORCE", "FLATTEN", "INTERRUPT")))
                 order = self.broker.close_spread_at_market(
                     p.underlying, p.expiration, p.right, p.short_strike, p.long_strike, qty,
-                    time_in_force="day", root=p.root)
+                    time_in_force="day", root=p.root, urgent=urgent)
             except BrokerError as e:
                 order = None
                 log.error("[%s] CLOSE_FAILED attempt %d/%d: %s", key, attempt, config.CLOSE_MAX_RETRIES, e)

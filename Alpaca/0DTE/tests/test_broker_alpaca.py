@@ -380,6 +380,23 @@ def test_close_spread_at_market_escalates(b):
     assert posts[0]["legs"][0]["position_intent"] == "buy_to_close"
 
 
+def test_close_spread_at_market_at_the_mid_basis_starts_five_cents_above_the_mid_and_ends_marketable(b):
+    """2026-11-16: quotes 1.00/1.20 and 0.30/0.40 -- mid 0.75, ask side 0.90. Two attempts at the mid + 0.05 (0.80, then 0.85: never
+    below the previous order), then marketable: the ask side + 0.05 = 0.95."""
+    b.close_price_basis, b.close_mid_offset, b.close_mid_attempts = "mid", 0.05, 2
+    snaps = {"SPXW260917P06300000": {"latestQuote": {"ap": 1.2, "bp": 1.0}}, "SPXW260917P06295000": {"latestQuote": {"ap": 0.4, "bp": 0.3}}}
+    b._session.add("GET", "/v1beta1/options/snapshots/SPXW", body={"snapshots": snaps})
+    working = dict(MLEG_RAW, status="new", filled_qty="0", id="c1")
+    working["legs"] = [dict(l, status="new", filled_avg_price=None) for l in MLEG_RAW["legs"]]
+    b._session.add("POST", "/v2/orders", body=working)
+    b._session.add("GET", "/v2/orders/c1", body=dict(working, status="canceled"))
+    b._session.add("DELETE", "/v2/orders/c1", status=204, body="")
+    with pytest.raises(BrokerError):
+        b.close_spread_at_market("SPX", date(2026, 9, 17), "P", 6300, 6295, 1, root="SPXW")
+    posts = [c["json"] for c in b._session.calls if c["method"] == "POST"]
+    assert [p["limit_price"] for p in posts] == ["0.80", "0.85", "0.95"]
+
+
 def test_close_spread_at_market_exhausts_and_raises(b):
     snaps = {"SPXW260917P06300000": {"latestQuote": {"ap": 1.2, "bp": 1.0}}, "SPXW260917P06295000": {"latestQuote": {"ap": 0.4, "bp": 0.3}}}
     b._session.add("GET", "/v1beta1/options/snapshots/SPXW", body={"snapshots": snaps})

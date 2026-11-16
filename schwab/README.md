@@ -134,3 +134,22 @@ slow or down:
   share 3; 1 open at a time; losses in a row that stop a strategy: B 2, C 2, F 7"), and the first refusal with a given set of
   reasons reaches the console and the log file ("No new entries: ..."). The lower end of "1-3" is not a limit the bot can
   promise: it takes what its setups signal. Alpaca paper: `{}` (off).
+
+## Closes start at the mid + 5 cents (16 Nov 2026)
+
+Three 16 Nov B/C trades entered at 1.00, showed +0.20 on the mid, and were bought back at 1.00 on the first pullback. Exits decide
+on the spread MID while a close paid the ask side (short ask minus long bid + 0.03 on the $0.05 grid, climbing every 2 s), 0.10 to
+0.25 worse on a 5-wide SPX 0DTE spread. Micah's call after a replay of the eight logged live trades (4-11 Nov: old rules +$45, the
+same exits bought back at the mid + 0.05 about +$85, the alternative exit rules worse): keep the exit rules as they are and change
+only the price a close is worked at.
+
+- `CLOSE_PRICE_BASIS = "mid"`, `CLOSE_MID_OFFSET = 0.05`, `CLOSE_MID_ATTEMPTS = 2`: a profit exit (trail, floor, target, lock) starts
+  at the spread mid + 0.05 snapped down to the $0.05 grid, so the mid or up to 5 cents above it. If it does not fill in 2 s it is
+  re-quoted and sent again at the new mid + 0.05 (never below the previous order + a tick); after those two orders every retry is
+  marketable: the ask side + 0.03 re-quoted at that moment, climbing a tick a retry as before, up to the usual 6 retries.
+- `CLOSE_URGENT_REASON_KEYWORDS = ("STOP", "FORCE", "FLATTEN", "INTERRUPT")`: a stop, the 13:00 hard stop, the stale-data flatten and
+  Ctrl-C skip the mid phase and are marketable from their first order, exactly as every close was before. The review found that a
+  stop waiting at the mid in a fast market could sit under the market for 18 s; this is why.
+- Log lines: "close_spread_at_market retry n/6 at x.xx (mid)" or "(marketable)". `"natural"` restores the old start for every close.
+  Same rule in the Alpaca paper broker. The resting profit target at Schwab is unchanged (it fills at its own price).
+- Nothing else changed: stage 1 still arms at +$0.20 and exits on the trail or a reversal read, stage 2 at +$0.30 with the floor.

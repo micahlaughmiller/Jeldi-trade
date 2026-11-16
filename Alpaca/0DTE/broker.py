@@ -158,6 +158,11 @@ class Broker:
 
         self.risk_free_rate = float(getattr(config_module, "RISK_FREE_RATE", 0.04))
         self.close_slippage = float(getattr(config_module, "CLOSE_SLIPPAGE", 0.05))
+        # 2026-11-16: "mid" starts a close at the spread mid + CLOSE_MID_OFFSET (Micah: "buy the mid or plus 5 cents of mid"); "natural"
+        # at the ask side + CLOSE_SLIPPAGE as before. The last attempt of a close is always marketable (ask side + slippage).
+        self.close_price_basis = str(getattr(config_module, "CLOSE_PRICE_BASIS", "natural") or "natural").strip().lower()
+        self.close_mid_offset = float(getattr(config_module, "CLOSE_MID_OFFSET", 0.05))
+        self.close_mid_attempts = int(getattr(config_module, "CLOSE_MID_ATTEMPTS", 2))
         self.close_retry_sec = float(getattr(config_module, "CLOSE_RETRY_SEC", 15))
         self.close_max_retries = int(getattr(config_module, "CLOSE_MAX_RETRIES", 6))
         self.timeout = float(getattr(config_module, "HTTP_TIMEOUT_SEC", 20))
@@ -663,36 +668,59 @@ class Broker:
         return self._submit(payload, "place_close_spread")
 
     def _spread_close_price(self, root: str, expiration: date, right: str, short_strike: float, long_strike: float) -> float | None:
+        quote = self._spread_close_quote(root, expiration, right, short_strike, long_strike)
+        return None if quote is None else quote[0]
+
+    def _spread_close_quote(self, root: str, expiration: date, right: str, short_strike: float,
+                            long_strike: float) -> tuple[float, float] | None:
+        """(natural, mid) of buying the spread back: short ask - long bid, and short mid - long mid. None without a quote."""
         lo, hi = min(short_strike, long_strike), max(short_strike, long_strike)
         chain = self.get_option_chain(root, expiration, right, strike_min=lo - 0.01, strike_max=hi + 0.01)
         by_strike = {round(r["strike"], 3): r for r in chain if r["root"] == root.upper()} or {round(r["strike"], 3): r for r in chain}
         s, l = by_strike.get(round(short_strike, 3)), by_strike.get(round(long_strike, 3))
         if not s or not l:
             return None
-        return max(s["ask"] - l["bid"], 0.0)
+        natural = max(float(s["ask"]) - float(l["bid"]), 0.0)
+        mid = max((float(s["bid"]) + float(s["ask"])) / 2 - (float(l["bid"]) + float(l["ask"])) / 2, 0.0)
+        return natural, round(mid, 4)
 
     def close_spread_at_market(self, underlying: str, expiration: date, right: str, short_strike: float,
                                long_strike: float, qty: int, time_in_force: str = "day",
-                               root: str | None = None, client_tag: str | None = None) -> dict:
-        """Escalating-limit close: ask-side spread price + CLOSE_SLIPPAGE, worse by CLOSE_SLIPPAGE each retry."""
+                               root: str | None = None, client_tag: str | None = None, urgent: bool = False) -> dict:
+        """Escalating-limit close. CLOSE_PRICE_BASIS "mid" (2026-11-16): the first CLOSE_MID_ATTEMPTS orders at the spread mid +
+        CLOSE_MID_OFFSET (re-quoted each attempt), then the ask side + CLOSE_SLIPPAGE, worse by CLOSE_SLIPPAGE each further retry;
+        `urgent` (a stop, the hard stop, a flatten) skips the mid phase. "natural": ask-side + CLOSE_SLIPPAGE, worse by CLOSE_SLIPPAGE
+        each retry (the 2026-09-23 rule)."""
         root = (root or underlying).upper()
         remaining = int(qty)
         last_order = None
         last_price = None
+        last_mid = None
+        last_limit = None
         for attempt in range(self.close_max_retries + 1):
             try:
-                px = self._spread_close_price(root, expiration, right, short_strike, long_strike)
+                quote = self._spread_close_quote(root, expiration, right, short_strike, long_strike)
             except BrokerError as e:
                 self.log(f"[broker] chain lookup failed during close ({e}); using fallback price")
-                px = None
-            if px is None:
+                quote = None
+            if quote is None:
                 px = last_price if last_price is not None else max(abs(short_strike - long_strike) * 0.5, 0.05)
-            last_price = px
-            limit = round(px + self.close_slippage * (attempt + 1), 2)
+                mid = last_mid if last_mid is not None else px
+            else:
+                px, mid = quote
+            last_price, last_mid = px, mid
+            mid_attempts = self.close_mid_attempts if (self.close_price_basis == "mid" and not urgent) else 0
+            if attempt < mid_attempts:
+                limit = round(mid + self.close_mid_offset + self.close_slippage * attempt, 2)   # the mid phase, re-quoted, a step worse each attempt
+            else:
+                limit = round(px + self.close_slippage * (attempt - mid_attempts + 1), 2)   # marketable, worse by a step each retry
+            if last_limit is not None and limit < last_limit + 0.01:
+                limit = round(last_limit + 0.01, 2)                                        # never below the previous order
             limit = max(limit, 0.01)
             width = abs(short_strike - long_strike)
             if width > 0:
                 limit = min(limit, round(width, 2))
+            last_limit = limit
             self.log(f"[broker] close_spread_at_market attempt {attempt + 1}/{self.close_max_retries + 1} qty={remaining} limit={limit:.2f}")
             order = self.place_close_spread(underlying, expiration, right, short_strike, long_strike, remaining,
                                             limit, time_in_force, root=root, client_tag=client_tag)

@@ -940,6 +940,16 @@ def test_a_close_at_market_with_the_three_cent_slippage_lands_on_the_grid(tmp_pa
     assert order["raw"]["price"] == "1.80"           # ask-side 1.80 + 0.03 = 1.83: the 3 Nov orders went out like that and were rejected
 
 
+def test_a_dry_run_close_at_the_mid_basis_starts_five_cents_above_the_mid(tmp_path, fake, monkeypatch):
+    monkeypatch.delenv("SCHWAB_LIVE_ORDERS", raising=False)
+    b = Broker(make_config(tmp_path, CLOSE_SLIPPAGE=0.03, CLOSE_PRICE_BASIS="mid", CLOSE_MID_OFFSET=0.05), dry_run=True,
+               log=logging.getLogger("test.broker"))
+    b._client = fake
+    b._sleep = lambda s: None
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW")
+    assert order["raw"]["price"] == "1.65"           # mid 1.60 + 0.05 (the ask side would be 1.80)
+
+
 def test_a_dry_run_re_price_of_an_spx_order_is_snapped(brk):
     order = brk.place_credit_spread("SPX", EXP, "P", 7610, 7605, qty=1, limit_credit=0.90, root="SPXW")
     assert brk.replace_order_price(order["id"], 0.83)["raw"]["price"] == "0.80"

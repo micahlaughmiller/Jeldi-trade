@@ -28,6 +28,7 @@ class FakeBroker:
         self.today = today or date(2026, 9, 17)
         self.positions: dict[str, dict] = {}
         self.orders: dict[str, dict] = {}
+        self.close_urgent: list[bool] = []
         # (underlying, right) -> {strike: (bid, ask)}; underlying None is the SPX chain
         self.chains: dict[tuple[str | None, str], dict[float, tuple[float, float]]] = {(None, "P"): {}, (None, "C"): {}}
         self.expirations: dict[str, list[date]] = {}
@@ -171,8 +172,9 @@ class FakeBroker:
 
     def close_spread_at_market(self, underlying: str, expiration: date, right: str, short_strike: float,
                                long_strike: float, qty: int, time_in_force: str = "gtc",
-                               root: str | None = None, client_tag: str | None = None) -> dict:
+                               root: str | None = None, client_tag: str | None = None, urgent: bool = False) -> dict:
         self.close_calls.append({"right": right, "short": short_strike, "long": long_strike, "qty": qty})
+        self.close_urgent.append(urgent)                      # 2026-11-16: a stop / hard stop / flatten is marketable at once
         self.close_roots.append(root or underlying)
         if self.close_failures > 0:
             self.close_failures -= 1

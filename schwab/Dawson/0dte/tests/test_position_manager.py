@@ -983,3 +983,17 @@ def test_the_paper_basis_is_the_default_and_books_on_the_tick_before_the_trigger
     row = tick(pm, et(10, 4), 3.61, rising())[0]
     assert row["pnl"] == pytest.approx(-60.00) and row["realistic_exit_price"] == pytest.approx(3.60)
     assert row["pnl_actual_fill"] == pytest.approx(-65.00)
+
+
+def test_a_stop_close_is_urgent_and_a_profit_exit_is_not(pm, broker, monkeypatch):
+    """2026-11-16: a stop (and the hard stop, a flatten, Ctrl-C) is marketable from its first order; a profit exit starts at the mid + 0.05."""
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    open_b_put_spread(pm, broker, qty=1, credit=1.00)                     # B: target 0.70, stop 1.50, no stop confirmation
+    rows = tick(pm, et(10, 1), 1.50, rising(), strat="B")
+    assert rows and rows[0]["exit_reason"] == "STOP_LOSS" and broker.close_urgent[-1] is True
+    open_b_put_spread(pm, broker, qty=1, credit=1.00)
+    rows = tick(pm, et(10, 2), 0.70, rising(), strat="B")
+    assert rows and rows[0]["exit_reason"] == "PROFIT_TARGET" and broker.close_urgent[-1] is False
+    open_b_put_spread(pm, broker, qty=1, credit=1.00)
+    rows = pm.force_close(et(10, 3), {"B": 1.00})
+    assert rows and broker.close_urgent[-1] is True

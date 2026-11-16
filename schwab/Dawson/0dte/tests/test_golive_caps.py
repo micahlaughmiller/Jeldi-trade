@@ -768,6 +768,56 @@ def test_a_close_that_does_not_fill_is_re_sent_one_tick_higher(tmp_path, monkeyp
     assert fake.canceled == ["777"]
 
 
+def test_a_close_starts_at_the_mid_plus_five_cents_climbs_a_tick_a_time_and_the_last_attempt_is_marketable(tmp_path, monkeypatch, caplog):
+    """2026-11-16 (Micah: "buy the mid or plus 5 cents of mid"): the chain quotes 7610P 9.30/9.50 and 7605P 7.70/7.90 -- mid 1.60, ask side
+    1.80. With CLOSE_MID_ATTEMPTS=2 the close goes out at 1.65, then 1.70 (the mid phase, re-quoted), and the next retry is marketable:
+    the ask side + 0.03 on the grid, 1.80."""
+    fake = CloseFake()
+    fake.order_by_id["777"] = _raw_close(777, "WORKING", 1.65)
+    fake.order_by_id["778"] = _raw_close(778, "WORKING", 1.70)
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03, CLOSE_PRICE_BASIS="mid", CLOSE_MID_OFFSET=0.05, CLOSE_MID_ATTEMPTS=2)
+    select(tmp_path)
+    with caplog.at_level(logging.INFO):
+        order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert order["status"] == "filled" and order["id"] == "779" and order["filled_avg_price"] == 1.80
+    assert [o["price"] for _, o in fake.placed] == ["1.65", "1.70", "1.80"]
+    assert fake.canceled == ["777", "778"]
+    assert any("retry 2/2 at 1.80 (marketable)" in r.getMessage() for r in caplog.records)
+
+
+def test_an_urgent_close_is_marketable_from_its_first_order(tmp_path, monkeypatch):
+    """A stop, the hard stop, a flatten or Ctrl-C never waits at the mid: the first order is the ask side + 0.03 on the grid."""
+    fake = CloseFake()
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03, CLOSE_PRICE_BASIS="mid", CLOSE_MID_OFFSET=0.05, CLOSE_MID_ATTEMPTS=2)
+    select(tmp_path)
+    b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day", urgent=True)
+    assert [o["price"] for _, o in fake.placed] == ["1.80"]
+
+
+def test_a_mid_close_follows_a_market_that_moves_against_it(tmp_path, monkeypatch):
+    """The ask side jumps 0.20 after the first order: the mid-phase retry is re-quoted (not a blind tick), and the marketable retry
+    pays the ask side as it is then."""
+    fake = CloseFake()
+    fake.order_by_id["777"] = _raw_close(777, "WORKING", 1.65)
+    fake.order_by_id["778"] = _raw_close(778, "WORKING", 1.90)
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03, CLOSE_PRICE_BASIS="mid", CLOSE_MID_OFFSET=0.05, CLOSE_MID_ATTEMPTS=2)
+    select(tmp_path)
+    quotes = iter([(1.80, 1.60), (2.00, 1.85), (2.05, 1.90)])                     # (natural, mid) at each quote
+    monkeypatch.setattr(b, "_spread_close_quote", lambda *a, **k: next(quotes))
+    order = b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert [o["price"] for _, o in fake.placed] == ["1.65", "1.90", "2.05"]      # mid 1.60+0.05; mid 1.85+0.05; ask side 2.05+0.03 -> 2.05
+    assert order["status"] == "filled" and order["filled_avg_price"] == 2.05
+
+
+def test_a_mid_close_whose_mid_is_off_the_grid_is_never_more_than_five_cents_above_the_mid(tmp_path, monkeypatch):
+    fake = CloseFake()
+    b = make(tmp_path, monkeypatch, fake, live=True, CLOSE_SLIPPAGE=0.03, CLOSE_PRICE_BASIS="mid", CLOSE_MID_OFFSET=0.05)
+    select(tmp_path)
+    monkeypatch.setattr(b, "_spread_close_quote", lambda *a, **k: (1.05, 0.83))      # mid 0.83: 0.88 -> 0.85 on the grid
+    b.close_spread_at_market("SPX", EXP, "P", 7610, 7605, qty=1, root="SPXW", time_in_force="day")
+    assert [o["price"] for _, o in fake.placed] == ["0.85"]
+
+
 def test_a_live_re_price_of_an_spx_order_lands_on_the_grid_and_a_no_op_is_not_sent(tmp_path, monkeypatch):
     class Replaces(LiveFake):
         def __init__(self):

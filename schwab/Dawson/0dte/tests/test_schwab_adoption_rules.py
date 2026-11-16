@@ -33,6 +33,14 @@ def test_the_shipped_trade_limits():
     assert config.MAX_TRADES_PER_DAY_SHARED == {("B", "C"): 3}                       # B and C: at most 3 trades a day between them
 
 
+def test_the_shipped_close_pricing():
+    """2026-11-16 (Micah: "buy the mid or plus 5 cents of mid"): a profit exit works two orders at the mid + 0.05 on the grid, then goes
+    marketable; a stop / hard stop / flatten is marketable at once. The exit rules themselves are unchanged (arm at $0.20)."""
+    assert config.CLOSE_PRICE_BASIS == "mid" and config.CLOSE_MID_OFFSET == 0.05 and config.CLOSE_MID_ATTEMPTS == 2
+    assert config.CLOSE_SLIPPAGE == 0.03 and config.CLOSE_URGENT_REASON_KEYWORDS == ("STOP", "FORCE", "FLATTEN", "INTERRUPT")
+    assert config.STAGE1_ARM_PCT == 0.04 and not hasattr(config, "STAGE1_REVERSAL_EXIT_ENABLED")
+
+
 def test_the_shipped_exit_booking_and_resting_exits():
     """2026-11-06: a real account's result is the fill, and the exit rests at Schwab as an OCO right after the entry fills."""
     assert config.EXIT_PNL_BASIS == "fill"

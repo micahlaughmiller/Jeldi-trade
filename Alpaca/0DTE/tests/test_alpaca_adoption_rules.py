@@ -31,6 +31,12 @@ def test_the_shipped_trade_limits():
     assert config.MAX_TRADES_PER_DAY_SHARED == {} and config.STOP_LOSS == 0.60
 
 
+def test_the_shipped_close_pricing():
+    """2026-11-16: the paper bots close at the mid + 0.05 too (two orders, then marketable); the exit rules are unchanged."""
+    assert config.CLOSE_PRICE_BASIS == "mid" and config.CLOSE_MID_OFFSET == 0.05 and config.CLOSE_MID_ATTEMPTS == 2
+    assert config.STAGE1_ARM_PCT == 0.04 and not hasattr(config, "STAGE1_REVERSAL_EXIT_ENABLED")
+
+
 def test_the_shipped_data_source_and_opening_range():
     """The paper bots keep Yahoo SPX data and the 30-minute opening range."""
     assert config.SPX_CANDLE_SOURCE == "yahoo"

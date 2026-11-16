@@ -91,10 +91,22 @@ DRY_RUN = SCHWAB_MODE != "sim" and \
     os.getenv("SCHWAB_LIVE_ORDERS", "false").strip().lower() not in ("1", "true", "yes")
 RISK_FREE_RATE = 0.04
 # 2026-09-23: SPX 0DTE quotes are tight enough to work a closer limit; escalation step now $0.03/retry
-# instead of $0.05 (close_spread_at_market: limit = ask-side + CLOSE_SLIPPAGE * attempt_number).
+# instead of $0.05 (close_spread_at_market: limit = ask-side + CLOSE_SLIPPAGE * attempt_number; the ask-side START was
+# replaced by the mid on 2026-11-16, see CLOSE_PRICE_BASIS below -- CLOSE_SLIPPAGE is still the marketable offset and the step).
 # 2026-11-03: SPX/SPXW orders are snapped DOWN to the $0.05 grid before they are sent (broker.snap_spx_price), so for SPX
 # the first close limit is the ask-side itself and every retry climbs one $0.05 tick; stock options (F) keep this exact step.
 CLOSE_SLIPPAGE = 0.03
+# 2026-11-16 (Micah: "buy the mid or plus 5 cents of mid"): a close of the bot's own starts at the spread MID + CLOSE_MID_OFFSET,
+# snapped down to the $0.05 grid for SPX (so the mid, or up to 5 cents above it). It is worked for CLOSE_MID_ATTEMPTS orders that way,
+# each retry re-quoted (mid now + offset, never below the previous order + one tick), then every further retry is marketable: the
+# ask side (short ask - long bid) + CLOSE_SLIPPAGE re-quoted at that moment, climbing a tick each retry as before. A close whose
+# reason contains one of CLOSE_URGENT_REASON_KEYWORDS (a stop, the 13:00 hard stop, the stale-data flatten, Ctrl-C) skips the mid
+# phase and is marketable from its first order, as every close was before 2026-11-16. "natural" restores the ask-side start for
+# all closes. Replay of the 8 logged live trades (4-11 Nov): about +$5 a trade. Identical in both 0DTE configs.
+CLOSE_PRICE_BASIS = "mid"
+CLOSE_MID_OFFSET = 0.05
+CLOSE_MID_ATTEMPTS = 2
+CLOSE_URGENT_REASON_KEYWORDS = ("STOP", "FORCE", "FLATTEN", "INTERRUPT")
 # 2026-09-29: 15s -> 2s. A's profit-lock/stop exits were chasing a moving target during fast moves
 # (one traced case: decision at 2.67, actual fill at 2.95 -- slippage well past the nominal
 # CLOSE_SLIPPAGE*attempts escalation, because the broker re-quotes its ask-side fresh on each retry,

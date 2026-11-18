@@ -72,16 +72,6 @@ def events(journal: Journal, kind: str) -> list[dict]:
     return [r for r in rows if r["event"] == kind]
 
 
-@pytest.fixture(autouse=True)
-def _legacy_stage_knobs(monkeypatch):
-    """The armed-jump tests describe the 29 Sep stage mechanics (arm +0.20, trail, stage 2); 2026-11-18 ships arm +0.25 and a +0.10 floor."""
-    monkeypatch.setattr(config, "STAGE1_ARM_PCT", 0.04)
-    monkeypatch.setattr(config, "STAGE1_FLOOR_PCT", None, raising=False)
-    monkeypatch.setattr(config, "STAGE1_TRAIL_ENABLED", True, raising=False)
-    monkeypatch.setattr(config, "STAGE1_REVERSAL_EXIT_ENABLED", True, raising=False)
-    monkeypatch.setattr(config, "STAGE2_ENABLED", True, raising=False)
-
-
 def test_first_ever_tick_passes_through_any_size_of_move(pm, broker):
     # No prior accepted price exists yet -- nothing to sanity-check against, so even a huge jump from
     # the entry credit on the very first tick is trusted immediately (this is normal: the first real

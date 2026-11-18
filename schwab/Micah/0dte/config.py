@@ -569,26 +569,13 @@ RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOM
 # below), so the same constants apply unscaled to every strategy's own width(s).
 STAGED_EXIT_ENABLED = True
 STAGE0_STOP_PCT = 0.08          # $0.40 on $5
-STAGE1_ARM_PCT = 0.05           # $0.25 on $5 (2026-11-18: was 0.04 = $0.20)
+STAGE1_ARM_PCT = 0.04           # $0.20 on $5
 STAGE1_TRAIL_PCT = 0.03         # $0.15 on $5
 STAGE2_TARGET_PCT = 0.06        # $0.30 on $5 -- matches PROFIT_TARGET/B_PROFIT_TARGET already
 STAGE2_FLOOR_PCT = 0.05         # $0.25 on $5
 STAGE3_TRAIL_PCT = 0.03         # $0.15 on $5
 STAGE3_CONFIRM_SECONDS = 30
 STAGE_EXIT_FLOOR = 0.05         # floor under every width-scaled level above, same role as F_EXIT_FLOOR
-# 2026-11-18 (Micah: "lock the floor at 10 cent profits, so it makes a little bit, only after 25 cent profit has been hit ... give us
-# more time to ride the chop ... the trigger is too sensitive"): two 17 Nov trades were cut by the stage-1 trail / reversal read and
-# should have waited. Now NOTHING but the stage-0 stop, the resting target at the broker and the hard stop touches a trade until the
-# mid shows +STAGE1_ARM_PCT ($0.25); from then on the only stage-1 exit is a hard floor at +STAGE1_FLOOR_PCT ($0.10): the trade is
-# closed when the mid gives back to entry - $0.10, however it got there. The 0.15 giveback trail (STAGE1_TRAIL_ENABLED) and the
-# candle / RSI / Bollinger-edge read (STAGE1_REVERSAL_EXIT_ENABLED) are off; stage 2 and 3 (STAGE2_ENABLED: the +0.30 target, its
-# +0.25 floor and the debounced trail) are off too, so the ride ends at the floor, the stop, the resting target (credit - 0.30,
-# filled at Schwab's own price) or 13:00 ET. Setting STAGE1_FLOOR_PCT = None, the two enables True and STAGE2_ENABLED True
-# restores the 29 Sep behaviour. Identical in both 0DTE configs.
-STAGE1_FLOOR_PCT = 0.02         # $0.10 on $5: the hard floor once stage 1 is armed (None = no floor)
-STAGE1_TRAIL_ENABLED = False
-STAGE1_REVERSAL_EXIT_ENABLED = False
-STAGE2_ENABLED = False
 
 # Stage 1's momentum-reversal read: candles/RSI (strategy.momentum_reversing) plus a Bollinger-edge
 # proximity check (strategy.bb_edge_reversal_risk) using its OWN, shorter period -- distinct from

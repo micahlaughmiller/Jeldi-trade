@@ -163,8 +163,12 @@ waited; the third was a real reversal and the exit was fine.
 - `STAGE1_ARM_PCT = 0.05` ($0.25 on a $5 width): until the mid has shown +0.25 nothing closes the trade except the stage-0 stop
   ($0.40), the resting target at Schwab (credit minus 0.30, filled at Schwab's own price) and the 13:00 ET hard stop.
 - `STAGE1_FLOOR_PCT = 0.02` ($0.10): once armed, the trade is closed when the mid gives back to entry minus 0.10, however it got
-  there (reason STAGE1_FLOOR, worked at the mid + 0.05 like every profit exit). No 0.15 trail from the best price
-  (`STAGE1_TRAIL_ENABLED = False`), no candle / RSI / Bollinger read (`STAGE1_REVERSAL_EXIT_ENABLED = False`).
+  there (reason STAGE1_FLOOR, worked at the mid + 0.05 like every profit exit). No candle / RSI / Bollinger read
+  (`STAGE1_REVERSAL_EXIT_ENABLED = False`).
+- `STAGE1_TRAIL_PCT = 0.04` ($0.20, later the same day: "a runner keeps running and follows with a 20 cent trail"): once armed the
+  trade also trails the best mid by 0.20 (reason STAGE1_TRAIL); whichever of the floor and the trail is hit first closes it, so the
+  trail takes over once the best mid is more than 0.30 below entry. The resting target at Schwab (credit minus 0.30) still fills
+  at its own price when the ask side reaches it, about +0.40 on the mid, which is where a runner ends.
 - `STAGE2_ENABLED = False`: the +0.30 target with its +0.25 floor and the debounced trail are off, so a trade that keeps going rides
-  until the floor, the stop, the resting target or the hard stop. Setting the four knobs back (0.04 / None / True / True / True)
+  until the trail, the floor, the stop, the resting target or the hard stop. Setting the knobs back (0.04 / None / 0.03 / True / True)
   restores the 29 Sep behaviour. Identical in the Alpaca paper config.

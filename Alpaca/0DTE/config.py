@@ -565,7 +565,7 @@ RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOM
 STAGED_EXIT_ENABLED = True
 STAGE0_STOP_PCT = 0.08          # $0.40 on $5
 STAGE1_ARM_PCT = 0.05           # $0.25 on $5 (2026-11-18: was 0.04 = $0.20)
-STAGE1_TRAIL_PCT = 0.03         # $0.15 on $5
+STAGE1_TRAIL_PCT = 0.04         # $0.20 on $5 (2026-11-18: was 0.03 = $0.15; Micah: "a runner keeps running and follows with a 20 cent trail")
 STAGE2_TARGET_PCT = 0.06        # $0.30 on $5 -- matches PROFIT_TARGET/B_PROFIT_TARGET already
 STAGE2_FLOOR_PCT = 0.05         # $0.25 on $5
 STAGE3_TRAIL_PCT = 0.03         # $0.15 on $5
@@ -581,7 +581,11 @@ STAGE_EXIT_FLOOR = 0.05         # floor under every width-scaled level above, sa
 # filled at Schwab's own price) or 13:00 ET. Setting STAGE1_FLOOR_PCT = None, the two enables True and STAGE2_ENABLED True
 # restores the 29 Sep behaviour. Identical in both 0DTE configs.
 STAGE1_FLOOR_PCT = 0.02         # $0.10 on $5: the hard floor once stage 1 is armed (None = no floor)
-STAGE1_TRAIL_ENABLED = False
+# 2026-11-18, later the same day (Micah: "i want a runner to keep running and follow with a 20 cent trail"): once armed the trade also
+# trails the BEST mid by STAGE1_TRAIL_PCT ($0.20): it is closed at whichever comes first, the +$0.10 floor or best + $0.20, so the
+# trail takes over the moment the best mid is more than $0.30 below entry. The resting target at the broker (credit - 0.30) still
+# fills at its own price when the ask side gets there, which ends a runner at about +$0.40 on the mid.
+STAGE1_TRAIL_ENABLED = True
 STAGE1_REVERSAL_EXIT_ENABLED = False
 STAGE2_ENABLED = False
 

@@ -895,7 +895,7 @@ class PositionManager:
         width = p.width
 
         def level(pct_name: str) -> float:
-            return max(config.STAGE_EXIT_FLOOR, self._knob(p, pct_name) * width)
+            return max(config.STAGE_EXIT_FLOOR, round(self._knob(p, pct_name) * width, 2))   # 2026-11-18: 0.05 * 3.0 is 0.15, not 0.15000000000000002
 
         confirm_seconds = strategy.exit_setting(p.strategy, "STOP_CONFIRM_SECONDS", 0)
         confirm = max(1, round(confirm_seconds / config.TICK_SECONDS))
@@ -940,7 +940,8 @@ class PositionManager:
         profit = round(p.entry_credit - spread_price, 2)
         if profit >= level("STAGE1_ARM_PCT"):
             p.stage1_armed = True
-        if profit >= level("STAGE2_TARGET_PCT"):
+        stage2_on = bool(strategy.exit_setting(p.strategy, "STAGE2_ENABLED", True))   # 2026-11-18: off -- the resting target takes +0.30
+        if stage2_on and profit >= level("STAGE2_TARGET_PCT"):
             if not p.stage2_armed:
                 # Anchor the stage-3 trail at the price that just crossed the target, NOT any deeper
                 # (unconfirmed) best_price seen earlier -- that price hasn't held yet, so it shouldn't
@@ -948,7 +949,7 @@ class PositionManager:
                 p.confirmed_best_price = spread_price
             p.stage2_armed = True
 
-        if p.stage2_armed:
+        if stage2_on and p.stage2_armed:
             floor_price = round(p.entry_credit - level("STAGE2_FLOOR_PCT"), 2)
             if spread_price >= floor_price:
                 return self._close(p, p.remaining, "STAGE2_FLOOR", now, spread_price)
@@ -966,9 +967,19 @@ class PositionManager:
             return []
 
         if p.stage1_armed:
-            trail1 = level("STAGE1_TRAIL_PCT")
-            if spread_price >= round(p.best_price + trail1, 2):
-                return self._close(p, p.remaining, "STAGE1_TRAIL", now, spread_price)
+            # 2026-11-18 (Micah): once +STAGE1_ARM_PCT has shown, a hard floor at +STAGE1_FLOOR_PCT is the stage-1 exit -- the trade
+            # is closed when the mid gives back to entry - floor, however it got there; the trail and the reversal read are opt-in
+            floor_pct = self._knob(p, "STAGE1_FLOOR_PCT")
+            if floor_pct:
+                floor1 = round(p.entry_credit - level("STAGE1_FLOOR_PCT"), 2)
+                if spread_price >= floor1:
+                    return self._close(p, p.remaining, "STAGE1_FLOOR", now, spread_price)
+            if strategy.exit_setting(p.strategy, "STAGE1_TRAIL_ENABLED", True):
+                trail1 = level("STAGE1_TRAIL_PCT")
+                if spread_price >= round(p.best_price + trail1, 2):
+                    return self._close(p, p.remaining, "STAGE1_TRAIL", now, spread_price)
+            if not strategy.exit_setting(p.strategy, "STAGE1_REVERSAL_EXIT_ENABLED", True):
+                return []
             rsi_period = strategy.exit_setting(p.strategy, "RSI_PERIOD", 14)
             rsi_pts = strategy.exit_setting(p.strategy, "RSI_REVERSAL_PTS", 5.0)
             bb_period = strategy.exit_setting(p.strategy, "EXIT_BB_PERIOD", 20)

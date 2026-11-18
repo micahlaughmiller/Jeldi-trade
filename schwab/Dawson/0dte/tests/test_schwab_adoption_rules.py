@@ -38,7 +38,12 @@ def test_the_shipped_close_pricing():
     marketable; a stop / hard stop / flatten is marketable at once. The exit rules themselves are unchanged (arm at $0.20)."""
     assert config.CLOSE_PRICE_BASIS == "mid" and config.CLOSE_MID_OFFSET == 0.05 and config.CLOSE_MID_ATTEMPTS == 2
     assert config.CLOSE_SLIPPAGE == 0.03 and config.CLOSE_URGENT_REASON_KEYWORDS == ("STOP", "FORCE", "FLATTEN", "INTERRUPT")
-    assert config.STAGE1_ARM_PCT == 0.04 and not hasattr(config, "STAGE1_REVERSAL_EXIT_ENABLED")
+
+
+def test_the_shipped_stage_1_floor():
+    """2026-11-18 (Micah): nothing exits before +0.25; then a hard floor at +0.10 and nothing else (stage 2/3 off)."""
+    assert config.STAGE1_ARM_PCT == 0.05 and config.STAGE1_FLOOR_PCT == 0.02
+    assert config.STAGE1_TRAIL_ENABLED is False and config.STAGE1_REVERSAL_EXIT_ENABLED is False and config.STAGE2_ENABLED is False
 
 
 def test_the_shipped_exit_booking_and_resting_exits():

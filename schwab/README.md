@@ -152,4 +152,19 @@ only the price a close is worked at.
   stop waiting at the mid in a fast market could sit under the market for 18 s; this is why.
 - Log lines: "close_spread_at_market retry n/6 at x.xx (mid)" or "(marketable)". `"natural"` restores the old start for every close.
   Same rule in the Alpaca paper broker. The resting profit target at Schwab is unchanged (it fills at its own price).
-- Nothing else changed: stage 1 still arms at +$0.20 and exits on the trail or a reversal read, stage 2 at +$0.30 with the floor.
+- (Superseded 18 Nov, next section: stage 1 now arms at +$0.25 with a +$0.10 floor; the close pricing above is unchanged.)
+
+## Stage 1: nothing until +$0.25, then a +$0.10 floor (18 Nov 2026)
+
+Micah, after 17 Nov: "lock the floor at 10 cent profits, so it makes a little bit, only after 25 cent profit has been hit ... give us
+more time to ride the chop ... the trigger is too sensitive". Two trades were cut by the stage-1 trail / reversal read and should have
+waited; the third was a real reversal and the exit was fine.
+
+- `STAGE1_ARM_PCT = 0.05` ($0.25 on a $5 width): until the mid has shown +0.25 nothing closes the trade except the stage-0 stop
+  ($0.40), the resting target at Schwab (credit minus 0.30, filled at Schwab's own price) and the 13:00 ET hard stop.
+- `STAGE1_FLOOR_PCT = 0.02` ($0.10): once armed, the trade is closed when the mid gives back to entry minus 0.10, however it got
+  there (reason STAGE1_FLOOR, worked at the mid + 0.05 like every profit exit). No 0.15 trail from the best price
+  (`STAGE1_TRAIL_ENABLED = False`), no candle / RSI / Bollinger read (`STAGE1_REVERSAL_EXIT_ENABLED = False`).
+- `STAGE2_ENABLED = False`: the +0.30 target with its +0.25 floor and the debounced trail are off, so a trade that keeps going rides
+  until the floor, the stop, the resting target or the hard stop. Setting the four knobs back (0.04 / None / True / True / True)
+  restores the 29 Sep behaviour. Identical in the Alpaca paper config.

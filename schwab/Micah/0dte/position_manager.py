@@ -111,7 +111,7 @@ class OpenSpread:
 
     @property
     def target_price(self) -> float:
-        return round(self.entry_credit - self.profit_target, 2)
+        return max(0.05, round(self.entry_credit - self.profit_target, 2))   # 2026-11-18: never at or below zero (credit - 0.60)
 
     @property
     def open_risk(self) -> float:
@@ -656,16 +656,20 @@ class PositionManager:
         )
 
     def on_tick(self, now: datetime, prices: dict[str, float], candles: pd.DataFrame,
-                candles_by_key: dict[str, pd.DataFrame] | None = None) -> list[dict]:
+                candles_by_key: dict[str, pd.DataFrame] | None = None,
+                structure_candles: pd.DataFrame | None = None) -> list[dict]:
         """`candles` is the shared SPX frame for A-E; a stock position only ever sees its own ticker's
-        frame from `candles_by_key` (None when it has none yet, which the momentum rules tolerate)."""
+        frame from `candles_by_key` (None when it has none yet, which the momentum rules tolerate). `structure_candles`
+        (2026-11-18) is the shared SPX frame at EXIT_STRUCTURE_INTERVAL for the structure-break reversal read; a stock
+        position reads the structure on its own frame."""
         fills: list[dict] = []
         for key, p in list(self.positions.items()):
             if key not in prices:
                 continue
             p.last_mark_at = now
-            c = (candles_by_key or {}).get(key) if p.strategy in config.STOCK_STRATEGIES else candles
-            fills += self._tick_position(p, now, prices[key], c)
+            stock = p.strategy in config.STOCK_STRATEGIES
+            c = (candles_by_key or {}).get(key) if stock else candles
+            fills += self._tick_position(p, now, prices[key], c, c if stock else structure_candles)
         return fills
 
     def _knob(self, p: OpenSpread, name: str, default=None):
@@ -810,7 +814,8 @@ class PositionManager:
         if timer and not p.runner and profit > 0 and (now - p.entry_time) >= timedelta(minutes=timer):
             self._set_floor(p, now, strategy.exit_setting(p.strategy, "STALE_FLOOR", 0.05), f"STALE_TIMER {timer}m")
 
-    def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame | None) -> list[dict]:
+    def _tick_position(self, p: OpenSpread, now: datetime, spread_price: float, candles: pd.DataFrame | None,
+                       structure: pd.DataFrame | None = None) -> list[dict]:
         tick_before_at = p.last_tick_at     # when the price we are about to call "the tick before" was accepted
         spread_price = self._sanitize_quote(p, now, spread_price)
         if spread_price is None:
@@ -831,7 +836,7 @@ class PositionManager:
         if p.floor_price is not None and spread_price >= p.floor_price and spread_price > p.target_price:
             return self._close(p, p.remaining, "PROFIT_FLOOR", now, spread_price)
         if strategy.exit_setting(p.strategy, "STAGED_EXIT_ENABLED", False):
-            return self._staged_tick(p, now, spread_price, candles)
+            return self._staged_tick(p, now, spread_price, candles, structure)
         if p.runner:
             return self._runner_tick(p, now, spread_price, candles)
         # 2026-09-29: time-based, not a raw tick count -- STOP_CONFIRM_TICKS=2 meant ~30s of real
@@ -887,7 +892,7 @@ class PositionManager:
         return []
 
     def _staged_tick(self, p: OpenSpread, now: datetime, spread_price: float,
-                     candles: pd.DataFrame | None) -> list[dict]:
+                     candles: pd.DataFrame | None, structure: pd.DataFrame | None = None) -> list[dict]:
         """2026-09-29/30: staged exit progression -- every strategy uses this (config.
         STAGED_EXIT_ENABLED), replacing the flat stop/target/lock/runner sequence in _tick_position
         above. See config.py's staged-exit section for the four dollar levels and the rationale.
@@ -895,7 +900,7 @@ class PositionManager:
         width = p.width
 
         def level(pct_name: str) -> float:
-            return max(config.STAGE_EXIT_FLOOR, self._knob(p, pct_name) * width)
+            return max(config.STAGE_EXIT_FLOOR, round(self._knob(p, pct_name) * width, 2))   # rounded: 0.05 * 3.0 is 0.15, not 0.15000000000000002
 
         confirm_seconds = strategy.exit_setting(p.strategy, "STOP_CONFIRM_SECONDS", 0)
         confirm = max(1, round(confirm_seconds / config.TICK_SECONDS))
@@ -948,10 +953,32 @@ class PositionManager:
                 p.confirmed_best_price = spread_price
             p.stage2_armed = True
 
+        def stage1_guards() -> list[dict] | None:
+            """2026-11-18 runner: the hard floor at +STAGE1_FLOOR_PCT (only where it sits below the arm level -- on a $1-wide F spread
+            both clamp to $0.05 and the floor would close the trade on the tick that arms it) and the reversal read in
+            EXIT_REVERSAL_MODE. Applied in stage 1 and kept in stage 2, so a runner that showed +0.30 can never ride back below +0.10
+            unnoticed. Returns rows (closed), [] (nothing, no indicator read) or None (the caller runs the 29 Sep indicator read)."""
+            floor_pct = self._knob(p, "STAGE1_FLOOR_PCT")
+            if floor_pct and level("STAGE1_FLOOR_PCT") < level("STAGE1_ARM_PCT") - 1e-9:
+                if spread_price >= round(p.entry_credit - level("STAGE1_FLOOR_PCT"), 2):
+                    return self._close(p, p.remaining, "STAGE1_FLOOR", now, spread_price)
+            mode = str(strategy.exit_setting(p.strategy, "EXIT_REVERSAL_MODE", "indicators") or "indicators").lower()
+            if mode == "structure":
+                lookback = int(strategy.exit_setting(p.strategy, "EXIT_STRUCTURE_LOOKBACK", 3))
+                if structure is not None and strategy.structure_break(structure, p.direction, lookback):   # no frame: no read
+                    return self._close(p, p.remaining, "STAGE1_STRUCTURE_BREAK", now, spread_price)
+                return []
+            return None if mode == "indicators" else []
+
         if p.stage2_armed:
-            floor_price = round(p.entry_credit - level("STAGE2_FLOOR_PCT"), 2)
-            if spread_price >= floor_price:
-                return self._close(p, p.remaining, "STAGE2_FLOOR", now, spread_price)
+            if strategy.exit_setting(p.strategy, "STAGE2_FLOOR_ENABLED", True):   # 2026-11-18 runner: off -- the ride is the point
+                floor_price = round(p.entry_credit - level("STAGE2_FLOOR_PCT"), 2)
+                if spread_price >= floor_price:
+                    return self._close(p, p.remaining, "STAGE2_FLOOR", now, spread_price)
+            else:
+                guarded = stage1_guards()                      # the +0.10 floor and the structure read stay on above +0.30
+                if guarded:
+                    return guarded
             confirm_sec = config.STAGE3_CONFIRM_SECONDS
             held_long_enough = (p.best_price_since is not None
                                 and (now - p.best_price_since).total_seconds() >= confirm_sec)
@@ -966,9 +993,15 @@ class PositionManager:
             return []
 
         if p.stage1_armed:
+            # 2026-11-18 runner: the floor (worst case) and the reversal read (stage1_guards), then the trail off the best mid
+            guarded = stage1_guards()
+            if guarded:
+                return guarded
             trail1 = level("STAGE1_TRAIL_PCT")
             if spread_price >= round(p.best_price + trail1, 2):
                 return self._close(p, p.remaining, "STAGE1_TRAIL", now, spread_price)
+            if guarded is not None:                            # structure / off: no indicator read
+                return []
             rsi_period = strategy.exit_setting(p.strategy, "RSI_PERIOD", 14)
             rsi_pts = strategy.exit_setting(p.strategy, "RSI_REVERSAL_PTS", 5.0)
             bb_period = strategy.exit_setting(p.strategy, "EXIT_BB_PERIOD", 20)

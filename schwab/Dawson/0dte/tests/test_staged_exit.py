@@ -110,6 +110,120 @@ def test_stage0_stop_streak_resets_if_price_recovers(pm, broker, monkeypatch):
 
 # ---------------------------------------------------------------------------------- stage 1: arm
 
+# ---------------------------------------------------------------------------------- shipped since 2026-11-18: the runner package
+
+def two_min(bars, start=None):
+    """2-minute structure candles (open, high, low, close) ending before the tick."""
+    return make_candles(start or et(9, 30), bars, minutes=2)
+
+
+def test_shipped_values_are_the_runner_package():
+    assert config.B_PROFIT_TARGET == 0.60 and config.C_PROFIT_TARGET == 0.60
+    assert config.STAGE1_ARM_PCT == 0.04 and config.STAGE1_TRAIL_PCT == 0.05 and config.STAGE1_FLOOR_PCT == 0.02
+    assert config.STAGE2_FLOOR_ENABLED is False and config.STAGE3_TRAIL_PCT == 0.05 and config.STAGE3_CONFIRM_SECONDS == 30
+    assert config.EXIT_REVERSAL_MODE == "structure" and config.EXIT_STRUCTURE_INTERVAL == "2m" and config.EXIT_STRUCTURE_LOOKBACK == 3
+
+
+def test_shipped_indicators_no_longer_close_an_armed_trade(pm, broker):
+    """Both 11 Nov exits fired on the RSI swing / Bollinger edge inside a rising trend. Now neither a red candle nor an indicator read
+    closes the trade; only the structure, the trail, the floor, the stop."""
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 5), 0.80, flat()) == [] and p.stage1_armed
+    bars = [(100, 100.3, 99.7, 100.0) for _ in range(19)] + [(100.0, 104.0, 100.0, 104.0)]      # Bollinger edge
+    assert tick(pm, et(10, 6), 0.81, make_candles(et(9, 30), bars)) == []
+    assert tick(pm, et(10, 7), 0.82, red_candle_against_bullish()) == []                        # a red candle on the shared frame
+    rising2 = two_min([(100 + i, 101 + i, 99.5 + i, 100.8 + i) for i in range(6)])
+    assert pm.on_tick(et(10, 8), {"B": 0.83}, red_candle_against_bullish(), None, rising2) == []   # 2-minute structure intact
+
+
+def test_shipped_a_two_minute_structure_break_closes_an_armed_trade(pm, broker):
+    """The last completed 2-minute candle closes below the low of the three before it (bullish) -> STAGE1_STRUCTURE_BREAK."""
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 5), 0.80, flat()) == [] and p.stage1_armed
+    intact = two_min([(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 100.3, 100.5)])
+    assert pm.on_tick(et(10, 6), {"B": 0.82}, flat(), None, intact) == []                       # 100.5 is above the prior low 99.5
+    broken = two_min([(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)])
+    fills = pm.on_tick(et(10, 7), {"B": 0.82}, flat(), None, broken)                            # 99.3 < 99.5
+    assert fills and fills[0]["exit_reason"] == "STAGE1_STRUCTURE_BREAK"
+
+
+def test_shipped_structure_read_needs_arming_and_enough_candles(pm, broker):
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    broken = two_min([(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)])
+    assert pm.on_tick(et(10, 5), {"B": 0.85}, flat(), None, broken) == [] and not p.stage1_armed    # +0.15: not armed, no read
+    short = two_min([(101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)])
+    assert pm.on_tick(et(10, 6), {"B": 0.80}, flat(), None, short) == [] and p.stage1_armed       # armed, but only 2 candles
+    assert pm.on_tick(et(10, 7), {"B": 0.81}, broken, None, None) == []                          # no structure frame: no read, whatever the shared frame shows
+
+
+def test_shipped_trail_is_25_cents_with_a_10_cent_floor(pm, broker):
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 5), 0.80, flat()) == [] and p.stage1_armed                          # floor 0.90, trail 1.05
+    assert tick(pm, et(10, 6), 0.89, flat()) == []                                             # 0.09 back from the best: holds
+    fills = tick(pm, et(10, 7), 0.90, flat())
+    assert fills and fills[0]["exit_reason"] == "STAGE1_FLOOR"
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 8), 0.55, flat()) == []                                             # best 0.55: trail 0.80 (stage 2 armed too)
+    assert tick(pm, et(10, 9), 0.79, flat()) == []
+    fills = tick(pm, et(10, 10), 0.80, flat())
+    assert fills and fills[0]["exit_reason"] == "STAGE3_TRAIL"                                # the stage-3 trail, same 0.25, no floor at 0.75
+
+
+def test_shipped_the_floor_and_the_structure_read_stay_on_above_30_cents(pm, broker):
+    """Review: once +0.30 printed the stage-2 branch used to drop the +0.10 floor and the structure read; a 0.70 runner could ride back to 0.95."""
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 5), 0.70, rising()) == [] and p.stage2_armed
+    assert tick(pm, et(10, 6), 0.89, rising()) == []
+    fills = tick(pm, et(10, 7), 0.90, rising())
+    assert fills and fills[0]["exit_reason"] == "STAGE1_FLOOR"
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 8), 0.70, rising()) == [] and p.stage2_armed
+    broken = two_min([(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)])
+    fills = pm.on_tick(et(10, 9), {"B": 0.75}, rising(), None, broken)
+    assert fills and fills[0]["exit_reason"] == "STAGE1_STRUCTURE_BREAK"
+
+
+def test_shipped_a_narrow_stock_spread_has_no_floor_where_it_would_equal_the_arm(pm, broker, pre_f_stop_fix):
+    """Review: on a $1-wide F spread arm and floor both clamp to $0.05; the floor would close the trade on the tick that arms it."""
+    p = open_f_spread(pm, broker, credit=0.20, width=1.0)
+    assert tick(pm, et(10, 5), 0.15, flat(), key="F:TSLA") == [] and p.stage1_armed                 # +0.05 arms, no floor
+    assert tick(pm, et(10, 6), 0.16, flat(), key="F:TSLA") == []                                   # 0.01 back: still open
+    fills = tick(pm, et(10, 7), 0.20, flat(), key="F:TSLA")                                        # 0.05 back from the best: the trail
+    assert fills and fills[0]["exit_reason"] == "STAGE1_TRAIL"
+
+
+def test_shipped_stage_2_has_no_floor_and_its_trail_ratchets_only_to_a_held_best(pm, broker):
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert tick(pm, et(10, 5), 0.70, rising()) == [] and p.stage2_armed                        # +0.30: confirmed best 0.70, trail 0.95
+    assert tick(pm, et(10, 6), 0.78, rising()) == []                                           # +0.22: the old +0.25 floor would have closed
+    assert tick(pm, et(10, 7), 0.60, rising()) == []                                           # new best 0.60, not held yet
+    assert tick(pm, et(10, 7, 10), 0.84, rising()) == []                                       # trail still 0.95: holds
+    assert tick(pm, et(10, 7, 20), 0.60, rising()) == []
+    assert tick(pm, et(10, 8), 0.61, rising()) == [] and p.confirmed_best_price == 0.60        # held 30 s with momentum: ratcheted
+    fills = tick(pm, et(10, 9), 0.85, rising())                                                # 0.25 back from 0.60
+    assert fills and fills[0]["exit_reason"] == "STAGE3_TRAIL"
+
+
+def test_shipped_resting_target_is_credit_minus_60_cents_never_below_5(pm, broker):
+    from strategy import exit_levels
+    assert exit_levels("B") == (0.60, 0.50) and exit_levels("C") == (0.60, 0.50)
+    p = open_spread(pm, broker, strategy="B", credit=1.00, width=5.0)
+    assert p.target_price == 0.40
+    p2 = open_spread(pm, broker, strategy="A", credit=0.62, width=5.0)
+    p2.profit_target = 0.60
+    assert p2.target_price == 0.05
+
+
+def test_shipped_a_stock_position_reads_the_structure_on_its_own_frame(pm, broker, pre_f_stop_fix):
+    p = open_f_spread(pm, broker, credit=0.80, width=3.0)
+    assert tick(pm, et(10, 5), 0.65, flat(), key="F:TSLA") == [] and p.stage1_armed                # 0.04 * 3 = 0.12 -> armed at 0.68
+    broken = make_candles(et(9, 30), [(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)])
+    fills = pm.on_tick(et(10, 6), {"F:TSLA": 0.67}, flat(), {"F:TSLA": broken}, None)
+    assert fills and fills[0]["exit_reason"] == "STAGE1_STRUCTURE_BREAK"
+
+
+# ---------------------------------------------------------------------------------- the 29 Sep mechanics (conftest pins the old knobs)
+
 def test_stage1_arms_at_20_cents_but_does_not_close_immediately(pm, broker):
     open_spread(pm, broker, strategy="B", credit=2.00, width=5.0)
     # profit 0.20 (STAGE1_ARM_PCT*5) -- best_price just became 1.80, the 0.15 trail (1.95) is untouched.

@@ -205,3 +205,21 @@ def _pin_trade_limits(request, monkeypatch):
                                                            "A": {"MAX_TRADES_PER_DAY": 5, "MAX_CONSECUTIVE_LOSSES": 5, "COOLDOWN_MIN": 30}})
         monkeypatch.setattr(config, "STOP_LOSS", 0.60)
         monkeypatch.setattr(config, "MAX_TRADES_PER_DAY_SHARED", {}, raising=False)       # Schwab: B and C share 3 a day
+
+
+@pytest.fixture(autouse=True)
+def _pin_runner_knobs(request, monkeypatch):
+    """The shared suite describes the 29 Sep exits (B target 0.30, 0.15 trails, the stage-2 floor, the candle / RSI / Bollinger read);
+    2026-11-18 ships the runner package (target 0.60, 0.25 trails, +0.10 floor, no stage-2 floor, 2-minute structure read). Pin the
+    old values -- except in the guard modules and in tests named *shipped*, which set or check the shipped ones."""
+    if request.module.__name__ in GUARD_MODULES or "shipped" in request.node.name:
+        return
+    monkeypatch.setattr(config, "B_PROFIT_TARGET", 0.30)
+    monkeypatch.setattr(config, "C_PROFIT_TARGET", 0.30)
+    monkeypatch.setattr(config, "D_PROFIT_TARGET", 0.30)
+    monkeypatch.setattr(config, "F_PROFIT_TARGET", 0.30)
+    monkeypatch.setattr(config, "STAGE1_TRAIL_PCT", 0.03)
+    monkeypatch.setattr(config, "STAGE3_TRAIL_PCT", 0.03)
+    monkeypatch.setattr(config, "STAGE1_FLOOR_PCT", None, raising=False)
+    monkeypatch.setattr(config, "STAGE2_FLOOR_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "EXIT_REVERSAL_MODE", "indicators", raising=False)

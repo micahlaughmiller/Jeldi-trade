@@ -464,7 +464,10 @@ STOP_CONFIRM_SECONDS = 0
 STOP_MIN_HOLD_SEC = 0
 STOP_HOLD_EMERGENCY_MULT = 3.0
 STOP_CONFIRM_TIME_SEC = 0
-B_PROFIT_TARGET = 0.30
+# 2026-11-18 (runner): the resting target at the broker is a safety net, not the exit -- credit - 0.60 (a 5-wide spread cannot go
+# below 0, so a 1.00 credit rests a buy-to-close at 0.40; never below 0.05). It used to be 0.30 and ended every runner at about +0.40
+# on the mid. C, D, E inherit it; F scales its own per position.
+B_PROFIT_TARGET = 0.60
 B_STOP_LOSS = 0.50
 # C, D: same target/stop as B by default. E: 5-cent target for the choppy-day variant; its stop
 # defaults to B's pending real tuning.
@@ -570,12 +573,28 @@ RUNNER_SLOWDOWN_EXIT = True      # runner exits when 3-candle momentum drops MOM
 STAGED_EXIT_ENABLED = True
 STAGE0_STOP_PCT = 0.08          # $0.40 on $5
 STAGE1_ARM_PCT = 0.04           # $0.20 on $5
-STAGE1_TRAIL_PCT = 0.03         # $0.15 on $5
+STAGE1_TRAIL_PCT = 0.05         # $0.25 on $5 (2026-11-18 runner: was 0.03 = $0.15, inside the quote noise of a 0.20-wide market)
 STAGE2_TARGET_PCT = 0.06        # $0.30 on $5 -- matches PROFIT_TARGET/B_PROFIT_TARGET already
 STAGE2_FLOOR_PCT = 0.05         # $0.25 on $5
-STAGE3_TRAIL_PCT = 0.03         # $0.15 on $5
+STAGE3_TRAIL_PCT = 0.05         # $0.25 on $5 (2026-11-18 runner: was 0.03), off a best that has HELD STAGE3_CONFIRM_SECONDS
 STAGE3_CONFIRM_SECONDS = 30
 STAGE_EXIT_FLOOR = 0.05         # floor under every width-scaled level above, same role as F_EXIT_FLOOR
+# 2026-11-18 (Micah: "how do i make sure a runner actually keeps running and not exited early" -> "build it and test it as
+# recommended"). What used to cut a winner, in order: the RSI / Bollinger-edge reads after +0.20 (both 11 Nov exits fired on them
+# inside a rising trend, never on a candle), the 0.15 trail (quote noise), the +0.25 floor the moment +0.30 printed, and the resting
+# target at credit - 0.30. Now, on a 1.00 credit: nothing until 0.80; then the trade closes only when the mid gives back
+# STAGE1_TRAIL_PCT ($0.25) from its best, or to entry - STAGE1_FLOOR_PCT ($0.10, the worst case), or the 2-minute structure breaks
+# against it (EXIT_REVERSAL_MODE "structure": a completed EXIT_STRUCTURE_INTERVAL candle closes beyond the low/high of the previous
+# EXIT_STRUCTURE_LOOKBACK candles; "indicators" restores the 29 Sep candle / RSI / Bollinger read; "off" = no reversal read).
+# Stage 2 (+0.30) no longer sets a floor (STAGE2_FLOOR_ENABLED False); its trail (STAGE3_TRAIL_PCT $0.25) only ratchets to a best
+# that has held STAGE3_CONFIRM_SECONDS with momentum continuing. The stop stays at +0.40 and goes straight to the market. A stock (F)
+# position reads the structure on its own ticker frame. Identical in both 0DTE configs.
+STAGE1_FLOOR_PCT = 0.02         # $0.10 on $5: the hard floor once stage 1 is armed (None = no floor)
+STAGE2_FLOOR_ENABLED = False
+EXIT_REVERSAL_MODE = "structure"
+EXIT_STRUCTURE_INTERVAL = "2m"
+EXIT_STRUCTURE_LOOKBACK = 3     # candles whose low (high) the last completed candle must close below (above)
+EXIT_STRUCTURE_LOOKBACK_MIN = 60  # minutes of 2-minute candles the scheduler fetches for the read
 
 # Stage 1's momentum-reversal read: candles/RSI (strategy.momentum_reversing) plus a Bollinger-edge
 # proximity check (strategy.bb_edge_reversal_risk) using its OWN, shorter period -- distinct from

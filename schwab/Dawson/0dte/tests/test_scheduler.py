@@ -2127,3 +2127,29 @@ def test_on_the_bot_basis_an_exempt_strategys_open_loss_does_not_count(bot, monk
     spread.current_price = 4.20                                                 # F is down $340, but F is exempt here (the Alpaca rule)
     bot.pm.open(spread)
     assert bot.entry_possible(100.0) is True
+
+
+def test_shipped_manage_hands_the_two_minute_structure_frame_to_the_exits(bot, monkeypatch):
+    """2026-11-18: in structure mode manage() fetches the SPX frame at EXIT_STRUCTURE_INTERVAL and passes it to the position manager;
+    a data error leaves the exits without a structure frame instead of stopping the tick."""
+    from conftest import make_candles
+    monkeypatch.setattr(config, "EXIT_REVERSAL_MODE", "structure", raising=False)
+    monkeypatch.setattr(config, "EXIT_STRUCTURE_INTERVAL", "2m", raising=False)
+    seen = {}
+    frame2 = make_candles(et(9, 30), [(100, 101, 99, 100.5)] * 4, minutes=2)
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda sym, interval, lookback, now: (seen.__setitem__("call", (sym, interval, lookback)), frame2)[1])
+
+    def fake_on_tick(now, prices, candles, by_key=None, structure=None):
+        seen["structure"] = structure
+        return []
+    monkeypatch.setattr(bot.pm, "on_tick", fake_on_tick)
+    bot.manage(et(10, 5), make_candles(et(9, 30), [(100, 101, 99, 100.5)] * 3))
+    assert seen["call"] == (config.SPX_SYMBOL, "2m", config.EXIT_STRUCTURE_LOOKBACK_MIN) and seen["structure"] is frame2
+    monkeypatch.setattr(scheduler.market_data, "get_candles", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("feed down")))
+    seen.clear()
+    bot.manage(et(10, 6), make_candles(et(9, 30), [(100, 101, 99, 100.5)] * 3))
+    assert seen.get("structure", "missing") is None
+    monkeypatch.setattr(config, "EXIT_REVERSAL_MODE", "indicators", raising=False)
+    seen.clear()
+    bot.manage(et(10, 7), make_candles(et(9, 30), [(100, 101, 99, 100.5)] * 3))
+    assert seen.get("structure", "missing") is None

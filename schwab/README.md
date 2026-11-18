@@ -153,3 +153,31 @@ only the price a close is worked at.
 - Log lines: "close_spread_at_market retry n/6 at x.xx (mid)" or "(marketable)". `"natural"` restores the old start for every close.
   Same rule in the Alpaca paper broker. The resting profit target at Schwab is unchanged (it fills at its own price).
 - Nothing else changed: stage 1 still arms at +$0.20 and exits on the trail or a reversal read, stage 2 at +$0.30 with the floor.
+
+## The runner package (18 Nov 2026)
+
+Micah: "how do i make sure a runner actually keeps running and not exited early" -> "build it and test it as recommended". What
+used to cut a winner, in order, on a 1.00 credit: the RSI-swing and Bollinger-edge reads after +0.20 (both 11 Nov exits fired on
+them inside a rising trend; the log shows neither was a red candle), the 0.15 trail (inside the quote noise of a 0.20-wide market),
+the +0.25 floor the moment +0.30 printed, and the resting target at 0.70 (filled near a mid of 0.60). Now, identical in both 0DTE
+configs:
+
+- Nothing until the mid shows +0.20 (`STAGE1_ARM_PCT` unchanged). Then the trade closes only when the mid gives back to entry
+  minus `STAGE1_FLOOR_PCT` ($0.10, the floor) or the structure breaks; the `STAGE1_TRAIL_PCT` ($0.25) trail off the best is a
+  backstop that binds only where the floor is skipped (a floor applies only where it sits below the arm level, so a $1-wide F
+  spread, where both clamp to $0.05, trails instead). The floor and the structure read stay on above +0.30 too (the review
+  found the stage-2 branch used to drop them).
+- `EXIT_REVERSAL_MODE = "structure"`: the reversal read is one test, `strategy.structure_break`: a completed 2-minute SPX candle
+  (`EXIT_STRUCTURE_INTERVAL`, built from the same 1-minute series by the scheduler each tick) closes below the lowest low of the
+  previous `EXIT_STRUCTURE_LOOKBACK` (3) candles for a bullish trade, above the highest high for a bearish one. Reason
+  STAGE1_STRUCTURE_BREAK. No RSI, no Bollinger, no single red candle. `"indicators"` restores the 29 Sep read, `"off"` removes it.
+  A stock (F) position reads the structure on its own ticker frame. A tick without a structure frame does not fire it (no
+  fallback to another frame). The shared frame is 2-minute as well (`CANDLE_INTERVAL`), so the 29 Sep read already ran on
+  2-minute candles; what changed is the test, not the bar size.
+- `STAGE2_FLOOR_ENABLED = False`: +0.30 no longer sets the +0.25 floor. The stage-3 trail is `STAGE3_TRAIL_PCT` $0.25 off a best
+  that has held `STAGE3_CONFIRM_SECONDS` (30 s) with momentum continuing, ratcheting only on new bests.
+- `B_PROFIT_TARGET = 0.60` (C inherits): the resting buy-to-close at Schwab rests at credit minus 0.60, 0.40 on a 1.00 credit,
+  never below 0.05. It is the safety net if the bot is down, not the exit.
+- The stop stays at +0.40 and still goes straight to the market. Closes are still worked at the mid + 0.05.
+- Unchanged: a trade that never shows +0.20 still rides to the stop or the hard stop, as before. What changed below +0.30 is that
+  a reversal after arming now costs down to +0.10 (the floor) instead of being cut by the first indicator read.

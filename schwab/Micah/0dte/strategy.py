@@ -546,6 +546,18 @@ def candle_against(candles: pd.DataFrame, direction: str) -> bool:
     return float(_signed_bodies(candles.tail(1), direction).iloc[0]) < 0
 
 
+def structure_break(candles: pd.DataFrame | None, direction: str, lookback: int = 3) -> bool:
+    """2026-11-18: the last completed candle closed beyond the lowest low (BULLISH) / highest high (BEARISH) of the `lookback`
+    candles before it -- a swing broken against the trade, not a single candle against it. False with too few candles.
+    Meant for 2-minute candles (config.EXIT_STRUCTURE_INTERVAL): a broken swing, not a single candle against the trade."""
+    if candles is None or len(candles) < lookback + 1:
+        return False
+    last, prior = candles.iloc[-1], candles.iloc[-1 - lookback:-1]
+    if direction == BULLISH:
+        return float(last["close"]) < float(prior["low"].min())
+    return float(last["close"]) > float(prior["high"].max())
+
+
 def rsi(closes: pd.Series, period: int = 14) -> pd.Series:
     """Standard Wilder-style RSI (simple rolling mean of gains/losses, not the smoothed EMA variant --
     close enough for a same-day reversal read and simpler to reason about). NaN for the first `period`

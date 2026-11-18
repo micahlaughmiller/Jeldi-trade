@@ -246,7 +246,7 @@ def test_manage_routes_ticker_candles_to_f_and_spx_candles_to_ab(bot, data, monk
     seen = {}
     on_tick = bot.pm.on_tick
 
-    def spy(now, prices, candles, candles_by_key=None):
+    def spy(now, prices, candles, candles_by_key=None, structure_candles=None):
         seen["candles"], seen["by_key"] = candles, candles_by_key
         return []
 
@@ -570,7 +570,7 @@ def test_f_frames_refresh_in_every_phase_and_after_a_self_disable(bot, data, mon
     steps, seen = [], []
     monkeypatch.setattr(bot.f, "step", lambda now: steps.append(now))
     on_tick = bot.pm.on_tick
-    monkeypatch.setattr(bot.pm, "on_tick", lambda now, prices, candles, by_key=None: seen.append(by_key) or on_tick(now, prices, candles, by_key))
+    monkeypatch.setattr(bot.pm, "on_tick", lambda now, prices, candles, by_key=None, structure=None: seen.append(by_key) or on_tick(now, prices, candles, by_key, structure))
     bot.tick(et(15, 5))                                                     # NO_NEW_ENTRIES: step() does not run ...
     assert steps == [] and list(seen[-1]["F:TSLA"].index.strftime("%H:%M"))[-1] == "09:55"   # ... the frame still moved on
     bot.f.disable("test", et(15, 5, 1))

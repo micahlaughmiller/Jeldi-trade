@@ -471,3 +471,17 @@ def test_levels_dict_roundtrip_survives_json_string_timestamps():
     roundtripped = json.loads(json.dumps(jsonable(lv)))
     restored = strategy.Levels.from_dict(roundtripped)
     assert restored == lv
+
+
+def test_structure_break_reads_the_last_candle_against_the_prior_swing():
+    """2026-11-18: a completed candle closing below the lowest low of the three before it (bullish) / above the highest high (bearish)."""
+    from conftest import et, make_candles
+    from strategy import BEARISH, BULLISH, structure_break
+    up = make_candles(et(9, 30), [(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 100.3, 100.5)], minutes=2)
+    assert structure_break(up, BULLISH) is False                           # 100.5 > 99.5: a pullback, not a break
+    broken = make_candles(et(9, 30), [(100, 101, 99.5, 100.8), (100.8, 101.5, 100.2, 101.2), (101.2, 101.8, 100.9, 101.5), (101.5, 101.9, 99.0, 99.3)], minutes=2)
+    assert structure_break(broken, BULLISH) is True and structure_break(broken, BEARISH) is False
+    down = make_candles(et(9, 30), [(100, 100.5, 99, 99.2), (99.2, 99.8, 98.5, 98.8), (98.8, 99.1, 98.2, 98.4), (98.4, 100.9, 98.3, 100.7)], minutes=2)
+    assert structure_break(down, BEARISH) is True and structure_break(down, BULLISH) is False   # 100.7 > 100.5, the prior highest high
+    assert structure_break(broken.iloc[-3:], BULLISH) is False and structure_break(None, BULLISH) is False   # too few candles
+    assert structure_break(broken, BULLISH, lookback=2) is True and structure_break(up, BULLISH, lookback=1) is True   # 100.5 < the prior candle's low 100.9

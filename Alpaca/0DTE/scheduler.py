@@ -1303,7 +1303,20 @@ class Bot:
                          p.right, p.long_strike, p.remaining, p.entry_credit, prices[key], p.best_price,
                          f" RUNNER best {p.runner_best:.2f}" if p.runner else "")
         candles_by_key = self.f.candles_by_key() if self.f is not None else None
-        self.record_fills(self.pm.on_tick(now, prices, candles, candles_by_key))
+        self.record_fills(self.pm.on_tick(now, prices, candles, candles_by_key, self._structure_candles(now)))
+
+    def _structure_candles(self, now: datetime) -> pd.DataFrame | None:
+        """2026-11-18: the SPX frame at EXIT_STRUCTURE_INTERVAL (2-minute candles from the same 1-minute series, complete candles
+        only) for the structure-break reversal read; None when the read is not in use or the frame cannot be built this tick
+        (the exit rules then see no structure and do not fire on it)."""
+        if str(getattr(config, "EXIT_REVERSAL_MODE", "indicators")).lower() != "structure":
+            return None
+        try:
+            return market_data.get_candles(config.SPX_SYMBOL, getattr(config, "EXIT_STRUCTURE_INTERVAL", "2m"),
+                                           int(getattr(config, "EXIT_STRUCTURE_LOOKBACK_MIN", 60)), now)
+        except Exception as e:      # noqa: BLE001 -- a data hiccup must not stop the stops and trails from running this tick
+            log.warning("structure candles unavailable this tick (%s: %s)", type(e).__name__, e)
+            return None
 
     def record_fills(self, fills: list[dict]) -> None:
         for row in fills:

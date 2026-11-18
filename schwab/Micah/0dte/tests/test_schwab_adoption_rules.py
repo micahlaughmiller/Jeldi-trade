@@ -38,7 +38,15 @@ def test_the_shipped_close_pricing():
     marketable; a stop / hard stop / flatten is marketable at once. The exit rules themselves are unchanged (arm at $0.20)."""
     assert config.CLOSE_PRICE_BASIS == "mid" and config.CLOSE_MID_OFFSET == 0.05 and config.CLOSE_MID_ATTEMPTS == 2
     assert config.CLOSE_SLIPPAGE == 0.03 and config.CLOSE_URGENT_REASON_KEYWORDS == ("STOP", "FORCE", "FLATTEN", "INTERRUPT")
-    assert config.STAGE1_ARM_PCT == 0.04 and not hasattr(config, "STAGE1_REVERSAL_EXIT_ENABLED")
+
+
+def test_the_shipped_runner_package():
+    """2026-11-18 (Micah: "build it and test it as recommended"): resting target credit - 0.60, +0.10 floor and 0.25 trails after +0.20,
+    no stage-2 floor, the 2-minute structure break as the only reversal read."""
+    assert config.B_PROFIT_TARGET == 0.60 and config.C_PROFIT_TARGET == 0.60 and config.B_STOP_LOSS == 0.50
+    assert config.STAGE1_ARM_PCT == 0.04 and config.STAGE1_FLOOR_PCT == 0.02 and config.STAGE1_TRAIL_PCT == 0.05
+    assert config.STAGE2_FLOOR_ENABLED is False and config.STAGE3_TRAIL_PCT == 0.05
+    assert config.EXIT_REVERSAL_MODE == "structure" and config.EXIT_STRUCTURE_INTERVAL == "2m" and config.EXIT_STRUCTURE_LOOKBACK == 3
 
 
 def test_the_shipped_exit_booking_and_resting_exits():

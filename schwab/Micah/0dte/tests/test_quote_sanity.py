@@ -78,7 +78,6 @@ def _legacy_stage_knobs(monkeypatch):
     monkeypatch.setattr(config, "STAGE1_ARM_PCT", 0.04)
     monkeypatch.setattr(config, "STAGE1_FLOOR_PCT", None, raising=False)
     monkeypatch.setattr(config, "STAGE1_TRAIL_ENABLED", True, raising=False)
-    monkeypatch.setattr(config, "STAGE1_TRAIL_PCT", 0.03)
     monkeypatch.setattr(config, "STAGE1_REVERSAL_EXIT_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "STAGE2_ENABLED", True, raising=False)
 

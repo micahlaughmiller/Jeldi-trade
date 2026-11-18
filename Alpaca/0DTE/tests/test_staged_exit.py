@@ -30,7 +30,6 @@ def _legacy_stage_knobs(request, monkeypatch):
     monkeypatch.setattr(config, "STAGE1_ARM_PCT", 0.04)
     monkeypatch.setattr(config, "STAGE1_FLOOR_PCT", None, raising=False)
     monkeypatch.setattr(config, "STAGE1_TRAIL_ENABLED", True, raising=False)
-    monkeypatch.setattr(config, "STAGE1_TRAIL_PCT", 0.03)
     monkeypatch.setattr(config, "STAGE1_REVERSAL_EXIT_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "STAGE2_ENABLED", True, raising=False)
 
@@ -130,7 +129,7 @@ def test_stage0_stop_streak_resets_if_price_recovers(pm, broker, monkeypatch):
 def test_shipped_nothing_exits_before_25_cents_whatever_the_candles_say(pm, broker):
     """Micah, 18 Nov: "give us more time to ride the chop" -- below +0.25 only the stop can close the trade."""
     assert config.STAGE1_ARM_PCT == 0.05 and config.STAGE1_FLOOR_PCT == 0.02 and config.STAGE2_ENABLED is False
-    assert config.STAGE1_TRAIL_ENABLED is True and config.STAGE1_TRAIL_PCT == 0.04 and config.STAGE1_REVERSAL_EXIT_ENABLED is False
+    assert config.STAGE1_TRAIL_ENABLED is False and config.STAGE1_REVERSAL_EXIT_ENABLED is False
     p = open_spread(pm, broker, strategy="B", credit=2.00, width=5.0)
     assert tick(pm, et(10, 5), 1.80, red_candle_against_bullish()) == [] and not p.stage1_armed   # +0.20: nothing
     assert tick(pm, et(10, 6), 1.99, red_candle_against_bullish()) == []                        # gave it all back: still nothing
@@ -141,22 +140,12 @@ def test_shipped_nothing_exits_before_25_cents_whatever_the_candles_say(pm, brok
 
 def test_shipped_after_25_cents_the_only_exit_is_the_10_cent_floor(pm, broker):
     p = open_spread(pm, broker, strategy="B", credit=2.00, width=5.0)
-    assert tick(pm, et(10, 5), 1.75, flat()) == [] and p.stage1_armed                          # +0.25 arms (trail 1.95 is looser than the 1.90 floor)
+    assert tick(pm, et(10, 5), 1.75, flat()) == [] and p.stage1_armed                          # +0.25 arms
     assert tick(pm, et(10, 6), 1.85, red_candle_against_bullish()) == []                        # 0.10 back from best, red candle: holds
-    assert tick(pm, et(10, 7), 1.70, flat()) == [] and not p.stage2_armed                       # +0.30: stage 2 does not arm (trail now 1.90 too)
+    assert tick(pm, et(10, 7), 1.60, flat()) == [] and not p.stage2_armed                       # +0.40: stage 2 does not arm
     assert tick(pm, et(10, 8), 1.89, flat()) == []                                             # +0.11: still above the floor
     fills = tick(pm, et(10, 9), 1.90, flat())                                                  # +0.10: the floor
     assert fills and fills[0]["exit_reason"] == "STAGE1_FLOOR"
-
-
-def test_shipped_runner_trails_the_best_mid_by_20_cents_once_armed(pm, broker):
-    """Micah, 18 Nov: "a runner keeps running and follows with a 20 cent trail" -- the tighter of the +0.10 floor and best + 0.20 closes."""
-    p = open_spread(pm, broker, strategy="B", credit=2.00, width=5.0)
-    assert tick(pm, et(10, 5), 1.75, flat()) == [] and p.stage1_armed                          # arms; floor 1.90, trail 1.95
-    assert tick(pm, et(10, 6), 1.50, red_candle_against_bullish()) == []                        # runs: best 1.50, trail now 1.70
-    assert tick(pm, et(10, 7), 1.69, flat()) == []                                             # 0.19 back: holds
-    fills = tick(pm, et(10, 8), 1.70, flat())                                                  # 0.20 back from the best
-    assert fills and fills[0]["exit_reason"] == "STAGE1_TRAIL"
 
 
 def test_shipped_floor_is_width_scaled_and_never_below_the_exit_floor(pm, broker, pre_f_stop_fix):

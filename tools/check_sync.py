@@ -74,6 +74,10 @@ INTENTIONAL_CONFIG_DIVERGENCE = {
                                   "(08:45 Central); Alpaca keeps 30"),
         "OVERNIGHT_ENTRY_END_MIN": ("30", "15", "2026-11-10: Schwab live: the ORB phase starts 15 minutes after the open, with the "
                                     "15-minute opening range; Alpaca keeps 30"),
+        "ORB_CANDLE_INTERVAL": ("'5m'", "'2m'", "2026-11-24: Schwab live: the ORB break/confirm machine runs on 2-minute candles so a "
+                                "break of the 15-minute range is confirmed by about 09:50 ET (Alpaca keeps 5m)"),
+        "ORB_SETUP_TIMEOUT_CANDLES": ("6", "15", "2026-11-24: Schwab live: 15 x 2-minute candles, the same 30-minute window as "
+                                      "Alpaca's 6 x 5-minute"),
         "MAX_TRADES_PER_DAY": ("5", "3", "2026-11-12: Schwab live: 3 trades a day per strategy (Alpaca 5)"),
         "MAX_TRADES_TOTAL_PER_DAY": ("None", "3", "2026-11-12: Schwab live: 3 trades a day across every strategy together (Alpaca: off)"),
         "MAX_CONSECUTIVE_LOSSES": ("5", "2", "2026-11-12: Schwab live: 2 consecutive losses stop the day (Alpaca 5)"),

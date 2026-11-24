@@ -270,8 +270,13 @@ FORCE_CLOSE_TIME = time(13, 0)    # 12:00 noon Central: everything closed, bot s
 # rate limiting shows up in the logs.
 TICK_SECONDS = 1
 CANDLE_INTERVAL = "2m"
-ORB_CANDLE_INTERVAL = "5m"
-ORB_SETUP_TIMEOUT_CANDLES = 6
+# 2026-11-24 (Micah: "need to use a 15 ORB, I have missed the only moves of the day waiting for 30 minutes"): the range was
+# already 15 minutes (OPENING_RANGE_MINUTES) -- the wait was the break/confirm machine on 5-minute candles: the break candle
+# closed at 09:50 at the earliest and the momentum confirm at 09:55, a pullback entry at 10:00 or later. On 2-minute candles
+# the first candle after the range is 09:46-09:48, the momentum confirm closes at 09:50 and a pullback entry can come at
+# 09:52. The timeout is scaled to keep the same 30-minute window (15 x 2 min = 6 x 5 min). Alpaca paper keeps 5m / 6.
+ORB_CANDLE_INTERVAL = "2m"
+ORB_SETUP_TIMEOUT_CANDLES = 15
 CANDLE_LOOKBACK_MIN = 180
 DATA_CACHE_SEC = 20
 # 2026-10-08: ONE index series, shared and complete. Every SPX candle, the opening range, the spot used by the data layer and

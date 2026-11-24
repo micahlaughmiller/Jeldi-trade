@@ -181,3 +181,25 @@ configs:
 - The stop stays at +0.40 and still goes straight to the market. Closes are still worked at the mid + 0.05.
 - Unchanged: a trade that never shows +0.20 still rides to the stop or the hard stop, as before. What changed below +0.30 is that
   a reversal after arming now costs down to +0.10 (the floor) instead of being cut by the first indicator read.
+
+## ORB break/confirm on 2-minute candles (24 Nov 2026)
+
+Micah: "need to use a 15 ORB, I have missed the only moves of the day waiting for 30 minutes, and sometimes right after 30
+minutes there is a reversal and I lose." The opening range was already 15 minutes (`OPENING_RANGE_MINUTES`, 10 Nov). The wait was
+the break/confirm machine (`strategy.OrbSetup`) running on 5-minute candles: the first candle after the range closed at 09:50,
+the momentum confirm at 09:55, and a pullback entry at 10:00 or later.
+
+- `ORB_CANDLE_INTERVAL` 5m -> 2m in the Schwab configs (Micah and Dawson; Alpaca paper keeps 5m). The 09:46-09:48 candle can
+  break the range, the 09:48-09:50 candle confirms it (MOMENTUM), so the earliest entry is about 09:50 ET (08:50 Central); a
+  pullback entry can come at 09:52. The rules of the machine are unchanged: a close beyond the range arms it, the next candle
+  must close beyond the break close (momentum) or wick back to the level and then close in the breakout direction (pullback);
+  a close back through the level resets it.
+- `ORB_SETUP_TIMEOUT_CANDLES` 6 -> 15: the same 30-minute window to confirm a break, now counted in 2-minute candles.
+- The 2-minute grid runs 09:44, 09:46, ...: the 09:44-09:46 candle straddles the end of the range and is not fed to the machine
+  (only candles from 09:46 on are), so the minute 09:45-09:46 is not read. The late-signal rule (`ORB_LATE_SIGNAL_MAX_MIN`) now
+  allows a replayed signal up to 10 minutes + one 2-minute candle old.
+- Known cost: 2-minute closes are noisier than 5-minute ones, so a false break that would have been filtered by the 5-minute
+  close can now arm and confirm. The reversal protection is the exit side: the 2-minute structure break (18 Nov) and the +0.10
+  floor once +0.20 has shown.
+- Guard test: `tests/test_schwab_adoption_rules.py` fires a MOMENTUM signal at 09:50 on the real config. The shared suite pins
+  5m / 6 (`tests/conftest.py`).

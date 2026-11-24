@@ -60,3 +60,39 @@ def test_the_shipped_data_source_and_opening_range():
     """2026-11-10: live Schwab data for everything, and a 15-minute opening range with breaks tradable from 09:45 ET (08:45 Central)."""
     assert config.SPX_CANDLE_SOURCE == "schwab" and config.SPX_SCHWAB_SYMBOL == "$SPX"
     assert config.OPENING_RANGE_MINUTES == 15 and config.OVERNIGHT_ENTRY_END_MIN == 15
+
+
+def test_schwab_runs_the_orb_machine_on_2_minute_candles_and_confirms_a_break_by_0950():
+    """2026-11-24: on 5-minute candles the earliest ORB entry was 09:55 (break 09:50, confirm 09:55). On 2-minute candles the
+    09:46-09:48 candle breaks the 15-minute range and the 09:48-09:50 candle confirms it: the signal fires at 09:50."""
+    from datetime import datetime, timedelta
+    import pandas as pd
+    import market_data
+    import scheduler
+    import strategy
+    assert config.ORB_CANDLE_INTERVAL == "2m" and config.ORB_SETUP_TIMEOUT_CANDLES == 15
+    assert config.OPENING_RANGE_MINUTES == 15
+    ET = config.ET
+
+    def t(h, m):
+        return datetime(2026, 11, 24, h, m, tzinfo=ET)
+
+    bot = scheduler.Bot.__new__(scheduler.Bot)
+    bot.orb = strategy.Levels(6700.0, 6690.0, t(9, 45))
+    bot.orb_setup = strategy.OrbSetup(6700.0, 6690.0)
+    bot.last_orb_candle = None
+    rows = [(t(9, 30 + 2 * i), 6695.0, 6699.0, 6691.0, 6695.0) for i in range(8)]          # 09:30..09:44 inside the range
+    rows += [(t(9, 46), 6698.0, 6704.0, 6697.0, 6703.0)]                                     # 09:46-09:48 closes above 6700: armed
+    frame = lambda rows: pd.DataFrame([{"open": o, "high": h, "low": l, "close": c, "volume": 1.0} for _, o, h, l, c in rows],
+                                      index=pd.DatetimeIndex([r[0] for r in rows]))
+    data = {"f": frame(rows)}
+    import pytest
+    mp = pytest.MonkeyPatch()
+    mp.setattr(market_data, "get_candles", lambda *a, **k: data["f"])
+    try:
+        assert bot.orb_signal(t(9, 48) + timedelta(seconds=5)) is None and bot.orb_setup.state == strategy.OrbSetup.BROKEN
+        data["f"] = frame(rows + [(t(9, 48), 6703.0, 6709.0, 6702.0, 6708.0)])               # 09:48-09:50 closes beyond the break close
+        signal = bot.orb_signal(t(9, 50) + timedelta(seconds=5))
+    finally:
+        mp.undo()
+    assert signal == (strategy.BULLISH, t(9, 48), strategy.MOMENTUM)

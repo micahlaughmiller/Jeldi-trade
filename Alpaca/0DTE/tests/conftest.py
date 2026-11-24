@@ -189,6 +189,8 @@ def _pin_data_source_and_opening_range(request, monkeypatch):
         monkeypatch.setattr(config, "SPX_CANDLE_SOURCE", "yahoo", raising=False)
         monkeypatch.setattr(config, "OPENING_RANGE_MINUTES", 30, raising=False)
         monkeypatch.setattr(config, "OVERNIGHT_ENTRY_END_MIN", 30, raising=False)
+        monkeypatch.setattr(config, "ORB_CANDLE_INTERVAL", "5m", raising=False)          # 2026-11-24: Schwab runs the ORB machine on 2m
+        monkeypatch.setattr(config, "ORB_SETUP_TIMEOUT_CANDLES", 6, raising=False)
 
 
 @pytest.fixture(autouse=True)
